@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use super::StoreError;
+
 #[derive(Debug, Clone)]
 pub struct StorePaths {
     config_root: PathBuf,
@@ -39,5 +41,34 @@ impl StorePaths {
 
     pub(crate) fn presets_dir(&self) -> PathBuf {
         self.state_root.join("sleepy")
+    }
+
+    pub(crate) fn lock_path(&self) -> PathBuf {
+        self.settings_dir().join(".sleepy-session.lock")
+    }
+
+    pub(crate) fn reject_symlinks(&self) -> Result<(), StoreError> {
+        let settings_dir = self.settings_dir();
+        let presets_dir = self.presets_dir();
+        let settings_path = self.settings_path();
+        let presets_path = self.presets_path();
+        let lock_path = self.lock_path();
+        for path in [
+            &self.config_root,
+            &self.state_root,
+            &settings_dir,
+            &presets_dir,
+            &settings_path,
+            &presets_path,
+            &lock_path,
+        ] {
+            if std::fs::symlink_metadata(path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(StoreError::unsafe_path(path.display()));
+            }
+        }
+        Ok(())
     }
 }

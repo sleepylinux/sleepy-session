@@ -3,6 +3,7 @@ use sleepy_sdk::{
     validate_preset, validate_settings, PresetDocument, PresetOrigin, SettingsDocument,
     BUILTIN_PRESET_ID,
 };
+use std::collections::BTreeSet;
 
 use super::StoreError;
 
@@ -23,11 +24,17 @@ impl Defaults {
                     .map_err(|error| StoreError::invalid(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let builtin_ids = builtins
+            .iter()
+            .map(|preset| preset.id.as_str())
+            .collect::<BTreeSet<_>>();
         if builtins.is_empty()
             || builtins
                 .iter()
                 .any(|preset| preset.origin != PresetOrigin::Builtin)
             || builtins.iter().any(|preset| preset.id != BUILTIN_PRESET_ID)
+            || builtin_ids.len() != builtins.len()
+            || !builtin_ids.contains(settings.active_preset_id.as_str())
         {
             return Err(StoreError::invalid(
                 "defaults must contain only builtin.sleepy",

@@ -26,18 +26,23 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: Vec<String>) -> Result<Value, StoreError> {
-    let store = StateStore::open(StorePaths::from_environment(), default_state()?)?;
     match arguments.as_slice() {
-        [command, action] if command == "settings" && action == "show" => store.settings_json(),
-        [command, action] if command == "presets" && action == "list" => store.presets_json(),
+        [command, action] if command == "settings" && action == "show" => {
+            StateStore::open(StorePaths::from_environment(), default_state()?)?.settings_json()
+        }
+        [command, action] if command == "presets" && action == "list" => {
+            StateStore::open(StorePaths::from_environment(), default_state()?)?.presets_json()
+        }
         [command, action, source, name] if command == "presets" && action == "duplicate" => {
-            store.duplicate_preset(source, name)
+            StateStore::open(StorePaths::from_environment(), default_state()?)?
+                .duplicate_preset(source, name)
         }
         [command, action, id, name] if command == "presets" && action == "rename" => {
-            store.rename_preset(id, name)
+            StateStore::open(StorePaths::from_environment(), default_state()?)?
+                .rename_preset(id, name)
         }
         [command, action, id] if command == "presets" && action == "activate" => {
-            store.activate_preset(id)
+            StateStore::open(StorePaths::from_environment(), default_state()?)?.activate_preset(id)
         }
         _ => Err(invalid_command()),
     }

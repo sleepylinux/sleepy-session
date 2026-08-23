@@ -1,9 +1,13 @@
 use std::{
+    collections::BTreeSet,
+    fmt,
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{self, Write},
     path::Path,
+    sync::Arc,
 };
 
+use fs2::FileExt;
 use serde_json::{json, Value};
 use sleepy_sdk::{
     validate_preset, validate_settings, PresetDocument, PresetOrigin, SettingsDocument,
@@ -13,101 +17,172 @@ use uuid::Uuid;
 
 use super::{Defaults, StoreError, StorePaths};
 
-#[derive(Debug, Clone)]
+/// Observable replacement boundary used by callers that need explicit fault injection.
+pub trait ReplacementObserver: Send + Sync {
+    fn reached(&self, stage: ReplacementStage) -> io::Result<()>;
+}
+
+/// The durable-replacement points at which an observer can stop or fail a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementStage {
+    TemporaryFileSynced,
+    RenamedBeforeParentSync,
+}
+
+#[derive(Clone)]
 pub struct StateStore {
     paths: StorePaths,
     defaults: Defaults,
+    replacement_observer: Option<Arc<dyn ReplacementObserver>>,
+}
+
+impl fmt::Debug for StateStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StateStore")
+            .field("paths", &self.paths)
+            .field("defaults", &self.defaults)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StateStore {
     pub fn open(paths: StorePaths, defaults: Defaults) -> Result<Self, StoreError> {
-        let store = Self { paths, defaults };
-        store.initialize()?;
-        let settings = store.load_settings()?;
-        store.load_user_presets()?;
-        if store.find_preset(&settings.active_preset_id)?.is_none() {
-            return Err(StoreError::invalid(
-                "settings activePresetId does not exist",
-            ));
-        }
+        let store = Self {
+            paths,
+            defaults,
+            replacement_observer: None,
+        };
+        store.with_transaction(|store| {
+            store.initialize()?;
+            let settings = store.load_settings()?;
+            store.load_user_presets()?;
+            if store.find_preset(&settings.active_preset_id)?.is_none() {
+                return Err(StoreError::invalid(
+                    "settings activePresetId does not exist",
+                ));
+            }
+            Ok(())
+        })?;
         Ok(store)
     }
 
+    /// Adds a replacement-stage observer to a cloned store handle.
+    pub fn with_replacement_observer(mut self, observer: Arc<dyn ReplacementObserver>) -> Self {
+        self.replacement_observer = Some(observer);
+        self
+    }
+
     pub fn settings_json(&self) -> Result<Value, StoreError> {
-        serde_json::to_value(self.load_settings()?)
-            .map_err(|error| StoreError::invalid(error.to_string()))
+        self.with_transaction(|store| {
+            serde_json::to_value(store.load_settings()?)
+                .map_err(|error| StoreError::invalid(error.to_string()))
+        })
     }
 
     pub fn presets_json(&self) -> Result<Value, StoreError> {
-        let mut presets = self.defaults.builtins.clone();
-        let mut users = self.load_user_presets()?;
-        users.sort_by(|left, right| left.id.cmp(&right.id));
-        presets.extend(users);
-        Ok(json!({ "presets": presets }))
+        self.with_transaction(|store| {
+            let mut presets = store.defaults.builtins.clone();
+            let mut users = store.load_user_presets()?;
+            users.sort_by(|left, right| left.id.cmp(&right.id));
+            presets.extend(users);
+            Ok(json!({ "presets": presets }))
+        })
     }
 
     pub fn create_user_preset(&self, preset: Value) -> Result<Value, StoreError> {
-        let preset = parse_preset(preset)?;
-        if preset.origin != PresetOrigin::User {
-            return Err(StoreError::invalid("created presets must have origin user"));
-        }
-        if self.find_preset(&preset.id)?.is_some() {
-            return Err(StoreError::invalid("preset id already exists"));
-        }
-        let mut users = self.load_user_presets()?;
-        users.push(preset.clone());
-        self.write_user_presets(&users)?;
-        Ok(json!({ "preset": preset }))
+        self.with_transaction(|store| {
+            let preset = parse_preset(preset)?;
+            if preset.origin != PresetOrigin::User {
+                return Err(StoreError::invalid("created presets must have origin user"));
+            }
+            if store.find_preset(&preset.id)?.is_some() {
+                return Err(StoreError::invalid("preset id already exists"));
+            }
+            let mut users = store.load_user_presets()?;
+            users.push(preset.clone());
+            store.write_user_presets(&users)?;
+            Ok(json!({ "preset": preset }))
+        })
     }
 
     pub fn duplicate_preset(&self, source_id: &str, name: &str) -> Result<Value, StoreError> {
-        let mut preset = self
-            .find_preset(source_id)?
-            .ok_or_else(|| StoreError::not_found(source_id))?;
-        preset.id = Uuid::new_v4().hyphenated().to_string();
-        preset.name = checked_name(name)?;
-        preset.origin = PresetOrigin::User;
-        preset.base_preset_id = Some(source_id.to_owned());
-        let mut users = self.load_user_presets()?;
-        users.push(preset.clone());
-        self.write_user_presets(&users)?;
-        Ok(json!({ "preset": preset }))
+        self.with_transaction(|store| {
+            let mut preset = store
+                .find_preset(source_id)?
+                .ok_or_else(|| StoreError::not_found(source_id))?;
+            preset.id = Uuid::new_v4().hyphenated().to_string();
+            preset.name = checked_name(name)?;
+            preset.origin = PresetOrigin::User;
+            preset.base_preset_id = Some(source_id.to_owned());
+            let mut users = store.load_user_presets()?;
+            users.push(preset.clone());
+            store.write_user_presets(&users)?;
+            Ok(json!({ "preset": preset }))
+        })
     }
 
     pub fn rename_preset(&self, id: &str, name: &str) -> Result<Value, StoreError> {
-        if id == BUILTIN_PRESET_ID {
-            return Err(StoreError::immutable(id));
-        }
-        let mut users = self.load_user_presets()?;
-        let preset = users
-            .iter_mut()
-            .find(|preset| preset.id == id)
-            .ok_or_else(|| StoreError::not_found(id))?;
-        preset.name = checked_name(name)?;
-        let result = preset.clone();
-        self.write_user_presets(&users)?;
-        Ok(json!({ "preset": result }))
+        self.with_transaction(|store| {
+            if id == BUILTIN_PRESET_ID {
+                return Err(StoreError::immutable(id));
+            }
+            let mut users = store.load_user_presets()?;
+            let preset = users
+                .iter_mut()
+                .find(|preset| preset.id == id)
+                .ok_or_else(|| StoreError::not_found(id))?;
+            preset.name = checked_name(name)?;
+            let result = preset.clone();
+            store.write_user_presets(&users)?;
+            Ok(json!({ "preset": result }))
+        })
     }
 
     pub fn activate_preset(&self, id: &str) -> Result<Value, StoreError> {
-        if self.find_preset(id)?.is_none() {
-            return Err(StoreError::not_found(id));
-        }
-        let mut settings = self.load_settings()?;
-        settings.active_preset_id = id.to_owned();
-        self.write_settings(&settings)?;
-        self.settings_json()
+        self.with_transaction(|store| {
+            if store.find_preset(id)?.is_none() {
+                return Err(StoreError::not_found(id));
+            }
+            let mut settings = store.load_settings()?;
+            settings.active_preset_id = id.to_owned();
+            store.write_settings(&settings)?;
+            serde_json::to_value(settings).map_err(|error| StoreError::invalid(error.to_string()))
+        })
     }
 
     pub fn replace_settings_json(&self, settings: Value) -> Result<Value, StoreError> {
-        let settings = parse_settings(settings)?;
-        if self.find_preset(&settings.active_preset_id)?.is_none() {
-            return Err(StoreError::invalid(
-                "settings activePresetId does not exist",
-            ));
-        }
-        self.write_settings(&settings)?;
-        self.settings_json()
+        self.with_transaction(|store| {
+            let settings = parse_settings(settings)?;
+            if store.find_preset(&settings.active_preset_id)?.is_none() {
+                return Err(StoreError::invalid(
+                    "settings activePresetId does not exist",
+                ));
+            }
+            store.write_settings(&settings)?;
+            serde_json::to_value(settings).map_err(|error| StoreError::invalid(error.to_string()))
+        })
+    }
+
+    fn with_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        // A single configuration-root lock establishes the order for all settings/preset operations.
+        self.paths.reject_symlinks()?;
+        fs::create_dir_all(self.paths.settings_dir()).map_err(StoreError::io)?;
+        self.paths.reject_symlinks()?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.paths.lock_path())
+            .map_err(StoreError::io)?;
+        lock.lock_exclusive().map_err(StoreError::io)?;
+        let result = operation(self);
+        FileExt::unlock(&lock).map_err(StoreError::io)?;
+        result
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
@@ -129,7 +204,7 @@ impl StateStore {
         let input = fs::read_to_string(self.paths.presets_path()).map_err(StoreError::io)?;
         let presets: Vec<Value> =
             serde_json::from_str(&input).map_err(|error| StoreError::invalid(error.to_string()))?;
-        presets
+        let presets = presets
             .into_iter()
             .map(parse_preset)
             .map(|result| {
@@ -143,7 +218,17 @@ impl StateStore {
                     }
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        let ids = presets
+            .iter()
+            .map(|preset| preset.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if ids.len() != presets.len() {
+            return Err(StoreError::invalid(
+                "user preset store contains duplicate ids",
+            ));
+        }
+        Ok(presets)
     }
 
     fn find_preset(&self, id: &str) -> Result<Option<PresetDocument>, StoreError> {
@@ -164,10 +249,20 @@ impl StateStore {
             &self.paths.settings_dir(),
             &self.paths.settings_path(),
             &serde_json::to_vec(&validated).map_err(StoreError::io)?,
+            self.replacement_observer.as_deref(),
         )
     }
 
     fn write_user_presets(&self, presets: &[PresetDocument]) -> Result<(), StoreError> {
+        let ids = presets
+            .iter()
+            .map(|preset| preset.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if ids.len() != presets.len() {
+            return Err(StoreError::invalid(
+                "user preset store contains duplicate ids",
+            ));
+        }
         for preset in presets {
             if preset.origin != PresetOrigin::User {
                 return Err(StoreError::invalid(
@@ -182,6 +277,7 @@ impl StateStore {
             &self.paths.presets_dir(),
             &self.paths.presets_path(),
             &serde_json::to_vec(&sorted).map_err(StoreError::io)?,
+            self.replacement_observer.as_deref(),
         )
     }
 }
@@ -202,7 +298,12 @@ fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
     validate_preset(&value.to_string()).map_err(|error| StoreError::invalid(error.to_string()))
 }
 
-fn atomic_replace(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+fn atomic_replace(
+    directory: &Path,
+    destination: &Path,
+    bytes: &[u8],
+    observer: Option<&dyn ReplacementObserver>,
+) -> Result<(), StoreError> {
     fs::create_dir_all(directory).map_err(StoreError::io)?;
     let temporary = directory.join(format!(
         ".{}.{}.tmp",
@@ -212,12 +313,11 @@ fn atomic_replace(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<
             .unwrap_or("state"),
         Uuid::new_v4()
     ));
-    let replacement = OpenOptions::new()
+    let mut replacement = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temporary)
-        .map_err(StoreError::io);
-    let mut replacement = replacement?;
+        .map_err(StoreError::io)?;
     let result = replacement
         .write_all(bytes)
         .and_then(|()| replacement.sync_all());
@@ -225,12 +325,23 @@ fn atomic_replace(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<
         let _ = fs::remove_file(&temporary);
         return Err(StoreError::io(error));
     }
+    if let Some(observer) = observer {
+        if let Err(error) = observer.reached(ReplacementStage::TemporaryFileSynced) {
+            let _ = fs::remove_file(&temporary);
+            return Err(StoreError::io(error));
+        }
+    }
     drop(replacement);
     if let Err(error) = fs::rename(&temporary, destination) {
         let _ = fs::remove_file(&temporary);
         return Err(StoreError::io(error));
     }
+    if let Some(observer) = observer {
+        if let Err(error) = observer.reached(ReplacementStage::RenamedBeforeParentSync) {
+            return Err(StoreError::commit_state_unknown(error));
+        }
+    }
     File::open(directory)
         .and_then(|file| file.sync_all())
-        .map_err(StoreError::io)
+        .map_err(StoreError::commit_state_unknown)
 }

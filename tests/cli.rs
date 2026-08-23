@@ -68,3 +68,17 @@ fn cli_writes_structured_json_errors_to_stderr() {
         .unwrap()
         .contains("immutable"));
 }
+
+#[test]
+fn invalid_cli_commands_do_not_initialize_xdg_state() {
+    let root = TempDir::new().unwrap();
+    let output = command(&root).args(["not-a-command"]).output().unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
+        "invalid_command"
+    );
+    assert!(!root.path().join("config/sleepy/settings.json").exists());
+    assert!(!root.path().join("state/sleepy/presets.json").exists());
+}

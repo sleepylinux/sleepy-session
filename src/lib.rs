@@ -2,4 +2,6 @@
 
 mod store;
 
-pub use store::{Defaults, StateStore, StoreError, StorePaths};
+pub use store::{
+    Defaults, ReplacementObserver, ReplacementStage, StateStore, StoreError, StorePaths,
+};

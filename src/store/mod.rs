@@ -6,4 +6,4 @@ mod state;
 pub use defaults::Defaults;
 pub use error::StoreError;
 pub use paths::StorePaths;
-pub use state::StateStore;
+pub use state::{ReplacementObserver, ReplacementStage, StateStore};

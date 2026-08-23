@@ -1,9 +1,15 @@
 {
   description = "Sleepy Linux durable settings and preset session store";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    sleepy-sdk = {
+      url = "github:sleepylinux/sleepy-sdk/4c4f7989b957f41f3748ddfb092b0348e2ba9e88";
+      flake = false;
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, sleepy-sdk }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -15,7 +21,12 @@
           pname = "sleepy-session";
           version = "0.1.0";
           src = self;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # Cargo.lock fixes the SDK revision; this avoids an invented vendor hash.
+            allowBuiltinFetchGit = true;
+          };
+          passthru.sleepy-sdk-source = sleepy-sdk;
         };
     in
     {

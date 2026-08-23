@@ -35,6 +35,22 @@ impl StoreError {
         }
     }
 
+    pub(crate) fn unsafe_path(path: impl fmt::Display) -> Self {
+        Self {
+            code: "unsafe_path",
+            message: format!("refusing symlinked store path: {path}"),
+        }
+    }
+
+    pub(crate) fn commit_state_unknown(error: impl fmt::Display) -> Self {
+        Self {
+            code: "commit_state_unknown",
+            message: format!(
+                "the replacement may already be visible and durable state is unknown: {error}"
+            ),
+        }
+    }
+
     pub fn invalid_command() -> Self {
         Self {
             code: "invalid_command",

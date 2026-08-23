@@ -48,3 +48,6 @@ cargo build --release
 
 The repository includes a standalone Nix flake. Nix was unavailable during the
 initial local verification; CI or a Nix-enabled host must run `nix flake check`.
+The flake also pins the non-flake `sleepy-sdk` source to the reviewed revision
+and permits Nix to fetch the Git dependency recorded in `Cargo.lock`; no
+placeholder vendor hash is used.
