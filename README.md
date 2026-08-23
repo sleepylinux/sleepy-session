@@ -11,6 +11,9 @@ When those XDG variables are unset, the standard `$HOME/.config` and
 `$HOME/.local/state` fallbacks apply. Initial defaults are written only when a
 document does not yet exist. Writes validate first, sync a same-directory
 temporary file, atomically rename it into place, then sync the parent directory.
+If syncing the parent directory fails after the rename, the CLI reports the
+structured `commit_state_unknown` error: the candidate may already be visible,
+so callers must re-read state rather than blindly retrying a mutation.
 
 The immutable built-in preset is `builtin.sleepy`. User presets have canonical
 hyphenated UUID identifiers. Unknown document fields and malformed data are
