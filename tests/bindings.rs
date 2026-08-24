@@ -123,6 +123,14 @@ struct RecordingValidator {
 
 struct InitializingValidator;
 
+struct ForbiddenValidator;
+
+impl BindingValidator for ForbiddenValidator {
+    fn validate(&self, _staged_root: &Path, _staged_config: &Path) -> Result<(), String> {
+        panic!("coherent initializer must not validate or rewrite")
+    }
+}
+
 impl BindingValidator for InitializingValidator {
     fn validate(&self, staged_root: &Path, staged_config: &Path) -> Result<(), String> {
         assert!(staged_config.starts_with(staged_root));
@@ -416,6 +424,50 @@ fn offline_initializer_reconciles_an_existing_pending_journal_idempotently() {
     assert_eq!(fs::read(paths.store().presets_path()).unwrap(), presets);
     assert_eq!(fs::read(paths.generated_include()).unwrap(), include);
     assert!(paths.journal().exists());
+}
+
+#[test]
+fn initializer_after_confirmed_reconcile_is_an_exact_noop() {
+    let (_temp, paths) = apply_fixture();
+    let offline = ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new())));
+    initialize_bindings(&paths, &InitializingValidator, &offline).unwrap();
+    let online_events = Arc::new(Mutex::new(Vec::new()));
+    reconcile_bindings(
+        &paths,
+        &ScriptedReloader::online(online_events, vec![Some(ConfigLoaded { failed: false })]),
+    )
+    .unwrap();
+    assert!(!paths.journal().exists());
+    let artifacts = [
+        paths.store().settings_path(),
+        paths.store().presets_path(),
+        paths.generated_include().to_owned(),
+    ];
+    let before = artifacts
+        .iter()
+        .map(|path| {
+            (
+                fs::read(path).unwrap(),
+                fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let no_reload_events = Arc::new(Mutex::new(Vec::new()));
+
+    let report = initialize_bindings(
+        &paths,
+        &ForbiddenValidator,
+        &ScriptedReloader::offline(Arc::clone(&no_reload_events)),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::Committed);
+    assert!(!paths.journal().exists());
+    assert!(no_reload_events.lock().unwrap().is_empty());
+    for (path, (bytes, modified)) in artifacts.iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+    }
 }
 
 #[test]

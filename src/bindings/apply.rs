@@ -816,6 +816,34 @@ pub fn initialize_bindings(
     if let Some(report) = reconcile_bindings(paths, reloader)? {
         return Ok(report);
     }
+    let store = StateStore::for_repair(paths.store.clone(), Defaults::packaged())
+        .map_err(BindingError::from_store)?;
+    if let Some(active_preset_id) = store
+        .with_repair_candidate_transaction(|store| {
+            let (settings_exists, presets_exists) = store.document_presence()?;
+            if !settings_exists || !presets_exists {
+                return Ok(None);
+            }
+            let settings = store.load_settings()?;
+            let preset = store
+                .find_preset(&settings.active_preset_id)?
+                .ok_or_else(|| crate::StoreError::invalid("active preset does not exist"))?;
+            let compiled = compile_bindings(&preset).map_err(store_binding_error)?;
+            let fs = BindingFileSystem::open(paths, store.secure_handles())
+                .map_err(store_binding_error)?;
+            let include = fs
+                .niri
+                .read_optional(BindingFileSystem::artifact_name(ArtifactKind::Bindings))?;
+            Ok((include.as_deref() == Some(compiled.as_bytes()))
+                .then_some(settings.active_preset_id))
+        })
+        .map_err(BindingError::from_store)?
+    {
+        return Ok(ApplyReport {
+            status: ApplyStatus::Committed,
+            active_preset_id,
+        });
+    }
     apply_active_bindings(paths, validator, reloader)
 }
 

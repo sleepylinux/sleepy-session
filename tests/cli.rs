@@ -67,6 +67,42 @@ fn prepare_niri_tree(root: &TempDir) {
     fs::write(niri.join("sleepy-user-bindings.kdl"), "binds {}\n").unwrap();
 }
 
+fn compile_rust_fake_niri(root: &TempDir) -> std::path::PathBuf {
+    let source = root.path().join("fake-niri.rs");
+    let executable = root.path().join("fake-niri-rust");
+    fs::write(
+        &source,
+        r#"use std::{env, fs, io::{self, Write}, path::Path, thread, time::Duration};
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] { println!("niri 26.04"); return; }
+    let marker = env::var_os("SLEEPY_TEST_RELOAD_MARKER").unwrap();
+    if args.iter().any(|arg| arg == "event-stream") {
+        println!("{{\"ConfigLoaded\":{{\"failed\":false}}}}");
+        println!("{{\"CastsChanged\":{{\"casts\":[]}}}}");
+        io::stdout().flush().unwrap();
+        while !Path::new(&marker).exists() { thread::sleep(Duration::from_millis(1)); }
+        println!("{{\"ConfigLoaded\":{{\"failed\":false}}}}");
+        io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_secs(1));
+    } else { fs::write(marker, b"requested").unwrap(); }
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", source.to_str().unwrap(), "-o"])
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    executable
+}
+
 #[test]
 fn cli_preset_crud_validate_import_and_export_round_trip() {
     let root = TempDir::new().unwrap();
@@ -787,6 +823,71 @@ fn cli_initialize_reconciles_pending_offline_and_online_required_fails_distinctl
         serde_json::from_slice::<Value>(&required.stderr).unwrap()["error"]["code"],
         "niri_unavailable"
     );
+}
+
+#[test]
+fn cli_initialize_after_online_confirmation_preserves_exact_bytes_and_mtimes() {
+    let root = TempDir::new().unwrap();
+    prepare_niri_tree(&root);
+    fs::create_dir_all(root.path().join("state")).unwrap();
+    let fake_niri = compile_rust_fake_niri(&root);
+    let marker = root.path().join("reload-requested-rust");
+    let socket = root.path().join("niri.sock");
+    let first = command(&root)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI", &fake_niri)
+        .env("SLEEPY_TEST_RELOAD_MARKER", &marker)
+        .env("NIRI_SOCKET", &socket)
+        .args(["bindings", "initialize"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(!root
+        .path()
+        .join("state/sleepy/bindings-transaction.json")
+        .exists());
+    let artifacts = [
+        root.path().join("config/sleepy/settings.json"),
+        root.path().join("state/sleepy/presets.json"),
+        root.path().join("config/niri/sleepy-user-bindings.kdl"),
+    ];
+    let before = artifacts
+        .iter()
+        .map(|path| {
+            (
+                fs::read(path).unwrap(),
+                fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let second = command(&root)
+        .env("SLEEPY_NIRI_VALIDATOR", root.path().join("must-not-run"))
+        .args(["bindings", "initialize"])
+        .output()
+        .unwrap();
+
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&second.stdout).unwrap()["status"],
+        "committed"
+    );
+    assert!(!root
+        .path()
+        .join("state/sleepy/bindings-transaction.json")
+        .exists());
+    for (path, (bytes, modified)) in artifacts.iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+    }
 }
 
 #[test]
