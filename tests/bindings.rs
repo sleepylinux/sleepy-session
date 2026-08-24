@@ -623,6 +623,80 @@ fn rejected_candidate_cannot_be_resurrected_after_any_rollback_install_crash() {
     }
 }
 
+#[test]
+fn sidecar_fsync_crashes_leave_a_discoverable_safe_preparation_record() {
+    let sidecar_stages = [
+        ApplyStage::PresetOldSidecarSynced,
+        ApplyStage::PresetNewSidecarSynced,
+        ApplyStage::SettingsOldSidecarSynced,
+        ApplyStage::SettingsNewSidecarSynced,
+        ApplyStage::BindingsOldSidecarSynced,
+        ApplyStage::BindingsNewSidecarSynced,
+    ];
+
+    for stage in sidecar_stages {
+        let (_temp, base_paths) = apply_fixture();
+        let old_settings = fs::read(base_paths.store().settings_path()).unwrap();
+        let old_presets = fs::read(base_paths.store().presets_path()).unwrap();
+        let old_bindings = fs::read(base_paths.generated_include()).unwrap();
+        let unrelated = base_paths
+            .store()
+            .settings_path()
+            .parent()
+            .unwrap()
+            .join(".settings.json.00000000-0000-4000-8000-000000000000.old");
+        fs::write(&unrelated, b"unrelated-user-bytes").unwrap();
+        let paths = base_paths.with_observer(Arc::new(FailOnceObserver {
+            target: stage,
+            failed: Mutex::new(false),
+        }));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let validator = RecordingValidator {
+            live_include: paths.generated_include().to_owned(),
+            events: Arc::clone(&events),
+            failure: None,
+        };
+
+        let error = apply_active_bindings(&paths, &validator, &ScriptedReloader::offline(events))
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            "fault_injected",
+            "unexpected failure at {stage:?}"
+        );
+        assert!(
+            paths.journal().exists(),
+            "no preparation record at {stage:?}"
+        );
+
+        assert!(reconcile_bindings(
+            &paths,
+            &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new())))
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            fs::read(paths.store().settings_path()).unwrap(),
+            old_settings
+        );
+        assert_eq!(fs::read(paths.store().presets_path()).unwrap(), old_presets);
+        assert_eq!(fs::read(paths.generated_include()).unwrap(), old_bindings);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated-user-bytes");
+        assert!(!paths.journal().exists());
+
+        let retry_events = Arc::new(Mutex::new(Vec::new()));
+        let retry_validator = RecordingValidator {
+            live_include: paths.generated_include().to_owned(),
+            events: Arc::clone(&retry_events),
+            failure: None,
+        };
+        let retry =
+            apply_active_bindings(&paths, &retry_validator, &successful_online(retry_events))
+                .unwrap();
+        assert_eq!(retry.status, ApplyStatus::Committed);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn apply_rejects_symlinked_writable_files_and_malicious_static_links() {

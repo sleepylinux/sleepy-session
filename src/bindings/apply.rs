@@ -210,6 +210,12 @@ pub enum ApplyStage {
     RollbackSettingsDirectorySynced,
     RollbackBindingsRenamed,
     RollbackBindingsDirectorySynced,
+    PresetOldSidecarSynced,
+    PresetNewSidecarSynced,
+    SettingsOldSidecarSynced,
+    SettingsNewSidecarSynced,
+    BindingsOldSidecarSynced,
+    BindingsNewSidecarSynced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,6 +748,10 @@ fn reconcile_bindings_locked(
     let Some(mut journal) = TransactionJournal::load(paths)? else {
         return Ok(None);
     };
+    if !journal.sidecars_complete {
+        journal.cleanup(paths)?;
+        return Ok(None);
+    }
     if journal.phase == JournalPhase::ReloadConfirmed {
         let status = status_for(journal.recovery_target);
         let active_preset_id = journal.active_preset_id_for(journal.recovery_target)?;

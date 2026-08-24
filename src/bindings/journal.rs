@@ -57,6 +57,8 @@ pub(crate) struct TransactionJournal {
     pub transaction_id: String,
     pub phase: JournalPhase,
     pub recovery_target: RecoveryTarget,
+    #[serde(default = "sidecars_complete_for_legacy_journal")]
+    pub sidecars_complete: bool,
     pub active_preset_id: String,
     pub previous_active_preset_id: Option<String>,
     pub artifacts: Vec<JournalArtifact>,
@@ -101,6 +103,8 @@ impl TransactionJournal {
             ),
         ];
         let mut artifacts = Vec::new();
+        let mut sidecar_bytes = Vec::new();
+        let mut previous_active_preset_id = None;
         for (kind, destination, new_bytes) in specifications {
             let old = match fs::read(&destination) {
                 Ok(bytes) => (true, bytes),
@@ -116,9 +120,12 @@ impl TransactionJournal {
                 .ok_or_else(|| BindingError::new("unsafe_path", "non-UTF-8 artifact name"))?;
             let old_artifact = directory.join(format!(".{name}.{transaction_id}.old"));
             let new_artifact = directory.join(format!(".{name}.{transaction_id}.new"));
-            write_new_file(&old_artifact, &old.1)?;
-            write_new_file(&new_artifact, new_bytes)?;
-            sync_directory(directory)?;
+            if kind == ArtifactKind::Settings && old.0 {
+                previous_active_preset_id = String::from_utf8(old.1.clone())
+                    .ok()
+                    .and_then(|input| sleepy_sdk::validate_settings(&input).ok())
+                    .map(|settings| settings.active_preset_id);
+            }
             artifacts.push(JournalArtifact {
                 kind,
                 destination,
@@ -128,23 +135,33 @@ impl TransactionJournal {
                 old_hash: hash(&old.1),
                 new_hash: hash(new_bytes),
             });
+            sidecar_bytes.push((old.1, new_bytes.to_vec()));
         }
-        let previous_active_preset_id = artifacts
-            .iter()
-            .find(|artifact| artifact.kind == ArtifactKind::Settings && artifact.old_existed)
-            .and_then(|artifact| fs::read(&artifact.old_artifact).ok())
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|input| sleepy_sdk::validate_settings(&input).ok())
-            .map(|settings| settings.active_preset_id);
-        let journal = Self {
+        let mut journal = Self {
             schema_version: 1,
             transaction_id,
             phase: JournalPhase::Prepared,
             recovery_target: RecoveryTarget::Candidate,
+            sidecars_complete: false,
             active_preset_id: active_preset_id.to_owned(),
             previous_active_preset_id,
             artifacts,
         };
+        journal.persist_initial(paths)?;
+        for (artifact, (old_bytes, new_bytes)) in journal.artifacts.iter().zip(sidecar_bytes.iter())
+        {
+            write_new_file(&artifact.old_artifact, old_bytes)?;
+            paths.observe(sidecar_stage(artifact.kind, false))?;
+            write_new_file(&artifact.new_artifact, new_bytes)?;
+            paths.observe(sidecar_stage(artifact.kind, true))?;
+            sync_directory(
+                artifact
+                    .destination
+                    .parent()
+                    .expect("closed artifact has parent"),
+            )?;
+        }
+        journal.sidecars_complete = true;
         journal.persist(paths)?;
         paths.observe(ApplyStage::PreparedSynced)?;
         Ok(journal)
@@ -226,6 +243,13 @@ impl TransactionJournal {
         atomic_replace(paths.journal(), &bytes)
     }
 
+    fn persist_initial(&self, paths: &BindingPaths) -> Result<(), BindingError> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| BindingError::new("invalid_journal", error.to_string()))?;
+        write_new_file(paths.journal(), &bytes)?;
+        sync_directory(paths.journal().parent().expect("journal has parent"))
+    }
+
     pub fn cleanup(&self, paths: &BindingPaths) -> Result<(), BindingError> {
         let mut directories = BTreeSet::new();
         for artifact in &self.artifacts {
@@ -301,7 +325,8 @@ impl TransactionJournal {
                     Ok(bytes) => bytes,
                     Err(error)
                         if error.kind() == std::io::ErrorKind::NotFound
-                            && self.phase == JournalPhase::ReloadConfirmed =>
+                            && (!self.sidecars_complete
+                                || self.phase == JournalPhase::ReloadConfirmed) =>
                     {
                         continue;
                     }
@@ -318,6 +343,21 @@ impl TransactionJournal {
             }
         }
         Ok(())
+    }
+}
+
+fn sidecars_complete_for_legacy_journal() -> bool {
+    true
+}
+
+fn sidecar_stage(kind: ArtifactKind, new: bool) -> ApplyStage {
+    match (kind, new) {
+        (ArtifactKind::Preset, false) => ApplyStage::PresetOldSidecarSynced,
+        (ArtifactKind::Preset, true) => ApplyStage::PresetNewSidecarSynced,
+        (ArtifactKind::Settings, false) => ApplyStage::SettingsOldSidecarSynced,
+        (ArtifactKind::Settings, true) => ApplyStage::SettingsNewSidecarSynced,
+        (ArtifactKind::Bindings, false) => ApplyStage::BindingsOldSidecarSynced,
+        (ArtifactKind::Bindings, true) => ApplyStage::BindingsNewSidecarSynced,
     }
 }
 
