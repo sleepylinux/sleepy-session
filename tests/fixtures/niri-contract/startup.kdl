@@ -1,0 +1,2 @@
+spawn-at-startup "nm-applet" "--indicator"
+spawn-at-startup "systemctl" "--user" "import-environment" "NIRI_SOCKET" "WAYLAND_DISPLAY"

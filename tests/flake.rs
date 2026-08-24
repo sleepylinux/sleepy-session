@@ -29,3 +29,12 @@ fn flake_exposes_the_session_and_user_unit_packages() {
     assert!(flake.contains("sleepy-session = package"));
     assert!(flake.contains("sleepy-session-user-unit = userUnit"));
 }
+
+#[test]
+fn flake_exposes_a_mandatory_niri_26_04_bindings_check() {
+    let flake = read_repository_file("flake.nix");
+
+    assert!(flake.contains("niri-bindings = packageFor system true"));
+    assert!(flake.contains("assert pkgs.niri.version == \"26.04\""));
+    assert!(flake.contains("compiler_registry_validates_with_niri_26_04 -- --exact --ignored"));
+}

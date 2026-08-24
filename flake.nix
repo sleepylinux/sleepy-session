@@ -13,12 +13,12 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      packageFor = system:
+      packageFor = system: withNiriContract:
         let
           pkgs = import nixpkgs { inherit system; };
           niriContract = assert pkgs.niri.version == "26.04"; pkgs.niri;
         in
-        pkgs.rustPlatform.buildRustPackage {
+        pkgs.rustPlatform.buildRustPackage ({
           pname = "sleepy-session";
           version = "0.1.0";
           src = self;
@@ -27,16 +27,23 @@
             # Cargo.lock fixes the SDK revision; this avoids an invented vendor hash.
             allowBuiltinFetchGit = true;
           };
-          SLEEPY_NIRI_CONTRACT = "${niriContract}/bin/niri";
           passthru.sleepy-sdk-source = sleepy-sdk;
           meta.license = pkgs.lib.licenses.gpl3Only;
-        };
+        } // pkgs.lib.optionalAttrs withNiriContract {
+          SLEEPY_NIRI_CONTRACT = "${niriContract}/bin/niri";
+          checkPhase = ''
+            runHook preCheck
+            cargo test --offline --release --test bindings \
+              compiler_registry_validates_with_niri_26_04 -- --exact --ignored
+            runHook postCheck
+          '';
+        });
     in
     {
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          package = packageFor system;
+          package = packageFor system false;
           userUnit = (pkgs.writeTextDir "share/systemd/user/sleepy-session.service" ''
             [Unit]
             Description=Initialize Sleepy session settings state
@@ -60,7 +67,8 @@
         });
 
       checks = forAllSystems (system: {
-        build = packageFor system;
+        build = packageFor system false;
+        niri-bindings = packageFor system true;
       });
     };
 }

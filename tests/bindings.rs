@@ -15,7 +15,7 @@ use sleepy_session::{
         reconcile_bindings, reconcile_bindings_online_required, repair_state,
         update_active_bindings_and_apply, ApplyObserver, ApplyStage, ApplyStatus, BindingPaths,
         BindingReloader, BindingValidator, ConfigEventStream, ConfigLoaded, NiriReloader,
-        RepairBundle,
+        NiriValidator, RepairBundle,
     },
     Defaults, StateStore, StorePaths,
 };
@@ -146,10 +146,10 @@ fn compiler_golden_maps_every_closed_action_to_typed_niri_kdl() {
 }
 
 #[test]
-fn compiler_registry_validates_with_pinned_niri() {
-    let Some(niri) = std::env::var_os("SLEEPY_NIRI_CONTRACT") else {
-        return;
-    };
+#[ignore = "run by the mandatory checks.niri-bindings Nix contract"]
+fn compiler_registry_validates_with_niri_26_04() {
+    let niri = std::env::var_os("SLEEPY_NIRI_CONTRACT")
+        .expect("checks.niri-bindings must provide SLEEPY_NIRI_CONTRACT");
     let version = Command::new(&niri).arg("--version").output().unwrap();
     assert!(version.status.success());
     assert!(
@@ -158,20 +158,21 @@ fn compiler_registry_validates_with_pinned_niri() {
         String::from_utf8_lossy(&version.stdout).trim()
     );
 
-    let root = TempDir::new().unwrap();
-    let config = root.path().join("config.kdl");
-    fs::write(&config, compile_bindings(&all_actions_preset()).unwrap()).unwrap();
-    let output = Command::new(niri)
-        .args(["validate", "--config"])
-        .arg(&config)
-        .output()
-        .unwrap();
+    let (temp, paths) = niri_contract_fixture();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let report = apply_active_bindings(
+        &paths,
+        &NiriValidator::new(niri),
+        &ScriptedReloader::offline(events),
+    )
+    .unwrap();
 
-    assert!(
-        output.status.success(),
-        "generated registry failed Niri 26.04 validation:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(temp.path().is_dir());
+    assert_eq!(report.status, ApplyStatus::ReloadPending);
+    let generated = fs::read_to_string(paths.generated_include()).unwrap();
+    assert!(generated.starts_with("binds {\n"));
+    assert!(generated.contains("focus-workspace-down"));
+    assert!(generated.contains("focus-workspace-up"));
 }
 
 #[test]
@@ -313,6 +314,36 @@ fn apply_fixture() -> (TempDir, BindingPaths) {
     .unwrap();
     fs::write(niri_root.join("input.kdl"), "input {}\n").unwrap();
     fs::write(niri_root.join("sleepy-user-bindings.kdl"), "old include\n").unwrap();
+    let store_paths = StorePaths::from_xdg_roots(&config_root, &state_root);
+    StateStore::open(store_paths, Defaults::packaged()).unwrap();
+    let paths = BindingPaths::from_xdg_roots(config_root, state_root);
+    (temp, paths)
+}
+
+fn niri_contract_fixture() -> (TempDir, BindingPaths) {
+    let temp = TempDir::new().unwrap();
+    let config_root = temp.path().join("config");
+    let state_root = temp.path().join("state");
+    let niri_root = config_root.join("niri");
+    fs::create_dir_all(&niri_root).unwrap();
+    fs::create_dir_all(&state_root).unwrap();
+    for name in [
+        "config.kdl",
+        "input.kdl",
+        "appearance.kdl",
+        "bindings-core.kdl",
+        "rules.kdl",
+        "startup.kdl",
+    ] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/niri-contract")
+                .join(name),
+            niri_root.join(name),
+        )
+        .unwrap();
+    }
+    fs::write(niri_root.join("sleepy-user-bindings.kdl"), "binds {}\n").unwrap();
     let store_paths = StorePaths::from_xdg_roots(&config_root, &state_root);
     StateStore::open(store_paths, Defaults::packaged()).unwrap();
     let paths = BindingPaths::from_xdg_roots(config_root, state_root);
