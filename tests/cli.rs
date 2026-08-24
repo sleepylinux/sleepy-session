@@ -1,10 +1,13 @@
 use std::{
     fs,
     io::Write,
+    path::Path,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use serde_json::{json, Value};
+use sleepy_session::bindings::{BindingReloader, BindingValidator, NiriReloader, NiriValidator};
 use tempfile::TempDir;
 
 const USER_ID: &str = "5268c988-5c83-4921-a592-2c3342e59d61";
@@ -78,16 +81,17 @@ fn main() {
     if args == ["--version"] { println!("niri 26.04"); return; }
     let marker = env::var_os("SLEEPY_TEST_RELOAD_MARKER").unwrap();
     if args.iter().any(|arg| arg == "event-stream") {
-        println!("{{\"ConfigLoaded\":{{\"failed\":false}}}}");
+        thread::sleep(Duration::from_millis(80));
+        println!("{{\"ConfigLoaded\":{{\"failed\":true}}}}");
         println!("{{\"CastsChanged\":{{\"casts\":[]}}}}");
         io::stdout().flush().unwrap();
         while !Path::new(&marker).exists() { thread::sleep(Duration::from_millis(1)); }
         println!("{{\"ConfigLoaded\":{{\"failed\":false}}}}");
         io::stdout().flush().unwrap();
         thread::sleep(Duration::from_secs(1));
-    } else { fs::write(marker, b"requested").unwrap(); }
-}
-"#,
+	    } else { fs::write(marker, b"requested").unwrap(); }
+	}
+	"#,
     )
     .unwrap();
     let output = Command::new("rustc")
@@ -101,6 +105,109 @@ fn main() {
         String::from_utf8_lossy(&output.stderr)
     );
     executable
+}
+
+fn compile_hanging_rust_niri(
+    root: &TempDir,
+    phase: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let source = root.path().join(format!("hanging-{phase}.rs"));
+    let executable = root.path().join(format!("hanging-{phase}"));
+    let pid_file = root.path().join(format!("hanging-{phase}.pid"));
+    let program = format!(
+        r#"use std::{{env, fs, io::{{self, Write}}, thread, time::Duration}};
+const PHASE: &str = {phase:?};
+const PID_FILE: &str = {pid_file:?};
+fn hang() -> ! {{
+    fs::write(PID_FILE, std::process::id().to_string()).unwrap();
+    loop {{ thread::sleep(Duration::from_secs(30)); }}
+}}
+fn main() {{
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] {{
+        if PHASE == "version" {{ hang(); }}
+        println!("niri 26.04");
+    }} else if args.first().map(String::as_str) == Some("validate") {{
+        if PHASE == "validate" {{ hang(); }}
+    }} else if args.iter().any(|arg| arg == "event-stream") {{
+        if PHASE == "event-stream" {{ hang(); }}
+        println!("{{{{\"ConfigLoaded\":{{{{\"failed\":false}}}}}}}}");
+        println!("{{{{\"CastsChanged\":{{{{\"casts\":[]}}}}}}}}");
+        io::stdout().flush().unwrap();
+        loop {{ thread::sleep(Duration::from_secs(30)); }}
+    }} else if args.iter().any(|arg| arg == "load-config-file") {{
+        if PHASE == "load" {{ hang(); }}
+    }}
+}}
+"#,
+        phase = phase,
+        pid_file = pid_file.to_string_lossy(),
+    );
+    fs::write(&source, program).unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", source.to_str().unwrap(), "-o"])
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (executable, pid_file)
+}
+
+fn assert_pid_reaped(pid_file: &Path) {
+    let pid = fs::read_to_string(pid_file).unwrap();
+    assert!(
+        !Path::new("/proc").join(pid.trim()).exists(),
+        "child {pid} was not reaped"
+    );
+}
+
+#[test]
+fn production_niri_processes_timeout_and_reap_validate_version_stream_and_load() {
+    for phase in ["validate", "version", "event-stream", "load"] {
+        let root = TempDir::new().unwrap();
+        let (executable, pid_file) = compile_hanging_rust_niri(&root, phase);
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let error = match phase {
+            "validate" => NiriValidator::with_timeout(&executable, timeout)
+                .validate(root.path(), &root.path().join("config.kdl"))
+                .unwrap_err(),
+            "version" => match NiriReloader::with_runtime(
+                &executable,
+                Some(root.path().join("niri.sock")),
+                timeout,
+            )
+            .subscribe()
+            {
+                Ok(_) => panic!("hanging version query unexpectedly succeeded"),
+                Err(error) => error,
+            },
+            "event-stream" => {
+                let reloader = NiriReloader::with_runtime(
+                    &executable,
+                    Some(root.path().join("niri.sock")),
+                    timeout,
+                );
+                let mut stream = reloader.subscribe().unwrap().unwrap();
+                stream.await_initial_snapshot(timeout).unwrap_err()
+            }
+            "load" => NiriReloader::with_runtime(
+                &executable,
+                Some(root.path().join("niri.sock")),
+                timeout,
+            )
+            .request_reload(&root.path().join("config.kdl"))
+            .unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(error.contains("timed out"), "phase={phase}: {error}");
+        assert!(started.elapsed() < Duration::from_secs(2), "phase={phase}");
+        assert_pid_reaped(&pid_file);
+    }
 }
 
 #[test]
@@ -747,19 +854,11 @@ fn cli_activation_apply_and_builtin_edit_use_the_offline_journal_path() {
 
 #[test]
 fn cli_online_reload_waits_through_delayed_stale_snapshot_and_keeps_json_clean() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = TempDir::new().unwrap();
     prepare_niri_tree(&root);
     fs::create_dir_all(root.path().join("state")).unwrap();
-    let fake_niri = root.path().join("fake-niri");
+    let fake_niri = compile_rust_fake_niri(&root);
     let reload_marker = root.path().join("reload-requested");
-    fs::write(
-        &fake_niri,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' 'niri 26.04'\nelif [ \"$2\" = \"--json\" ]; then\n  sleep 0.08\n  printf '%s\\n' '{\"ConfigLoaded\":{\"failed\":true}}'\n  printf '%s\\n' '{\"CastsChanged\":{\"casts\":[]}}'\n  while [ ! -f \"$SLEEPY_TEST_RELOAD_MARKER\" ]; do sleep 0.01; done\n  printf '%s\\n' '{\"ConfigLoaded\":{\"failed\":false}}'\n  sleep 1\nelse\n  : > \"$SLEEPY_TEST_RELOAD_MARKER\"\n  printf '%s\\n' 'niri-child-noise'\nfi\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_niri, fs::Permissions::from_mode(0o700)).unwrap();
 
     let output = command(&root)
         .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")

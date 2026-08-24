@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs,
     path::Path,
+    process::Command,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,7 +14,8 @@ use sleepy_session::{
         import_replace_active_and_apply, initialize_bindings, mutate_keybinding_and_apply,
         reconcile_bindings, reconcile_bindings_online_required, repair_state,
         update_active_bindings_and_apply, ApplyObserver, ApplyStage, ApplyStatus, BindingPaths,
-        BindingReloader, BindingValidator, ConfigEventStream, ConfigLoaded, RepairBundle,
+        BindingReloader, BindingValidator, ConfigEventStream, ConfigLoaded, NiriReloader,
+        RepairBundle,
     },
     Defaults, StateStore, StorePaths,
 };
@@ -34,6 +36,58 @@ fn preset(bindings: &[(&str, &str)]) -> PresetDocument {
             .collect(),
         plugin_requirements: Vec::new(),
     }
+}
+
+fn compile_rollback_hanging_niri(root: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let source = root.path().join("rollback-hang.rs");
+    let executable = root.path().join("rollback-hang");
+    let count = root.path().join("load-count");
+    let pid = root.path().join("rollback-load.pid");
+    let program = r#"use std::{env, fs, io::{self, Write}, path::Path, thread, time::Duration};
+const COUNT: &str = __COUNT__;
+const PID: &str = __PID__;
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args == ["--version"] { println!("niri 26.04"); return; }
+    if args.iter().any(|arg| arg == "event-stream") {
+        let initial = fs::read_to_string(COUNT).unwrap_or_else(|_| "0".to_owned());
+        println!("{{\"ConfigLoaded\":{{\"failed\":{}}}}}", initial != "0");
+        println!("{{\"CastsChanged\":{{\"casts\":[]}}}}");
+        io::stdout().flush().unwrap();
+        loop {
+            let current = fs::read_to_string(COUNT).unwrap_or_else(|_| "0".to_owned());
+            if current != initial {
+                println!("{{\"ConfigLoaded\":{{\"failed\":true}}}}");
+                io::stdout().flush().unwrap();
+                loop { thread::sleep(Duration::from_secs(30)); }
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if args.iter().any(|arg| arg == "load-config-file") {
+        if Path::new(COUNT).exists() {
+            fs::write(COUNT, "2").unwrap();
+            fs::write(PID, std::process::id().to_string()).unwrap();
+            loop { thread::sleep(Duration::from_secs(30)); }
+        }
+        fs::write(COUNT, "1").unwrap();
+    }
+}
+"#
+    .replace("__COUNT__", &format!("{:?}", count.to_string_lossy()))
+    .replace("__PID__", &format!("{:?}", pid.to_string_lossy()));
+    fs::write(&source, program).unwrap();
+    let output = Command::new("rustc")
+        .args(["--edition=2021", source.to_str().unwrap(), "-o"])
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (executable, pid)
 }
 
 #[test]
@@ -345,6 +399,24 @@ fn apply_reports_unknown_state_when_rollback_reload_is_not_confirmed() {
         fs::read_to_string(paths.generated_include()).unwrap(),
         "old include\n"
     );
+    assert!(paths.journal().exists());
+}
+
+#[test]
+fn production_rollback_load_timeout_is_bounded_reaped_and_reported_unknown() {
+    let (temp, paths) = apply_fixture();
+    let (executable, pid_file) = compile_rollback_hanging_niri(&temp);
+    let reloader = NiriReloader::with_runtime(
+        executable,
+        Some(temp.path().join("niri.sock")),
+        Duration::from_millis(100),
+    );
+
+    let report = apply_active_bindings(&paths, &InitializingValidator, &reloader).unwrap();
+
+    assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
+    let pid = fs::read_to_string(pid_file).unwrap();
+    assert!(!Path::new("/proc").join(pid.trim()).exists());
     assert!(paths.journal().exists());
 }
 

@@ -1,11 +1,15 @@
 use std::{
     collections::BTreeSet,
-    io::{BufRead, BufReader},
+    io::Read,
+    os::fd::AsRawFd,
     os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
-    sync::Arc,
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -48,29 +52,45 @@ pub trait BindingReloader {
             .ok_or_else(|| "Niri socket or event stream is unavailable".to_owned())
     }
     fn request_reload(&self, trusted_config: &Path) -> Result<(), String>;
+    fn request_reload_with_timeout(
+        &self,
+        trusted_config: &Path,
+        _timeout: Duration,
+    ) -> Result<(), String> {
+        self.request_reload(trusted_config)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct NiriValidator {
     executable: PathBuf,
+    timeout: Duration,
 }
 
 impl NiriValidator {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            timeout: RELOAD_TIMEOUT,
+        }
+    }
+
+    pub fn with_timeout(executable: impl Into<PathBuf>, timeout: Duration) -> Self {
+        Self {
+            executable: executable.into(),
+            timeout,
         }
     }
 }
 
 impl BindingValidator for NiriValidator {
     fn validate(&self, staged_root: &Path, staged_config: &Path) -> Result<(), String> {
-        let output = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .args(["validate", "--config"])
             .arg(staged_config)
-            .current_dir(staged_root)
-            .output()
-            .map_err(|error| format!("failed to execute pinned Niri validator: {error}"))?;
+            .current_dir(staged_root);
+        let output = run_command_bounded(&mut command, self.timeout, "pinned Niri validator")?;
         if output.status.success() {
             Ok(())
         } else {
@@ -85,22 +105,39 @@ impl BindingValidator for NiriValidator {
 #[derive(Debug, Clone)]
 pub struct NiriReloader {
     executable: PathBuf,
+    socket: Option<PathBuf>,
+    timeout: Duration,
 }
 
 impl NiriReloader {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            socket: std::env::var_os("NIRI_SOCKET").map(PathBuf::from),
+            timeout: RELOAD_TIMEOUT,
         }
     }
-}
 
-impl BindingReloader for NiriReloader {
-    fn subscribe(&self) -> Result<Option<Box<dyn ConfigEventStream>>, String> {
-        if std::env::var_os("NIRI_SOCKET").is_none() {
+    pub fn with_runtime(
+        executable: impl Into<PathBuf>,
+        socket: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            executable: executable.into(),
+            socket,
+            timeout,
+        }
+    }
+
+    fn subscribe_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<Box<dyn ConfigEventStream>>, String> {
+        if self.socket.is_none() {
             return Ok(None);
         }
-        ensure_supported_niri(&self.executable)?;
+        ensure_supported_niri(&self.executable, remaining(deadline)?)?;
         let mut child = Command::new(&self.executable)
             .args(["msg", "--json", "event-stream"])
             .stdout(Stdio::piped())
@@ -111,43 +148,86 @@ impl BindingReloader for NiriReloader {
             .stdout
             .take()
             .ok_or_else(|| "Niri event stream did not expose stdout".to_owned())?;
+        set_nonblocking(stdout.as_raw_fd())?;
         let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(message) = parse_stream_message(&line) {
-                    if sender.send(message).is_err() {
-                        break;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let reader_cancelled = Arc::clone(&cancelled);
+        let reader = thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut pending = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !reader_cancelled.load(Ordering::Acquire) {
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(length) => {
+                        pending.extend_from_slice(&chunk[..length]);
+                        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                            let line = pending.drain(..=newline).collect::<Vec<_>>();
+                            if let Ok(line) = std::str::from_utf8(&line) {
+                                if let Some(message) = parse_stream_message(line) {
+                                    if sender.send(message).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
                 }
             }
         });
-        Ok(Some(Box::new(NiriEventStream { child, receiver })))
+        Ok(Some(Box::new(NiriEventStream {
+            child: Some(child),
+            reader: Some(reader),
+            cancelled,
+            receiver,
+            deadline,
+        })))
+    }
+}
+
+impl BindingReloader for NiriReloader {
+    fn subscribe(&self) -> Result<Option<Box<dyn ConfigEventStream>>, String> {
+        self.subscribe_until(Instant::now() + self.timeout)
     }
 
     fn request_reload(&self, trusted_config: &Path) -> Result<(), String> {
-        let status = Command::new(&self.executable)
+        self.request_reload_with_timeout(trusted_config, self.timeout)
+    }
+
+    fn request_reload_with_timeout(
+        &self,
+        trusted_config: &Path,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let mut command = Command::new(&self.executable);
+        command
             .args(["msg", "action", "load-config-file", "--path"])
-            .arg(trusted_config)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| format!("failed to request Niri config reload: {error}"))?;
-        if status.success() {
+            .arg(trusted_config);
+        let output = run_command_bounded(
+            &mut command,
+            timeout.min(self.timeout),
+            "Niri reload request",
+        )?;
+        if output.status.success() {
             Ok(())
         } else {
-            Err(format!("Niri reload request exited with {status}"))
+            Err(format!("Niri reload request exited with {}", output.status))
         }
     }
 
     fn subscribe_required(&self, timeout: Duration) -> Result<Box<dyn ConfigEventStream>, String> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + timeout.min(self.timeout);
         loop {
-            if let Some(socket) = std::env::var_os("NIRI_SOCKET") {
+            if let Some(socket) = self.socket.as_deref() {
                 if std::fs::symlink_metadata(socket)
                     .map(|metadata| metadata.file_type().is_socket())
                     .unwrap_or(false)
                 {
-                    if let Some(stream) = self.subscribe()? {
+                    if let Some(stream) = self.subscribe_until(deadline)? {
                         return Ok(stream);
                     }
                 }
@@ -161,13 +241,16 @@ impl BindingReloader for NiriReloader {
 }
 
 struct NiriEventStream {
-    child: Child,
+    child: Option<Child>,
+    reader: Option<thread::JoinHandle<()>>,
+    cancelled: Arc<AtomicBool>,
     receiver: Receiver<NiriStreamMessage>,
+    deadline: Instant,
 }
 
 impl ConfigEventStream for NiriEventStream {
     fn await_initial_snapshot(&mut self, timeout: Duration) -> Result<ConfigLoaded, String> {
-        let deadline = Instant::now() + timeout;
+        let deadline = (Instant::now() + timeout).min(self.deadline);
         let mut config = None;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -187,9 +270,11 @@ impl ConfigEventStream for NiriEventStream {
                     });
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    self.terminate();
                     return Err("timed out awaiting complete Niri initial snapshot".to_owned());
                 }
                 Err(RecvTimeoutError::Disconnected) => {
+                    self.terminate();
                     return Err(
                         "Niri event stream closed before initial snapshot completed".to_owned()
                     );
@@ -199,13 +284,18 @@ impl ConfigEventStream for NiriEventStream {
     }
 
     fn next_config_loaded(&mut self, timeout: Duration) -> Result<Option<ConfigLoaded>, String> {
+        let timeout = timeout.min(self.deadline.saturating_duration_since(Instant::now()));
         match self.receiver.recv_timeout(timeout) {
             Ok(NiriStreamMessage::ConfigLoaded(event)) => Ok(Some(event)),
             Ok(NiriStreamMessage::InitialSnapshotComplete) => {
                 Err("Niri emitted an unexpected second initial snapshot marker".to_owned())
             }
-            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Timeout) => {
+                self.terminate();
+                Ok(None)
+            }
             Err(RecvTimeoutError::Disconnected) => {
+                self.terminate();
                 Err("Niri event stream closed before ConfigLoaded".to_owned())
             }
         }
@@ -214,9 +304,38 @@ impl ConfigEventStream for NiriEventStream {
 
 impl Drop for NiriEventStream {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate();
     }
+}
+
+impl NiriEventStream {
+    fn terminate(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn set_nonblocking(descriptor: i32) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(format!(
+            "failed to inspect Niri event stream flags: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(format!(
+            "failed to make Niri event stream nonblocking: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,11 +357,10 @@ fn parse_stream_message(line: &str) -> Option<NiriStreamMessage> {
     Some(NiriStreamMessage::ConfigLoaded(ConfigLoaded { failed }))
 }
 
-fn ensure_supported_niri(executable: &Path) -> Result<(), String> {
-    let output = Command::new(executable)
-        .arg("--version")
-        .output()
-        .map_err(|error| format!("failed to query pinned Niri version: {error}"))?;
+fn ensure_supported_niri(executable: &Path, timeout: Duration) -> Result<(), String> {
+    let mut command = Command::new(executable);
+    command.arg("--version");
+    let output = run_command_bounded(&mut command, timeout, "pinned Niri version query")?;
     if !output.status.success() {
         return Err("pinned Niri version query failed".to_owned());
     }
@@ -262,6 +380,83 @@ fn ensure_supported_niri(executable: &Path) -> Result<(), String> {
             "unsupported Niri event protocol {version:?}; requires Niri >= 26.04"
         )),
     }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err("timed out before starting Niri subprocess".to_owned())
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn run_command_bounded(
+    command: &mut Command,
+    timeout: Duration,
+    description: &str,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to execute {description}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{description} did not expose stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{description} did not expose stderr"))?;
+    let stdout_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stdout = stdout;
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut stderr = stderr;
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(
+                    Duration::from_millis(5)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("timed out waiting for {description}"));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("failed waiting for {description}: {error}"));
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| format!("{description} stdout reader panicked"))?
+        .map_err(|error| format!("failed reading {description} stdout: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| format!("{description} stderr reader panicked"))?
+        .map_err(|error| format!("failed reading {description} stderr: {error}"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 pub trait ApplyObserver: Send + Sync {
@@ -883,6 +1078,7 @@ fn reconcile_bindings_locked(
     reloader: &dyn BindingReloader,
     online_required: bool,
 ) -> Result<Option<ApplyReport>, BindingError> {
+    let online_deadline = online_required.then(|| Instant::now() + RELOAD_TIMEOUT);
     let Some(mut journal) = TransactionJournal::load(fs, paths)? else {
         return Ok(None);
     };
@@ -910,7 +1106,10 @@ fn reconcile_bindings_locked(
     let mut stream = if online_required {
         Some(
             reloader
-                .subscribe_required(RELOAD_TIMEOUT)
+                .subscribe_required(
+                    remaining(online_deadline.expect("required deadline"))
+                        .map_err(|message| BindingError::new("niri_unavailable", message))?,
+                )
                 .map_err(|message| BindingError::new("niri_unavailable", message))?,
         )
     } else {
@@ -920,7 +1119,7 @@ fn reconcile_bindings_locked(
     };
     if let Some(stream) = stream.as_mut() {
         stream
-            .await_initial_snapshot(RELOAD_TIMEOUT)
+            .await_initial_snapshot(operation_timeout(online_deadline))
             .map_err(|message| {
                 BindingError::new(
                     if online_required {
@@ -948,7 +1147,12 @@ fn reconcile_bindings_locked(
             active_preset_id,
         }));
     };
-    if reload_confirmed(paths, reloader, stream.as_mut())? {
+    if reload_confirmed(
+        paths,
+        reloader,
+        stream.as_mut(),
+        operation_timeout(online_deadline),
+    )? {
         journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
         journal.cleanup(fs, paths)?;
         return Ok(Some(ApplyReport {
@@ -963,10 +1167,18 @@ fn reconcile_bindings_locked(
         }));
     }
 
-    let rollback_stream = reloader.subscribe();
+    let rollback_stream = if online_required {
+        remaining(online_deadline.expect("required deadline"))
+            .and_then(|timeout| reloader.subscribe_required(timeout).map(Some))
+    } else {
+        reloader.subscribe()
+    };
     let mut rollback_stream = match rollback_stream {
         Ok(Some(mut stream)) => {
-            if stream.await_initial_snapshot(RELOAD_TIMEOUT).is_ok() {
+            if stream
+                .await_initial_snapshot(operation_timeout(online_deadline))
+                .is_ok()
+            {
                 Some(stream)
             } else {
                 None
@@ -979,7 +1191,12 @@ fn reconcile_bindings_locked(
     journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
     let confirmed = match rollback_stream.as_mut() {
-        Some(stream) => reload_confirmed(paths, reloader, stream.as_mut())?,
+        Some(stream) => reload_confirmed(
+            paths,
+            reloader,
+            stream.as_mut(),
+            operation_timeout(online_deadline),
+        )?,
         None => false,
     };
     if confirmed {
@@ -1070,7 +1287,7 @@ fn apply_candidate_locked(
             active_preset_id: active_preset_id.to_owned(),
         });
     };
-    if reload_confirmed(paths, reloader, candidate_stream.as_mut())? {
+    if reload_confirmed(paths, reloader, candidate_stream.as_mut(), RELOAD_TIMEOUT)? {
         journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
         journal.cleanup(fs, paths)?;
         return Ok(ApplyReport {
@@ -1095,7 +1312,7 @@ fn apply_candidate_locked(
     journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
     let rollback_confirmed = match rollback_stream.as_mut() {
-        Some(stream) => reload_confirmed(paths, reloader, stream.as_mut())?,
+        Some(stream) => reload_confirmed(paths, reloader, stream.as_mut(), RELOAD_TIMEOUT)?,
         None => false,
     };
     if rollback_confirmed {
@@ -1117,15 +1334,25 @@ fn reload_confirmed(
     paths: &BindingPaths,
     reloader: &dyn BindingReloader,
     stream: &mut dyn ConfigEventStream,
+    timeout: Duration,
 ) -> Result<bool, BindingError> {
-    if reloader.request_reload(paths.trusted_config()).is_err() {
+    if reloader
+        .request_reload_with_timeout(paths.trusted_config(), timeout)
+        .is_err()
+    {
         return Ok(false);
     }
     paths.observe(ApplyStage::ReloadRequested)?;
     Ok(matches!(
-        stream.next_config_loaded(RELOAD_TIMEOUT),
+        stream.next_config_loaded(timeout),
         Ok(Some(ConfigLoaded { failed: false }))
     ))
+}
+
+fn operation_timeout(deadline: Option<Instant>) -> Duration {
+    deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(RELOAD_TIMEOUT)
 }
 
 fn validate_candidate_tree(
@@ -1224,4 +1451,37 @@ fn remove_tree(directory: &SecureDir) -> Result<(), BindingError> {
         }
     }
     directory.sync().map_err(BindingError::from_store)
+}
+
+#[cfg(test)]
+mod process_lifecycle_tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    #[test]
+    fn event_stream_termination_joins_reader_before_returning() {
+        let child = Command::new("/bin/true").spawn().unwrap();
+        let (_sender, receiver) = mpsc::channel();
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_reader = Arc::clone(&completed);
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            completed_in_reader.store(true, Ordering::SeqCst);
+        });
+        let mut stream = NiriEventStream {
+            child: Some(child),
+            reader: Some(reader),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            receiver,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+
+        stream.terminate();
+
+        assert!(completed.load(Ordering::SeqCst));
+    }
 }
