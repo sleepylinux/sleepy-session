@@ -616,6 +616,34 @@ struct SwapWritableDirectoryObserver {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct SwapNiriSourceEntryObserver {
+    source: std::path::PathBuf,
+    attacker: std::path::PathBuf,
+    occurrence: usize,
+    seen: Mutex<usize>,
+}
+
+#[cfg(unix)]
+impl ApplyObserver for SwapNiriSourceEntryObserver {
+    fn reached(&self, stage: ApplyStage) -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+
+        if stage != ApplyStage::NiriSourceEntryEnumerated {
+            return Ok(());
+        }
+        let mut seen = self.seen.lock().unwrap();
+        *seen += 1;
+        if *seen == self.occurrence {
+            fs::rename(&self.source, self.source.with_extension("opened-original"))
+                .map_err(|error| error.to_string())?;
+            symlink(&self.attacker, &self.source).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 impl ApplyObserver for SwapWritableDirectoryObserver {
     fn reached(&self, stage: ApplyStage) -> Result<(), String> {
         use std::os::unix::fs::symlink;
@@ -732,6 +760,46 @@ fn binding_roots_reject_ancestor_symlinks_and_relative_xdg_paths() {
     )
     .unwrap_err();
     assert_eq!(relative_error.code(), "unsafe_path");
+}
+
+#[cfg(unix)]
+#[test]
+fn niri_source_copy_never_follows_an_entry_swapped_after_enumeration() {
+    for nested in [false, true] {
+        let (_temp, base_paths) = apply_fixture();
+        let source = if nested {
+            let directory = base_paths.niri_root().join("nested");
+            fs::create_dir(&directory).unwrap();
+            let source = directory.join("extra.kdl");
+            fs::write(&source, b"original nested\n").unwrap();
+            source
+        } else {
+            base_paths.trusted_config().to_owned()
+        };
+        let attacker = base_paths.niri_root().join(if nested {
+            "attacker-nested.kdl"
+        } else {
+            "attacker-root.kdl"
+        });
+        fs::write(&attacker, b"attacker bytes\n").unwrap();
+        let occurrence = if nested { 3 } else { 1 };
+        let paths = base_paths.with_observer(Arc::new(SwapNiriSourceEntryObserver {
+            source,
+            attacker,
+            occurrence,
+            seen: Mutex::new(0),
+        }));
+
+        let error = apply_active_bindings(
+            &paths,
+            &InitializingValidator,
+            &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), "unsafe_path", "nested={nested}");
+        assert!(!paths.journal().exists());
+    }
 }
 
 #[test]

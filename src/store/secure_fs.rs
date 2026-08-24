@@ -1,10 +1,10 @@
 use std::{
-    ffi::{CString, OsStr},
+    ffi::{CStr, CString, OsStr, OsString},
     fs::File,
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::ffi::OsStrExt,
+        unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -44,6 +44,12 @@ pub(crate) enum PublicationBoundary {
     Renamed,
     DirectorySyncStarted,
     DirectorySynced,
+}
+
+pub(crate) enum SecureEntry {
+    Regular(Vec<u8>),
+    Directory(SecureDir),
+    Symlink(PathBuf),
 }
 
 impl StoreHandles {
@@ -310,11 +316,127 @@ impl SecureDir {
         }
     }
 
-    pub fn entries(&self) -> Result<Vec<std::ffi::OsString>, StoreError> {
-        std::fs::read_dir(self.proc_path())
-            .map_err(StoreError::io)?
-            .map(|entry| entry.map(|entry| entry.file_name()).map_err(StoreError::io))
-            .collect()
+    pub fn entries(&self) -> Result<Vec<OsString>, StoreError> {
+        let duplicate = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicate < 0 {
+            return Err(StoreError::io(io::Error::last_os_error()));
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            unsafe { libc::close(duplicate) };
+            return Err(StoreError::io(io::Error::last_os_error()));
+        }
+        let mut entries = Vec::new();
+        loop {
+            unsafe { *libc::__errno_location() = 0 };
+            let entry = unsafe { libc::readdir(stream) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                unsafe { libc::closedir(stream) };
+                if error.raw_os_error() == Some(0) {
+                    break;
+                }
+                return Err(StoreError::io(error));
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() != b"." && name.to_bytes() != b".." {
+                entries.push(OsStr::from_bytes(name.to_bytes()).to_owned());
+            }
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
+    pub fn open_entry(&self, name: &OsStr) -> Result<SecureEntry, StoreError> {
+        let path = self.display_path.join(name);
+        let name_c = c_string(name, &path)?;
+        let descriptor = match openat_owned(
+            self.as_raw_fd(),
+            &name_c,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                let descriptor = openat_owned(
+                    self.as_raw_fd(),
+                    &name_c,
+                    libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0,
+                )
+                .map_err(|error| map_open_error(&path, error))?;
+                let metadata = fstat(descriptor.as_raw_fd()).map_err(StoreError::io)?;
+                if metadata.st_mode & libc::S_IFMT != libc::S_IFLNK {
+                    return Err(StoreError::unsafe_path(path.display()));
+                }
+                return readlink_fd(descriptor.as_raw_fd()).map(SecureEntry::Symlink);
+            }
+            Err(error) => return Err(map_open_error(&path, error)),
+        };
+        let metadata = fstat(descriptor.as_raw_fd()).map_err(StoreError::io)?;
+        match metadata.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                let mut file = File::from(descriptor);
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(StoreError::io)?;
+                Ok(SecureEntry::Regular(bytes))
+            }
+            libc::S_IFDIR => {
+                validate_writable_directory(descriptor.as_raw_fd(), &path)?;
+                Ok(SecureEntry::Directory(Self {
+                    descriptor: Arc::new(descriptor),
+                    display_path: path,
+                }))
+            }
+            _ => Err(StoreError::unsafe_path(path.display())),
+        }
+    }
+
+    pub fn read_root_store_regular(path: &Path) -> Result<Vec<u8>, StoreError> {
+        if !path.starts_with("/nix/store") {
+            return Err(StoreError::unsafe_path(path.display()));
+        }
+        let root = CString::new("/").expect("static root has no NUL");
+        let mut descriptor = openat_owned(
+            libc::AT_FDCWD,
+            &root,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+        .map_err(StoreError::io)?;
+        let components = path.components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(component) = component else {
+                if matches!(component, Component::RootDir) {
+                    continue;
+                }
+                return Err(StoreError::unsafe_path(path.display()));
+            };
+            let name = c_string(component, path)?;
+            let final_component = index + 1 == components.len();
+            descriptor = openat_owned(
+                descriptor.as_raw_fd(),
+                &name,
+                libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | if final_component {
+                        0
+                    } else {
+                        libc::O_DIRECTORY
+                    },
+                0,
+            )
+            .map_err(|error| map_open_error(path, error))?;
+        }
+        let metadata = fstat(descriptor.as_raw_fd()).map_err(StoreError::io)?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_uid != 0 {
+            return Err(StoreError::unsafe_path(path.display()));
+        }
+        let mut file = File::from(descriptor);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(StoreError::io)?;
+        Ok(bytes)
     }
 
     pub fn sync(&self) -> Result<(), StoreError> {
@@ -386,6 +508,34 @@ fn fstat(descriptor: i32) -> io::Result<libc::stat> {
     let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
     cvt(unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) })?;
     Ok(unsafe { metadata.assume_init() })
+}
+
+fn readlink_fd(descriptor: i32) -> Result<PathBuf, StoreError> {
+    let empty = CString::new("").expect("static empty string has no NUL");
+    let mut capacity = 256;
+    loop {
+        let mut buffer = vec![0_u8; capacity];
+        let length = unsafe {
+            libc::readlinkat(
+                descriptor,
+                empty.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if length < 0 {
+            return Err(StoreError::io(io::Error::last_os_error()));
+        }
+        let length = length as usize;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Ok(PathBuf::from(OsString::from_vec(buffer)));
+        }
+        capacity *= 2;
+        if capacity > 1024 * 1024 {
+            return Err(StoreError::unsafe_path("oversized symlink target"));
+        }
+    }
 }
 
 fn openat_owned(directory: i32, name: &CString, flags: i32, mode: u32) -> io::Result<OwnedFd> {

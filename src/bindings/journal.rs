@@ -575,6 +575,3 @@ fn sidecar_stage(k: ArtifactKind, new: bool) -> ApplyStage {
 fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-pub(crate) fn io_error(context: &str, error: std::io::Error) -> BindingError {
-    BindingError::new("io_error", format!("{context}: {error}"))
-}

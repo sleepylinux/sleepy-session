@@ -1,8 +1,7 @@
 use std::{
     collections::BTreeSet,
-    fs,
     io::{BufRead, BufReader},
-    os::unix::fs::{FileTypeExt, MetadataExt},
+    os::unix::fs::FileTypeExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
@@ -19,11 +18,14 @@ use sleepy_sdk::{
 };
 use uuid::Uuid;
 
-use crate::{store::StateCandidate, Defaults, StateStore, StorePaths};
+use crate::{
+    store::{SecureDir, SecureEntry, StateCandidate},
+    Defaults, StateStore, StorePaths,
+};
 
 use super::{
     compile_bindings,
-    journal::{io_error, ArtifactKind, JournalPhase, RecoveryTarget, TransactionJournal},
+    journal::{ArtifactKind, JournalPhase, RecoveryTarget, TransactionJournal},
     secure_fs::BindingFileSystem,
     BindingError,
 };
@@ -275,6 +277,7 @@ pub enum ApplyStage {
     PublicationRenamed,
     PublicationDirectorySyncStarted,
     PublicationDirectorySynced,
+    NiriSourceEntryEnumerated,
     PreparedSynced,
     PresetRenamed,
     PresetDirectorySynced,
@@ -1127,7 +1130,7 @@ fn reload_confirmed(
 
 fn validate_candidate_tree(
     fs: &BindingFileSystem,
-    _paths: &BindingPaths,
+    paths: &BindingPaths,
     binding_bytes: &[u8],
     validator: &dyn BindingValidator,
 ) -> Result<(), BindingError> {
@@ -1138,7 +1141,7 @@ fn validate_candidate_tree(
         .child_writable(staging_name.as_ref(), true)
         .map_err(BindingError::from_store)?;
     let result = (|| {
-        copy_config_tree(&fs.niri.proc_path(), &staging_root, true)?;
+        copy_config_tree(&fs.niri, &staging_root, true, paths)?;
         staging_root
             .write_new(
                 BindingFileSystem::artifact_name(ArtifactKind::Bindings),
@@ -1166,76 +1169,58 @@ fn validate_candidate_tree(
 }
 
 fn copy_config_tree(
-    source: &Path,
-    destination: &crate::store::SecureDir,
+    source: &SecureDir,
+    destination: &SecureDir,
     root: bool,
+    paths: &BindingPaths,
 ) -> Result<(), BindingError> {
-    for entry in fs::read_dir(source).map_err(|error| io_error("read Niri config tree", error))? {
-        let entry = entry.map_err(|error| io_error("read Niri config entry", error))?;
-        let source_path = entry.path();
-        if root && entry.file_name() == BindingFileSystem::artifact_name(ArtifactKind::Bindings) {
+    for name in source.entries().map_err(BindingError::from_store)? {
+        if root && name == BindingFileSystem::artifact_name(ArtifactKind::Bindings) {
             continue;
         }
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|error| io_error("inspect Niri config entry", error))?;
-        if metadata.file_type().is_symlink() {
-            let resolved = fs::canonicalize(&source_path)
-                .map_err(|error| io_error("resolve static Niri symlink", error))?;
-            let target = fs::metadata(&resolved)
-                .map_err(|error| io_error("inspect static Niri symlink target", error))?;
-            if !resolved.starts_with("/nix/store") || !target.is_file() || target.uid() != 0 {
-                return Err(BindingError::new(
-                    "unsafe_path",
-                    format!("untrusted static Niri symlink: {}", source_path.display()),
-                ));
+        paths.observe(ApplyStage::NiriSourceEntryEnumerated)?;
+        match source.open_entry(&name).map_err(BindingError::from_store)? {
+            SecureEntry::Symlink(target) => {
+                let bytes = SecureDir::read_root_store_regular(&target)
+                    .map_err(BindingError::from_store)?;
+                destination
+                    .write_new(&name, &bytes)
+                    .map_err(BindingError::from_store)?;
             }
-            let bytes =
-                fs::read(&resolved).map_err(|error| io_error("read static Niri file", error))?;
-            destination
-                .write_new(&entry.file_name(), &bytes)
-                .map_err(BindingError::from_store)?;
-        } else if metadata.is_dir() {
-            let child = destination
-                .child_writable(&entry.file_name(), true)
-                .map_err(BindingError::from_store)?;
-            copy_config_tree(&source_path, &child, false)?;
-            child.sync().map_err(BindingError::from_store)?;
-        } else if metadata.is_file() {
-            let bytes =
-                fs::read(&source_path).map_err(|error| io_error("read static Niri file", error))?;
-            destination
-                .write_new(&entry.file_name(), &bytes)
-                .map_err(BindingError::from_store)?;
-        } else {
-            return Err(BindingError::new(
-                "unsafe_path",
-                format!(
-                    "Niri config entry is not a regular file: {}",
-                    source_path.display()
-                ),
-            ));
+            SecureEntry::Directory(child) => {
+                let staged_child = destination
+                    .child_writable(&name, true)
+                    .map_err(BindingError::from_store)?;
+                copy_config_tree(&child, &staged_child, false, paths)?;
+                staged_child.sync().map_err(BindingError::from_store)?;
+            }
+            SecureEntry::Regular(bytes) => {
+                destination
+                    .write_new(&name, &bytes)
+                    .map_err(BindingError::from_store)?;
+            }
         }
     }
     Ok(())
 }
 
-fn remove_tree(directory: &crate::store::SecureDir) -> Result<(), BindingError> {
+fn remove_tree(directory: &SecureDir) -> Result<(), BindingError> {
     for name in directory.entries().map_err(BindingError::from_store)? {
-        let path = directory.proc_path().join(&name);
-        let metadata =
-            fs::symlink_metadata(&path).map_err(|error| io_error("inspect staged entry", error))?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            let child = directory
-                .child_writable(&name, false)
-                .map_err(BindingError::from_store)?;
-            remove_tree(&child)?;
-            directory
-                .remove_dir(&name)
-                .map_err(BindingError::from_store)?;
-        } else {
-            directory
-                .remove_file(&name)
-                .map_err(BindingError::from_store)?;
+        match directory
+            .open_entry(&name)
+            .map_err(BindingError::from_store)?
+        {
+            SecureEntry::Directory(child) => {
+                remove_tree(&child)?;
+                directory
+                    .remove_dir(&name)
+                    .map_err(BindingError::from_store)?;
+            }
+            SecureEntry::Regular(_) | SecureEntry::Symlink(_) => {
+                directory
+                    .remove_file(&name)
+                    .map_err(BindingError::from_store)?;
+            }
         }
     }
     directory.sync().map_err(BindingError::from_store)
