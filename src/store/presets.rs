@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use sleepy_sdk::{PresetOrigin, BUILTIN_PRESET_ID};
+use sleepy_sdk::{canonicalize_accelerator, PresetOrigin, BUILTIN_PRESET_ID};
 
 use super::{state::parse_preset, StateStore, StoreError};
 
@@ -77,6 +77,48 @@ impl StateStore {
             let removed = users.remove(position);
             store.write_user_presets(&users)?;
             Ok(json!({ "preset": removed }))
+        })
+    }
+
+    pub fn mutate_user_keybinding(
+        &self,
+        id: &str,
+        action: &str,
+        accelerator: Option<&str>,
+    ) -> Result<Value, StoreError> {
+        self.with_transaction(|store| {
+            let mut candidate = store
+                .find_preset(id)?
+                .ok_or_else(|| StoreError::not_found(id))?;
+            if candidate.origin == PresetOrigin::Builtin || id == BUILTIN_PRESET_ID {
+                return Err(StoreError::immutable(id));
+            }
+            if store.load_settings()?.active_preset_id == id {
+                return Err(StoreError::apply_required(id));
+            }
+
+            match accelerator {
+                Some(accelerator) => {
+                    let canonical = canonicalize_accelerator(accelerator)
+                        .map_err(|error| StoreError::invalid(error.to_string()))?;
+                    candidate.keybindings.insert(action.to_owned(), canonical);
+                }
+                None => {
+                    candidate.keybindings.remove(action);
+                }
+            }
+            let candidate = parse_preset(
+                serde_json::to_value(candidate)
+                    .map_err(|error| StoreError::invalid(error.to_string()))?,
+            )?;
+            let mut users = store.load_user_presets()?;
+            let position = users
+                .iter()
+                .position(|preset| preset.id == id)
+                .ok_or_else(|| StoreError::not_found(id))?;
+            users[position] = candidate.clone();
+            store.write_user_presets(&users)?;
+            Ok(json!({ "preset": candidate }))
         })
     }
 }

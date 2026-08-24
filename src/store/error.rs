@@ -87,6 +87,15 @@ impl StoreError {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: "unsupported_platform",
+            message: message.into(),
+            details: None,
+        }
+    }
+
     pub(crate) fn commit_state_unknown(error: impl fmt::Display) -> Self {
         Self {
             code: "commit_state_unknown",

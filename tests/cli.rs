@@ -314,6 +314,73 @@ fn cli_keybinding_mutations_return_immutable_apply_required_and_structured_confl
 }
 
 #[test]
+fn cli_keybinding_error_precedence_checks_target_before_requested_binding() {
+    let root = TempDir::new().unwrap();
+    assert!(command(&root)
+        .args(["presets", "list"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let presets_path = root.path().join("state/sleepy/presets.json");
+
+    let builtin = command(&root)
+        .args([
+            "keybindings",
+            "set",
+            "--preset",
+            "builtin.sleepy",
+            "app.terminal.open",
+            "not a chord",
+        ])
+        .output()
+        .unwrap();
+    assert!(!builtin.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&builtin.stderr).unwrap()["error"]["code"],
+        "immutable_preset"
+    );
+    assert_eq!(fs::read(&presets_path).unwrap(), b"[]");
+
+    let mut preset = user_preset(USER_ID, "Active bindings");
+    preset["keybindings"]["app.terminal.open"] = json!("Mod+Return");
+    let input = write_json(&root, "active.json", &preset);
+    assert!(command(&root)
+        .args(["presets", "create", "--input", &input])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(command(&root)
+        .args(["presets", "activate", USER_ID])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let before = fs::read(&presets_path).unwrap();
+
+    for accelerator in ["Mod+Return", "not a chord"] {
+        let active = command(&root)
+            .args([
+                "keybindings",
+                "set",
+                "--preset",
+                USER_ID,
+                "launcher.open",
+                accelerator,
+            ])
+            .output()
+            .unwrap();
+        assert!(!active.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&active.stderr).unwrap()["error"]["code"],
+            "apply_required"
+        );
+        assert_eq!(fs::read(&presets_path).unwrap(), before);
+    }
+}
+
+#[test]
 fn cli_rejects_symlinked_oversized_and_non_utf8_inputs_without_changing_store_bytes() {
     let root = TempDir::new().unwrap();
     assert!(command(&root)
@@ -377,6 +444,61 @@ fn cli_rejects_symlinked_oversized_and_non_utf8_inputs_without_changing_store_by
         );
         assert_eq!(fs::read(&presets_path).unwrap(), original);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_descriptor_input_rejects_symlinked_ancestor_and_final_components() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    assert!(command(&root)
+        .args(["presets", "list"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let presets_path = root.path().join("state/sleepy/presets.json");
+    let before = fs::read(&presets_path).unwrap();
+    let real_directory = root.path().join("real-inputs");
+    fs::create_dir(&real_directory).unwrap();
+    let real_file = real_directory.join("preset.json");
+    fs::write(&real_file, user_preset(USER_ID, "Unsafe").to_string()).unwrap();
+
+    let symlinked_directory = root.path().join("linked-inputs");
+    symlink(&real_directory, &symlinked_directory).unwrap();
+    let ancestor = command(&root)
+        .args([
+            "presets",
+            "import",
+            "--input",
+            symlinked_directory.join("preset.json").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!ancestor.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ancestor.stderr).unwrap()["error"]["code"],
+        "unsafe_path"
+    );
+
+    let symlinked_file = root.path().join("linked-preset.json");
+    symlink(&real_file, &symlinked_file).unwrap();
+    let final_component = command(&root)
+        .args([
+            "presets",
+            "import",
+            "--input",
+            symlinked_file.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!final_component.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&final_component.stderr).unwrap()["error"]["code"],
+        "unsafe_path"
+    );
+    assert_eq!(fs::read(&presets_path).unwrap(), before);
 }
 
 #[test]

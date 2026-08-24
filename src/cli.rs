@@ -1,12 +1,19 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::File,
     io::{self, Read},
     path::{Path, PathBuf},
 };
 
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
+use std::{
+    ffi::CString,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
+    path::Component,
+};
 
 use serde_json::{json, Value};
 use sleepy_sdk::{
@@ -17,8 +24,6 @@ use sleepy_sdk::{
 use crate::{Defaults, ImportMode, StateInspector, StateStore, StoreError, StorePaths};
 
 const MAX_JSON_INPUT_BYTES: u64 = 1024 * 1024;
-#[cfg(target_os = "linux")]
-const O_NOFOLLOW: i32 = 0o400000;
 
 enum CliCommand {
     SettingsShow,
@@ -247,25 +252,11 @@ fn keybindings_set(
     action: &str,
     accelerator: &str,
 ) -> Result<Value, StoreError> {
-    let mut preset = store.preset_json(id)?;
-    let canonical = canonicalize_accelerator(accelerator)
-        .map_err(|error| StoreError::invalid(error.to_string()))?;
-    preset
-        .get_mut("keybindings")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| StoreError::invalid("preset keybindings must be an object"))?
-        .insert(action.to_owned(), Value::String(canonical));
-    store.update_user_preset(id, preset)
+    store.mutate_user_keybinding(id, action, Some(accelerator))
 }
 
 fn keybindings_unset(store: &StateStore, id: &str, action: &str) -> Result<Value, StoreError> {
-    let mut preset = store.preset_json(id)?;
-    preset
-        .get_mut("keybindings")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| StoreError::invalid("preset keybindings must be an object"))?
-        .remove(action);
-    store.update_user_preset(id, preset)
+    store.mutate_user_keybinding(id, action, None)
 }
 
 fn validate_keybinding_map(candidate: Value) -> Result<Value, StoreError> {
@@ -290,16 +281,7 @@ fn read_json_input(input: &str) -> Result<Value, StoreError> {
         read_bounded(&mut io::stdin().lock())?
     } else {
         let path = PathBuf::from(input);
-        reject_input_symlinks(&path)?;
-        let metadata = fs::metadata(&path).map_err(StoreError::io)?;
-        if !metadata.is_file() {
-            return Err(StoreError::invalid("JSON input must be a regular file"));
-        }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(target_os = "linux")]
-        options.custom_flags(O_NOFOLLOW);
-        let mut file = options.open(&path).map_err(StoreError::io)?;
+        let mut file = open_regular_file(&path)?;
         read_bounded(&mut file)?
     };
     let input = String::from_utf8(bytes)
@@ -321,21 +303,104 @@ fn read_bounded(reader: &mut impl Read) -> Result<Vec<u8>, StoreError> {
     Ok(bytes)
 }
 
-fn reject_input_symlinks(path: &Path) -> Result<(), StoreError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir().map_err(StoreError::io)?.join(path)
-    };
-    for ancestor in absolute.ancestors() {
-        if fs::symlink_metadata(ancestor)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(StoreError::unsafe_path(ancestor.display()));
+#[cfg(target_os = "linux")]
+fn open_regular_file(path: &Path) -> Result<File, StoreError> {
+    open_regular_file_with_observer(path, |_| {})
+}
+
+#[cfg(target_os = "linux")]
+fn open_regular_file_with_observer(
+    path: &Path,
+    mut opened_directory: impl FnMut(&Path),
+) -> Result<File, StoreError> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(component) => components.push(component.to_owned()),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(StoreError::unsafe_path(path.display()));
+            }
         }
     }
-    Ok(())
+    let final_component = components
+        .pop()
+        .ok_or_else(|| StoreError::invalid("JSON input path must name a file"))?;
+    let anchor = if path.is_absolute() { "/" } else { "." };
+    let anchor_name = CString::new(anchor).expect("static anchor contains no NUL");
+    let mut directory = openat_owned(
+        libc::AT_FDCWD,
+        &anchor_name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    )
+    .map_err(StoreError::io)?;
+    let mut opened_path = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        opened_path.push(&component);
+        let component_name = c_path_component(&component)?;
+        directory = openat_owned(
+            directory.as_raw_fd(),
+            &component_name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+        .map_err(|error| map_component_open_error(&opened_path, error))?;
+        opened_directory(&opened_path);
+    }
+
+    let final_name = c_path_component(&final_component)?;
+    let final_path = opened_path.join(&final_component);
+    let descriptor = openat_owned(
+        directory.as_raw_fd(),
+        &final_name,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    )
+    .map_err(|error| map_component_open_error(&final_path, error))?;
+    let file = File::from(descriptor);
+    if !file.metadata().map_err(StoreError::io)?.is_file() {
+        return Err(StoreError::invalid("JSON input must be a regular file"));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn openat_owned(directory: i32, component: &CString, flags: i32) -> Result<OwnedFd, io::Error> {
+    // SAFETY: `component` is NUL-terminated, `directory` is AT_FDCWD or a live
+    // directory descriptor, and ownership of a successful descriptor is
+    // transferred exactly once into `OwnedFd`.
+    let descriptor = unsafe { libc::openat(directory, component.as_ptr(), flags) };
+    if descriptor < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // SAFETY: `openat` returned a new owned descriptor above.
+        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn c_path_component(component: &std::ffi::OsStr) -> Result<CString, StoreError> {
+    CString::new(component.as_bytes())
+        .map_err(|_| StoreError::invalid("JSON input path contains a NUL byte"))
+}
+
+#[cfg(target_os = "linux")]
+fn map_component_open_error(path: &Path, error: io::Error) -> StoreError {
+    if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+        StoreError::unsafe_path(path.display())
+    } else {
+        StoreError::io(error)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_regular_file(_path: &Path) -> Result<File, StoreError> {
+    Err(StoreError::unsupported(
+        "secure descriptor-relative JSON file input is unsupported on this platform",
+    ))
 }
 
 fn default_state() -> Result<Defaults, StoreError> {
@@ -362,4 +427,41 @@ fn default_state() -> Result<Defaults, StoreError> {
             "pluginRequirements": []
         })],
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::{fs, io::Read, os::unix::fs::symlink};
+
+    use tempfile::TempDir;
+
+    use super::open_regular_file_with_observer;
+
+    #[test]
+    fn secure_input_resolution_keeps_open_directory_after_path_swap() {
+        let root = TempDir::new().unwrap();
+        let safe_directory = root.path().join("safe");
+        let moved_directory = root.path().join("safe-opened");
+        let attacker_directory = root.path().join("attacker");
+        fs::create_dir(&safe_directory).unwrap();
+        fs::create_dir(&attacker_directory).unwrap();
+        fs::write(safe_directory.join("preset.json"), b"safe-bytes").unwrap();
+        fs::write(attacker_directory.join("preset.json"), b"attacker-bytes").unwrap();
+        let input_path = safe_directory.join("preset.json");
+        let mut swapped = false;
+
+        let mut file = open_regular_file_with_observer(&input_path, |opened_path| {
+            if !swapped && opened_path == safe_directory {
+                fs::rename(&safe_directory, &moved_directory).unwrap();
+                symlink(&attacker_directory, &safe_directory).unwrap();
+                swapped = true;
+            }
+        })
+        .unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+
+        assert!(swapped);
+        assert_eq!(bytes, b"safe-bytes");
+    }
 }

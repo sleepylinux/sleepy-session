@@ -623,6 +623,126 @@ fn preset_mutation_concurrent_updates_serialize_the_full_transaction() {
 }
 
 #[test]
+fn keybinding_transaction_set_and_unset_validate_and_replace_atomically() {
+    let temp = TempDir::new().unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    store
+        .create_user_preset(user_preset(id, "Bindings"))
+        .unwrap();
+
+    let set = store
+        .mutate_user_keybinding(id, "app.terminal.open", Some("mod+return"))
+        .unwrap();
+    assert_eq!(
+        set["preset"]["keybindings"]["app.terminal.open"],
+        "Mod+Return"
+    );
+
+    let unset = store
+        .mutate_user_keybinding(id, "app.terminal.open", None)
+        .unwrap();
+    assert!(unset["preset"]["keybindings"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn keybinding_transaction_concurrent_edits_preserve_both_actions() {
+    let temp = TempDir::new().unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    let initial = StateStore::open(paths(&temp), defaults()).unwrap();
+    initial
+        .create_user_preset(user_preset(id, "Bindings"))
+        .unwrap();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let store = initial.with_replacement_observer(Arc::new(PauseFirstReplacement {
+        started: started_sender,
+        release: Mutex::new(release_receiver),
+        seen: Mutex::new(0),
+    }));
+    let first = store.clone();
+    let first_thread = thread::spawn(move || {
+        first.mutate_user_keybinding(id, "app.terminal.open", Some("Mod+Return"))
+    });
+    started_receiver.recv().unwrap();
+    let second = store.clone();
+    let (done_sender, done_receiver) = mpsc::channel();
+    let second_thread = thread::spawn(move || {
+        let result = second.mutate_user_keybinding(id, "launcher.open", Some("Mod+Space"));
+        done_sender.send(()).unwrap();
+        result
+    });
+
+    assert!(done_receiver
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    release_sender.send(()).unwrap();
+    first_thread.join().unwrap().unwrap();
+    second_thread.join().unwrap().unwrap();
+    done_receiver.recv().unwrap();
+
+    assert_eq!(
+        store.preset_json(id).unwrap()["keybindings"],
+        json!({
+            "app.terminal.open": "Mod+Return",
+            "launcher.open": "Mod+Space"
+        })
+    );
+}
+
+#[test]
+fn keybinding_transaction_after_concurrent_whole_update_preserves_new_fields() {
+    let temp = TempDir::new().unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    let initial = StateStore::open(paths(&temp), defaults()).unwrap();
+    initial
+        .create_user_preset(user_preset(id, "Before"))
+        .unwrap();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let store = initial.with_replacement_observer(Arc::new(PauseFirstReplacement {
+        started: started_sender,
+        release: Mutex::new(release_receiver),
+        seen: Mutex::new(0),
+    }));
+    let whole = store.clone();
+    let whole_thread = thread::spawn(move || {
+        whole.update_user_preset(id, updated_user_preset(id, "Whole update"))
+    });
+    started_receiver.recv().unwrap();
+    let key = store.clone();
+    let (done_sender, done_receiver) = mpsc::channel();
+    let key_thread = thread::spawn(move || {
+        let result = key.mutate_user_keybinding(id, "launcher.open", Some("Mod+Space"));
+        done_sender.send(()).unwrap();
+        result
+    });
+
+    assert!(done_receiver
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    release_sender.send(()).unwrap();
+    whole_thread.join().unwrap().unwrap();
+    key_thread.join().unwrap().unwrap();
+    done_receiver.recv().unwrap();
+
+    let final_preset = store.preset_json(id).unwrap();
+    assert_eq!(final_preset["name"], "Whole update");
+    assert_eq!(final_preset["layouts"]["DP-1"]["main"], "terminal");
+    assert_eq!(
+        final_preset["keybindings"],
+        json!({
+            "app.terminal.open": "Mod+Return",
+            "launcher.open": "Mod+Space",
+            "surface.controlCenter.toggle": "Mod+C"
+        })
+    );
+}
+
+#[test]
 fn concurrent_duplicates_serialize_the_full_read_modify_write_transaction() {
     let temp = TempDir::new().unwrap();
     let (started_sender, started_receiver) = mpsc::channel();
