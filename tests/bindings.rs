@@ -153,9 +153,9 @@ struct ScriptedStream {
 }
 
 impl ConfigEventStream for ScriptedStream {
-    fn drain_initial(&mut self) -> Result<(), String> {
-        self.events.lock().unwrap().push("drain".to_owned());
-        Ok(())
+    fn await_initial_snapshot(&mut self, _timeout: Duration) -> Result<ConfigLoaded, String> {
+        self.events.lock().unwrap().push("snapshot".to_owned());
+        Ok(ConfigLoaded { failed: true })
     }
 
     fn next_config_loaded(&mut self, _timeout: Duration) -> Result<Option<ConfigLoaded>, String> {
@@ -225,7 +225,7 @@ fn apply_fixture() -> (TempDir, BindingPaths) {
 }
 
 #[test]
-fn apply_validates_and_drains_before_replacement_then_confirms_next_loaded_event() {
+fn apply_validates_and_awaits_snapshot_before_replacement_then_confirms_next_loaded_event() {
     let (_temp, paths) = apply_fixture();
     let events = Arc::new(Mutex::new(Vec::new()));
     let validator = RecordingValidator {
@@ -246,7 +246,7 @@ fn apply_validates_and_drains_before_replacement_then_confirms_next_loaded_event
         .contains("spawn \"ghostty\""));
     assert!(!paths.journal().exists());
     let events = events.lock().unwrap();
-    assert_eq!(events[0..3], ["validate", "subscribe", "drain"]);
+    assert_eq!(events[0..3], ["validate", "subscribe", "snapshot"]);
     assert!(events[3].starts_with("reload:"));
     assert_eq!(events[4], "event");
 }
@@ -304,7 +304,10 @@ fn apply_failed_candidate_reload_rolls_back_and_requires_its_own_confirmation() 
         events.iter().filter(|event| *event == "subscribe").count(),
         2
     );
-    assert_eq!(events.iter().filter(|event| *event == "drain").count(), 2);
+    assert_eq!(
+        events.iter().filter(|event| *event == "snapshot").count(),
+        2
+    );
     assert_eq!(
         events
             .iter()
@@ -424,7 +427,7 @@ fn apply_reconciliation_finishes_pending_candidate_once_and_is_idempotent() {
     assert!(!paths.journal().exists());
     assert!(reconcile_bindings(&paths, &online).unwrap().is_none());
     let events = events.lock().unwrap();
-    assert_eq!(events[0..2], ["subscribe", "drain"]);
+    assert_eq!(events[0..2], ["subscribe", "snapshot"]);
     assert!(events[2].starts_with("reload:"));
     assert_eq!(events[3], "event");
 }

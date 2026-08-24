@@ -710,16 +710,17 @@ fn cli_activation_apply_and_builtin_edit_use_the_offline_journal_path() {
 }
 
 #[test]
-fn cli_online_reload_keeps_child_output_out_of_structured_json() {
+fn cli_online_reload_waits_through_delayed_stale_snapshot_and_keeps_json_clean() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempDir::new().unwrap();
     prepare_niri_tree(&root);
     fs::create_dir_all(root.path().join("state")).unwrap();
     let fake_niri = root.path().join("fake-niri");
+    let reload_marker = root.path().join("reload-requested");
     fs::write(
         &fake_niri,
-        "#!/bin/sh\nif [ \"$2\" = \"--json\" ]; then\n  sleep 0.1\n  printf '%s\\n' '{\"ConfigLoaded\":{\"failed\":false}}'\n  sleep 1\nelse\n  printf '%s\\n' 'niri-child-noise'\nfi\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' 'niri 26.04'\nelif [ \"$2\" = \"--json\" ]; then\n  sleep 0.08\n  printf '%s\\n' '{\"ConfigLoaded\":{\"failed\":true}}'\n  printf '%s\\n' '{\"CastsChanged\":{\"casts\":[]}}'\n  while [ ! -f \"$SLEEPY_TEST_RELOAD_MARKER\" ]; do sleep 0.01; done\n  printf '%s\\n' '{\"ConfigLoaded\":{\"failed\":false}}'\n  sleep 1\nelse\n  : > \"$SLEEPY_TEST_RELOAD_MARKER\"\n  printf '%s\\n' 'niri-child-noise'\nfi\n",
     )
     .unwrap();
     fs::set_permissions(&fake_niri, fs::Permissions::from_mode(0o700)).unwrap();
@@ -727,6 +728,7 @@ fn cli_online_reload_keeps_child_output_out_of_structured_json() {
     let output = command(&root)
         .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
         .env("SLEEPY_NIRI", &fake_niri)
+        .env("SLEEPY_TEST_RELOAD_MARKER", &reload_marker)
         .env("NIRI_SOCKET", root.path().join("niri.sock"))
         .args(["bindings", "initialize"])
         .output()

@@ -9,7 +9,7 @@ use std::{
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ pub trait BindingValidator {
 }
 
 pub trait ConfigEventStream {
-    fn drain_initial(&mut self) -> Result<(), String>;
+    fn await_initial_snapshot(&mut self, timeout: Duration) -> Result<ConfigLoaded, String>;
     fn next_config_loaded(&mut self, timeout: Duration) -> Result<Option<ConfigLoaded>, String>;
 }
 
@@ -94,6 +94,7 @@ impl BindingReloader for NiriReloader {
         if std::env::var_os("NIRI_SOCKET").is_none() {
             return Ok(None);
         }
+        ensure_supported_niri(&self.executable)?;
         let mut child = Command::new(&self.executable)
             .args(["msg", "--json", "event-stream"])
             .stdout(Stdio::piped())
@@ -107,8 +108,8 @@ impl BindingReloader for NiriReloader {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if let Some(event) = parse_config_loaded_event(&line) {
-                    if sender.send(event).is_err() {
+                if let Some(message) = parse_stream_message(&line) {
+                    if sender.send(message).is_err() {
                         break;
                     }
                 }
@@ -135,17 +136,37 @@ impl BindingReloader for NiriReloader {
 
 struct NiriEventStream {
     child: Child,
-    receiver: Receiver<ConfigLoaded>,
+    receiver: Receiver<NiriStreamMessage>,
 }
 
 impl ConfigEventStream for NiriEventStream {
-    fn drain_initial(&mut self) -> Result<(), String> {
+    fn await_initial_snapshot(&mut self, timeout: Duration) -> Result<ConfigLoaded, String> {
+        let deadline = Instant::now() + timeout;
+        let mut config = None;
         loop {
-            match self.receiver.recv_timeout(Duration::from_millis(25)) {
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => return Ok(()),
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.receiver.recv_timeout(remaining) {
+                Ok(NiriStreamMessage::ConfigLoaded(event)) if config.is_none() => {
+                    config = Some(event);
+                }
+                Ok(NiriStreamMessage::ConfigLoaded(_)) => {
+                    return Err(
+                        "Niri initial snapshot contained multiple ConfigLoaded events".to_owned(),
+                    );
+                }
+                Ok(NiriStreamMessage::InitialSnapshotComplete) => {
+                    return config.ok_or_else(|| {
+                        "Niri initial snapshot ended before ConfigLoaded (requires Niri >= 26.04)"
+                            .to_owned()
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err("timed out awaiting complete Niri initial snapshot".to_owned());
+                }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err("Niri event stream closed during initial drain".to_owned());
+                    return Err(
+                        "Niri event stream closed before initial snapshot completed".to_owned()
+                    );
                 }
             }
         }
@@ -153,7 +174,10 @@ impl ConfigEventStream for NiriEventStream {
 
     fn next_config_loaded(&mut self, timeout: Duration) -> Result<Option<ConfigLoaded>, String> {
         match self.receiver.recv_timeout(timeout) {
-            Ok(event) => Ok(Some(event)),
+            Ok(NiriStreamMessage::ConfigLoaded(event)) => Ok(Some(event)),
+            Ok(NiriStreamMessage::InitialSnapshotComplete) => {
+                Err("Niri emitted an unexpected second initial snapshot marker".to_owned())
+            }
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
                 Err("Niri event stream closed before ConfigLoaded".to_owned())
@@ -169,16 +193,49 @@ impl Drop for NiriEventStream {
     }
 }
 
-fn parse_config_loaded_event(line: &str) -> Option<ConfigLoaded> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NiriStreamMessage {
+    ConfigLoaded(ConfigLoaded),
+    InitialSnapshotComplete,
+}
+
+fn parse_stream_message(line: &str) -> Option<NiriStreamMessage> {
     let value: Value = serde_json::from_str(line).ok()?;
-    let payload = value
-        .get("ConfigLoaded")
-        .or_else(|| value.get("configLoaded"))?;
+    if value.get("CastsChanged").is_some() {
+        return Some(NiriStreamMessage::InitialSnapshotComplete);
+    }
+    let payload = value.get("ConfigLoaded")?;
     let failed = payload
         .get("failed")
         .and_then(Value::as_bool)
         .or_else(|| payload.as_bool())?;
-    Some(ConfigLoaded { failed })
+    Some(NiriStreamMessage::ConfigLoaded(ConfigLoaded { failed }))
+}
+
+fn ensure_supported_niri(executable: &Path) -> Result<(), String> {
+    let output = Command::new(executable)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("failed to query pinned Niri version: {error}"))?;
+    if !output.status.success() {
+        return Err("pinned Niri version query failed".to_owned());
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    let supported = version.split_whitespace().find_map(|word| {
+        let (major, minor) = word.split_once('.')?;
+        let major = major.parse::<u32>().ok()?;
+        let minor = minor
+            .trim_end_matches(|character: char| !character.is_ascii_digit())
+            .parse::<u32>()
+            .ok()?;
+        Some(major > 26 || (major == 26 && minor >= 4))
+    });
+    match supported {
+        Some(true) => Ok(()),
+        _ => Err(format!(
+            "unsupported Niri event protocol {version:?}; requires Niri >= 26.04"
+        )),
+    }
 }
 
 pub trait ApplyObserver: Send + Sync {
@@ -774,7 +831,7 @@ fn reconcile_bindings_locked(
         .map_err(|message| BindingError::new("reload_failed", message))?;
     if let Some(stream) = stream.as_mut() {
         stream
-            .drain_initial()
+            .await_initial_snapshot(RELOAD_TIMEOUT)
             .map_err(|message| BindingError::new("reload_failed", message))?;
     }
     if target == RecoveryTarget::Previous {
@@ -811,7 +868,7 @@ fn reconcile_bindings_locked(
     let rollback_stream = reloader.subscribe();
     let mut rollback_stream = match rollback_stream {
         Ok(Some(mut stream)) => {
-            if stream.drain_initial().is_ok() {
+            if stream.await_initial_snapshot(RELOAD_TIMEOUT).is_ok() {
                 Some(stream)
             } else {
                 None
@@ -878,7 +935,7 @@ fn apply_candidate_locked(
         .map_err(|message| BindingError::new("reload_failed", message))?;
     if let Some(stream) = candidate_stream.as_mut() {
         stream
-            .drain_initial()
+            .await_initial_snapshot(RELOAD_TIMEOUT)
             .map_err(|message| BindingError::new("reload_failed", message))?;
     }
 
@@ -915,7 +972,7 @@ fn apply_candidate_locked(
     let rollback_stream = reloader.subscribe();
     let mut rollback_stream = match rollback_stream {
         Ok(Some(mut stream)) => {
-            if stream.drain_initial().is_err() {
+            if stream.await_initial_snapshot(RELOAD_TIMEOUT).is_err() {
                 None
             } else {
                 Some(stream)
