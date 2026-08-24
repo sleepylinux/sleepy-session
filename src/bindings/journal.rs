@@ -53,6 +53,8 @@ pub(crate) struct TransactionJournal {
     pub transaction_id: String,
     pub phase: JournalPhase,
     pub recovery_target: RecoveryTarget,
+    #[serde(default)]
+    pub preserve_existing_state: bool,
     #[serde(default = "sidecars_complete_for_legacy_journal")]
     pub sidecars_complete: bool,
     pub active_preset_id: String,
@@ -87,6 +89,7 @@ impl TransactionJournal {
         preset_bytes: &[u8],
         settings_bytes: &[u8],
         binding_bytes: &[u8],
+        preserve_existing_state: bool,
     ) -> Result<Self, BindingError> {
         let transaction_id = Uuid::new_v4().hyphenated().to_string();
         let specs = [
@@ -116,6 +119,15 @@ impl TransactionJournal {
                 .map_err(BindingError::from_store)?;
             let old_existed = old.is_some();
             let old = old.unwrap_or_default();
+            if preserve_existing_state
+                && matches!(kind, ArtifactKind::Preset | ArtifactKind::Settings)
+                && old.as_slice() != new_bytes
+            {
+                return Err(BindingError::new(
+                    "concurrent_state_change",
+                    "existing state changed while initializing bindings",
+                ));
+            }
             let name = destination
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -147,6 +159,7 @@ impl TransactionJournal {
             transaction_id,
             phase: JournalPhase::Prepared,
             recovery_target: RecoveryTarget::Candidate,
+            preserve_existing_state,
             sidecars_complete: false,
             active_preset_id: active_preset_id.to_owned(),
             previous_active_preset_id,
@@ -193,6 +206,7 @@ impl TransactionJournal {
             Some(paths),
             self.artifact(kind),
             RecoveryTarget::Candidate,
+            self.preserve_existing_state,
         )
     }
     pub fn restore_all(
@@ -201,7 +215,13 @@ impl TransactionJournal {
         paths: &BindingPaths,
     ) -> Result<(), BindingError> {
         for a in &self.artifacts {
-            install(fs, Some(paths), a, RecoveryTarget::Previous)?;
+            install(
+                fs,
+                Some(paths),
+                a,
+                RecoveryTarget::Previous,
+                self.preserve_existing_state,
+            )?;
         }
         Ok(())
     }
@@ -212,7 +232,7 @@ impl TransactionJournal {
         target: RecoveryTarget,
     ) -> Result<(), BindingError> {
         for a in &self.artifacts {
-            install(fs, Some(paths), a, target)?;
+            install(fs, Some(paths), a, target, self.preserve_existing_state)?;
         }
         Ok(())
     }
@@ -477,7 +497,13 @@ fn install(
     paths: Option<&BindingPaths>,
     artifact: &JournalArtifact,
     target: RecoveryTarget,
+    preserve_existing_state: bool,
 ) -> Result<(), BindingError> {
+    if preserve_existing_state
+        && matches!(artifact.kind, ArtifactKind::Preset | ArtifactKind::Settings)
+    {
+        return Ok(());
+    }
     let dir = fs.artifact_dir(artifact.kind);
     let destination = BindingFileSystem::artifact_name(artifact.kind);
     if target == RecoveryTarget::Previous && !artifact.old_existed {

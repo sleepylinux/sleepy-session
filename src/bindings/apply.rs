@@ -683,6 +683,7 @@ pub fn apply_active_bindings(
                         preset: &preset_bytes,
                         settings: &settings_bytes,
                         bindings: bindings.as_bytes(),
+                        preserve_existing_state: false,
                     },
                 )
                 .map_err(store_binding_error)
@@ -921,6 +922,7 @@ fn apply_store_candidate(
             preset: &preset_bytes,
             settings: &settings_bytes,
             bindings: bindings.as_bytes(),
+            preserve_existing_state: false,
         },
     )
     .map_err(store_binding_error)
@@ -1022,7 +1024,7 @@ pub fn initialize_bindings(
     }
     let store = StateStore::for_repair(paths.store.clone(), Defaults::packaged())
         .map_err(BindingError::from_store)?;
-    if let Some(active_preset_id) = store
+    if let Some(report) = store
         .with_repair_candidate_transaction(|store| {
             let (settings_exists, presets_exists) = store.document_presence()?;
             if !settings_exists || !presets_exists {
@@ -1038,15 +1040,42 @@ pub fn initialize_bindings(
             let include = fs
                 .niri
                 .read_optional(BindingFileSystem::artifact_name(ArtifactKind::Bindings))?;
-            Ok((include.as_deref() == Some(compiled.as_bytes()))
-                .then_some(settings.active_preset_id))
+            if include.as_deref() == Some(compiled.as_bytes()) {
+                return Ok(Some(ApplyReport {
+                    status: ApplyStatus::Committed,
+                    active_preset_id: settings.active_preset_id,
+                }));
+            }
+            if include.is_none() {
+                let preset_bytes = fs
+                    .handles
+                    .presets
+                    .read(BindingFileSystem::artifact_name(ArtifactKind::Preset))?;
+                let settings_bytes = fs
+                    .handles
+                    .settings
+                    .read(BindingFileSystem::artifact_name(ArtifactKind::Settings))?;
+                return apply_candidate_locked(
+                    &fs,
+                    paths,
+                    validator,
+                    reloader,
+                    &settings.active_preset_id,
+                    CandidateArtifacts {
+                        preset: &preset_bytes,
+                        settings: &settings_bytes,
+                        bindings: compiled.as_bytes(),
+                        preserve_existing_state: true,
+                    },
+                )
+                .map(Some)
+                .map_err(store_binding_error);
+            }
+            Ok(None)
         })
         .map_err(BindingError::from_store)?
     {
-        return Ok(ApplyReport {
-            status: ApplyStatus::Committed,
-            active_preset_id,
-        });
+        return Ok(report);
     }
     apply_active_bindings(paths, validator, reloader)
 }
@@ -1233,6 +1262,7 @@ struct CandidateArtifacts<'a> {
     preset: &'a [u8],
     settings: &'a [u8],
     bindings: &'a [u8],
+    preserve_existing_state: bool,
 }
 
 fn apply_candidate_locked(
@@ -1272,6 +1302,7 @@ fn apply_candidate_locked(
         artifacts.preset,
         artifacts.settings,
         artifacts.bindings,
+        artifacts.preserve_existing_state,
     )?;
     journal.install_new(fs, paths, ArtifactKind::Preset)?;
     journal.set_phase(fs, paths, JournalPhase::PresetCommitted)?;

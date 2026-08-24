@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use sleepy_sdk::{PresetDocument, PresetOrigin};
 use sleepy_session::{
     bindings::{
@@ -541,6 +544,67 @@ fn apply_offline_initializer_journals_missing_settings_presets_and_include_toget
         .unwrap()
         .iter()
         .all(|artifact| artifact["oldExisted"] == false));
+}
+
+#[cfg(unix)]
+#[test]
+fn initializer_missing_include_preserves_existing_state_through_online_reconcile() {
+    let (_temp, paths) = apply_fixture();
+    fs::remove_file(paths.generated_include()).unwrap();
+    let artifacts = [
+        paths.store().settings_path().to_owned(),
+        paths.store().presets_path().to_owned(),
+    ];
+    let before = artifacts
+        .iter()
+        .map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.ino(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let report = initialize_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::ReloadPending);
+    assert!(paths.generated_include().is_file());
+    assert!(paths.journal().is_file());
+    for (path, (bytes, inode, mtime, mtime_nsec)) in artifacts.iter().zip(&before) {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
+        assert_eq!(metadata.ino(), *inode);
+        assert_eq!(metadata.mtime(), *mtime);
+        assert_eq!(metadata.mtime_nsec(), *mtime_nsec);
+    }
+
+    let reconciled = reconcile_bindings(
+        &paths,
+        &ScriptedReloader::online(
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Some(ConfigLoaded { failed: false })],
+        ),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(reconciled.status, ApplyStatus::Committed);
+    assert!(!paths.journal().exists());
+    for (path, (bytes, inode, mtime, mtime_nsec)) in artifacts.iter().zip(&before) {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
+        assert_eq!(metadata.ino(), *inode);
+        assert_eq!(metadata.mtime(), *mtime);
+        assert_eq!(metadata.mtime_nsec(), *mtime_nsec);
+    }
 }
 
 #[test]
