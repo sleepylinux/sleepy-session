@@ -723,7 +723,7 @@ fn initializer_detects_same_byte_inode_swap_after_binding_publication() {
     assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
     assert_eq!(fs::read(&settings).unwrap(), bytes);
     assert_ne!(fs::metadata(&settings).unwrap().ino(), original_inode);
-    assert!(!paths.generated_include().exists());
+    assert!(paths.generated_include().exists());
     assert!(!paths.journal().exists());
 }
 
@@ -778,6 +778,7 @@ fn binding_only_publication_faults_preserve_state_and_leave_no_legacy_journal() 
                 ApplyStatus::CommitStateUnknown,
                 "{stage:?}"
             );
+            assert!(base_paths.generated_include().exists(), "{stage:?}");
         }
         assert!(reconcile_bindings(
             &base_paths,
@@ -834,7 +835,38 @@ fn binding_only_publication_never_replaces_a_destination_created_concurrently() 
 
 #[cfg(unix)]
 #[test]
-fn initializer_reload_rejection_rolls_back_without_replacing_existing_state() {
+fn binding_only_publication_detects_post_rename_takeover_without_adopting_or_deleting_it() {
+    let (_temp, base_paths) = apply_fixture();
+    fs::remove_file(base_paths.generated_include()).unwrap();
+    let external = b"external post-rename bindings\n".to_vec();
+    let observer = Arc::new(TakeoverFileObserver {
+        target: ApplyStage::PublicationRenamed,
+        path: base_paths.generated_include().to_owned(),
+        bytes: external.clone(),
+        swapped: Mutex::new(false),
+        replacement_inode: Mutex::new(None),
+    });
+    let paths = base_paths.clone().with_observer(observer.clone());
+
+    let report = initialize_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
+    assert_eq!(fs::read(paths.generated_include()).unwrap(), external);
+    assert_eq!(
+        fs::metadata(paths.generated_include()).unwrap().ino(),
+        observer.replacement_inode.lock().unwrap().unwrap()
+    );
+    assert!(!paths.journal().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn initializer_reload_rejection_keeps_new_include_without_replacing_state() {
     let (_temp, paths) = apply_fixture();
     fs::remove_file(paths.generated_include()).unwrap();
     let artifacts = [
@@ -854,17 +886,14 @@ fn initializer_reload_rejection_rolls_back_without_replacing_existing_state() {
         &InitializingValidator,
         &ScriptedReloader::online(
             Arc::new(Mutex::new(Vec::new())),
-            vec![
-                Some(ConfigLoaded { failed: true }),
-                Some(ConfigLoaded { failed: false }),
-            ],
+            vec![Some(ConfigLoaded { failed: true })],
         ),
     )
     .unwrap();
 
-    assert_eq!(report.status, ApplyStatus::RolledBackConfirmed);
+    assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
     assert!(!paths.journal().exists());
-    assert!(!paths.generated_include().exists());
+    assert!(paths.generated_include().exists());
     for (path, (bytes, inode)) in artifacts.iter().zip(&before) {
         assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
         assert_eq!(fs::metadata(path).unwrap().ino(), *inode);
@@ -873,7 +902,7 @@ fn initializer_reload_rejection_rolls_back_without_replacing_existing_state() {
 
 #[cfg(unix)]
 #[test]
-fn initializer_reload_request_fault_removes_new_include_without_touching_state() {
+fn initializer_reload_request_fault_keeps_new_include_without_touching_state() {
     let (_temp, base_paths) = apply_fixture();
     fs::remove_file(base_paths.generated_include()).unwrap();
     let artifacts = [
@@ -902,16 +931,13 @@ fn initializer_reload_request_fault_removes_new_include_without_touching_state()
         &InitializingValidator,
         &ScriptedReloader::online(
             Arc::new(Mutex::new(Vec::new())),
-            vec![
-                Some(ConfigLoaded { failed: false }),
-                Some(ConfigLoaded { failed: false }),
-            ],
+            vec![Some(ConfigLoaded { failed: false })],
         ),
     )
     .unwrap();
 
-    assert_eq!(report.status, ApplyStatus::RolledBackConfirmed);
-    assert!(!paths.generated_include().exists());
+    assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
+    assert!(paths.generated_include().exists());
     assert!(!paths.journal().exists());
     for (path, (bytes, inode, mtime, mtime_nsec)) in artifacts.iter().zip(&before) {
         let metadata = fs::metadata(path).unwrap();
@@ -920,6 +946,40 @@ fn initializer_reload_request_fault_removes_new_include_without_touching_state()
         assert_eq!(metadata.mtime(), *mtime);
         assert_eq!(metadata.mtime_nsec(), *mtime_nsec);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn initializer_never_unlinks_a_takeover_during_the_post_reload_check() {
+    let (_temp, base_paths) = apply_fixture();
+    fs::remove_file(base_paths.generated_include()).unwrap();
+    let external = b"external reload-window bindings\n".to_vec();
+    let observer = Arc::new(TakeoverFileObserver {
+        target: ApplyStage::ReloadRequested,
+        path: base_paths.generated_include().to_owned(),
+        bytes: external.clone(),
+        swapped: Mutex::new(false),
+        replacement_inode: Mutex::new(None),
+    });
+    let paths = base_paths.clone().with_observer(observer.clone());
+
+    let report = initialize_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::online(
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Some(ConfigLoaded { failed: false })],
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
+    assert_eq!(fs::read(paths.generated_include()).unwrap(), external);
+    assert_eq!(
+        fs::metadata(paths.generated_include()).unwrap().ino(),
+        observer.replacement_inode.lock().unwrap().unwrap()
+    );
+    assert!(!paths.journal().exists());
 }
 
 #[test]
@@ -1135,6 +1195,16 @@ struct SwapFileObserver {
     swapped: Mutex<bool>,
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct TakeoverFileObserver {
+    target: ApplyStage,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    swapped: Mutex<bool>,
+    replacement_inode: Mutex<Option<u64>>,
+}
+
 impl ApplyObserver for FailNthObserver {
     fn reached(&self, stage: ApplyStage) -> Result<(), String> {
         if stage != self.target {
@@ -1187,6 +1257,28 @@ impl ApplyObserver for SwapFileObserver {
             let replacement = self.path.with_extension("concurrent-replacement");
             fs::write(&replacement, &self.bytes).map_err(|error| error.to_string())?;
             fs::rename(&replacement, &self.path).map_err(|error| error.to_string())?;
+            *swapped = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl ApplyObserver for TakeoverFileObserver {
+    fn reached(&self, stage: ApplyStage) -> Result<(), String> {
+        if stage != self.target {
+            return Ok(());
+        }
+        let mut swapped = self.swapped.lock().unwrap();
+        if !*swapped {
+            let replacement = self.path.with_extension("external-takeover");
+            fs::write(&replacement, &self.bytes).map_err(|error| error.to_string())?;
+            fs::rename(&replacement, &self.path).map_err(|error| error.to_string())?;
+            *self.replacement_inode.lock().unwrap() = Some(
+                fs::metadata(&self.path)
+                    .map_err(|error| error.to_string())?
+                    .ino(),
+            );
             *swapped = true;
         }
         Ok(())

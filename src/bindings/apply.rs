@@ -1113,52 +1113,31 @@ fn initialize_binding_only_locked(
     let published = if include_missing {
         verify_binding_state_snapshots(fs, &settings, &presets)?;
         let temporary = format!(".sleepy-user-bindings.{}.tmp", Uuid::new_v4());
-        let mut renamed = false;
         let publication = fs.niri.publish_new_no_replace(
             temporary.as_ref(),
             BindingFileSystem::artifact_name(ArtifactKind::Bindings),
             bindings,
             |boundary| {
-                if matches!(boundary, crate::store::PublicationBoundary::Renamed) {
-                    renamed = true;
-                }
                 paths
                     .observe(binding_publication_stage(boundary))
                     .map_err(store_binding_error)
             },
         );
-        if let Err(error) = publication {
-            if !renamed {
+        match publication {
+            crate::store::NoReplacePublication::NotPublished(error) => {
                 return Err(BindingError::from_store(error));
             }
-            let published = fs
-                .niri
-                .snapshot_regular(BindingFileSystem::artifact_name(ArtifactKind::Bindings))
-                .map_err(BindingError::from_store)?;
-            return match published {
-                Some(published) => rollback_new_binding_only_include(
-                    fs,
-                    paths,
-                    reloader,
-                    active_preset_id,
-                    &settings,
-                    &presets,
-                    &published,
-                ),
-                None => Ok(ApplyReport {
+            crate::store::NoReplacePublication::Published(snapshot) => Some(snapshot),
+            crate::store::NoReplacePublication::PublishedWithError { snapshot, error } => {
+                // Visibility is already ambiguous. Keep the fd-derived provenance only long
+                // enough to make the non-destructive decision; never re-open or unlink the name.
+                let _ = (snapshot, error);
+                return Ok(ApplyReport {
                     status: ApplyStatus::CommitStateUnknown,
                     active_preset_id: active_preset_id.to_owned(),
-                }),
-            };
+                });
+            }
         }
-        Some(
-            fs.niri
-                .snapshot_regular(BindingFileSystem::artifact_name(ArtifactKind::Bindings))
-                .map_err(BindingError::from_store)?
-                .ok_or_else(|| {
-                    BindingError::new("commit_state_unknown", "published bindings disappeared")
-                })?,
-        )
     } else {
         Some(
             fs.niri
@@ -1218,15 +1197,10 @@ fn initialize_binding_only_locked(
     })();
     match candidate_result {
         Ok(report) => Ok(report),
-        Err(_) => rollback_new_binding_only_include(
-            fs,
-            paths,
-            reloader,
-            active_preset_id,
-            &settings,
-            &presets,
-            &published,
-        ),
+        Err(_) => Ok(ApplyReport {
+            status: ApplyStatus::CommitStateUnknown,
+            active_preset_id: active_preset_id.to_owned(),
+        }),
     }
 }
 
@@ -1249,58 +1223,6 @@ fn verify_binding_snapshot(
             "generated bindings changed during initialization",
         ))
     }
-}
-
-fn rollback_new_binding_only_include(
-    fs: &BindingFileSystem,
-    paths: &BindingPaths,
-    reloader: &dyn BindingReloader,
-    active_preset_id: &str,
-    settings: &crate::store::SecureFileSnapshot,
-    presets: &crate::store::SecureFileSnapshot,
-    published: &crate::store::SecureFileSnapshot,
-) -> Result<ApplyReport, BindingError> {
-    let unknown = || ApplyReport {
-        status: ApplyStatus::CommitStateUnknown,
-        active_preset_id: active_preset_id.to_owned(),
-    };
-    if !fs
-        .niri
-        .snapshot_matches(
-            BindingFileSystem::artifact_name(ArtifactKind::Bindings),
-            published,
-        )
-        .map_err(BindingError::from_store)?
-    {
-        return Ok(unknown());
-    }
-    if fs
-        .niri
-        .remove_file(BindingFileSystem::artifact_name(ArtifactKind::Bindings))
-        .and_then(|()| fs.niri.sync())
-        .is_err()
-    {
-        return Ok(unknown());
-    }
-    let mut stream = match reloader.subscribe() {
-        Ok(stream) => stream,
-        Err(_) => return Ok(unknown()),
-    };
-    let Some(stream) = stream.as_mut() else {
-        return Ok(unknown());
-    };
-    if stream.await_initial_snapshot(RELOAD_TIMEOUT).is_err()
-        || !reload_confirmed(paths, reloader, stream.as_mut(), RELOAD_TIMEOUT).unwrap_or(false)
-    {
-        return Ok(unknown());
-    }
-    if verify_binding_state_snapshots(fs, settings, presets).is_err() {
-        return Ok(unknown());
-    }
-    Ok(ApplyReport {
-        status: ApplyStatus::RolledBackConfirmed,
-        active_preset_id: active_preset_id.to_owned(),
-    })
 }
 
 fn verify_binding_state_snapshots(

@@ -59,6 +59,15 @@ pub(crate) struct SecureFileSnapshot {
     changed_nanoseconds: i64,
 }
 
+pub(crate) enum NoReplacePublication {
+    NotPublished(StoreError),
+    Published(SecureFileSnapshot),
+    PublishedWithError {
+        snapshot: Option<SecureFileSnapshot>,
+        error: StoreError,
+    },
+}
+
 pub(crate) enum SecureEntry {
     Regular(Vec<u8>),
     Directory(SecureDir),
@@ -293,9 +302,71 @@ impl SecureDir {
         temporary: &OsStr,
         destination: &OsStr,
         bytes: &[u8],
-        observe: impl FnMut(PublicationBoundary) -> Result<(), StoreError>,
-    ) -> Result<(), StoreError> {
-        self.publish_new_inner(temporary, destination, bytes, true, observe)
+        mut observe: impl FnMut(PublicationBoundary) -> Result<(), StoreError>,
+    ) -> NoReplacePublication {
+        if let Err(error) = self.exists(destination).and_then(|exists| {
+            if exists {
+                Err(StoreError::conflict(format!(
+                    "{} already exists",
+                    self.display_path.join(destination).display()
+                )))
+            } else {
+                Ok(())
+            }
+        }) {
+            return NoReplacePublication::NotPublished(error);
+        }
+        let path = self.display_path.join(temporary);
+        let temporary_c = match c_string(temporary, &path) {
+            Ok(temporary) => temporary,
+            Err(error) => return NoReplacePublication::NotPublished(error),
+        };
+        let descriptor = match openat_owned(
+            self.as_raw_fd(),
+            &temporary_c,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return NoReplacePublication::NotPublished(map_open_error(&path, error)),
+        };
+        let mut file = File::from(descriptor);
+        let split = if bytes.is_empty() {
+            0
+        } else {
+            (bytes.len() / 2).max(1)
+        };
+        let before_rename = (|| {
+            file.write_all(&bytes[..split]).map_err(StoreError::io)?;
+            observe(PublicationBoundary::PartialWritten)?;
+            file.write_all(&bytes[split..]).map_err(StoreError::io)?;
+            observe(PublicationBoundary::FileSyncStarted)?;
+            file.sync_all().map_err(StoreError::io)?;
+            observe(PublicationBoundary::FileSynced)?;
+            self.rename_no_replace(temporary, destination)
+        })();
+        if let Err(error) = before_rename {
+            drop(file);
+            let _ = self.remove_file(temporary);
+            return NoReplacePublication::NotPublished(error);
+        }
+        let snapshot = snapshot_from_descriptor(file.as_raw_fd(), bytes.to_vec()).ok();
+        let after_rename = (|| {
+            observe(PublicationBoundary::Renamed)?;
+            observe(PublicationBoundary::DirectorySyncStarted)?;
+            self.sync().map_err(StoreError::commit_state_unknown)?;
+            observe(PublicationBoundary::DirectorySynced)
+        })();
+        match after_rename {
+            Ok(()) => match snapshot_from_descriptor(file.as_raw_fd(), bytes.to_vec()) {
+                Ok(snapshot) => NoReplacePublication::Published(snapshot),
+                Err(error) => NoReplacePublication::PublishedWithError {
+                    snapshot,
+                    error: StoreError::io(error),
+                },
+            },
+            Err(error) => NoReplacePublication::PublishedWithError { snapshot, error },
+        }
     }
 
     fn publish_new_inner(
@@ -736,6 +807,13 @@ fn snapshot_metadata(metadata: libc::stat) -> SecureFileSnapshot {
         changed_seconds: metadata.st_ctime,
         changed_nanoseconds: metadata.st_ctime_nsec,
     }
+}
+
+fn snapshot_from_descriptor(descriptor: i32, bytes: Vec<u8>) -> io::Result<SecureFileSnapshot> {
+    Ok(SecureFileSnapshot {
+        bytes,
+        ..snapshot_metadata(fstat(descriptor)?)
+    })
 }
 
 fn fstat(descriptor: i32) -> io::Result<libc::stat> {
