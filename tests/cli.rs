@@ -2,7 +2,7 @@ use std::{
     fs,
     io::Write,
     os::unix::fs::PermissionsExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -21,11 +21,26 @@ fn command(root: &TempDir) -> Command {
     command
 }
 
+fn executable_on_path(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("tests require PATH"))
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{program} is not available on PATH"))
+}
+
+fn shell_script(body: &str) -> String {
+    format!("#!{}\n{body}", executable_on_path("sh").display())
+}
+
+fn successful_validator() -> PathBuf {
+    executable_on_path("true")
+}
+
 fn install_fake_system_tools(root: &TempDir) -> std::path::PathBuf {
     let bin = root.path().join("system-bin");
     fs::create_dir(&bin).unwrap();
-    let script = r#"#!/bin/sh
-tool=${0##*/}
+    let script = shell_script(
+        r#"tool=${0##*/}
 case "$tool" in
   nmcli)
     if [ "$3" = "WIFI" ]; then printf 'enabled\n'; else printf '*:Sleepy WiFi:73\n'; fi ;;
@@ -48,7 +63,8 @@ case "$tool" in
   niri) printf 'niri 26.04\n' ;;
   *) exit 2 ;;
 esac
-"#;
+"#,
+    );
     for tool in [
         "nmcli",
         "bluetoothctl",
@@ -62,7 +78,7 @@ esac
         "niri",
     ] {
         let path = bin.join(tool);
-        fs::write(&path, script).unwrap();
+        fs::write(&path, &script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     bin
@@ -394,7 +410,7 @@ fn cli_session_perform_echoes_generation_in_typed_result() {
     let bin = root.path().join("bin");
     fs::create_dir(&bin).unwrap();
     let swaylock = bin.join("swaylock");
-    fs::write(&swaylock, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(&swaylock, shell_script("exit 0\n")).unwrap();
     fs::set_permissions(&swaylock, fs::Permissions::from_mode(0o755)).unwrap();
     let output = command(&root)
         .env("PATH", &bin)
@@ -1013,7 +1029,7 @@ fn cli_activation_apply_and_builtin_edit_use_the_offline_journal_path() {
         .success());
 
     let activate = command(&root)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .args(["presets", "activate", USER_ID, "--apply"])
         .output()
         .unwrap();
@@ -1040,7 +1056,7 @@ fn cli_activation_apply_and_builtin_edit_use_the_offline_journal_path() {
         .status
         .success());
     let edit = command(&second)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .args([
             "keybindings",
             "set",
@@ -1071,7 +1087,7 @@ fn cli_online_reload_waits_through_delayed_stale_snapshot_and_keeps_json_clean()
     let reload_marker = root.path().join("reload-requested");
 
     let output = command(&root)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .env("SLEEPY_NIRI", &fake_niri)
         .env("SLEEPY_TEST_RELOAD_MARKER", &reload_marker)
         .env("NIRI_SOCKET", root.path().join("niri.sock"))
@@ -1093,7 +1109,7 @@ fn cli_initialize_reconciles_pending_offline_and_online_required_fails_distinctl
     let root = TempDir::new().unwrap();
     prepare_niri_tree(&root);
     let first = command(&root)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .args(["bindings", "initialize"])
         .output()
         .unwrap();
@@ -1105,7 +1121,7 @@ fn cli_initialize_reconciles_pending_offline_and_online_required_fails_distinctl
     let journal = fs::read(root.path().join("state/sleepy/bindings-transaction.json")).unwrap();
 
     let second = command(&root)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .args(["bindings", "initialize"])
         .output()
         .unwrap();
@@ -1143,7 +1159,7 @@ fn cli_initialize_after_online_confirmation_preserves_exact_bytes_and_mtimes() {
     let marker = root.path().join("reload-requested-rust");
     let socket = root.path().join("niri.sock");
     let first = command(&root)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .env("SLEEPY_NIRI", &fake_niri)
         .env("SLEEPY_TEST_RELOAD_MARKER", &marker)
         .env("NIRI_SOCKET", &socket)
@@ -1215,7 +1231,7 @@ fn cli_active_apply_conflict_keeps_structured_action_details_without_writing() {
         fs::read(root.path().join("config/niri/sleepy-user-bindings.kdl")).unwrap();
 
     let output = command(&root)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .args([
             "keybindings",
             "set",
@@ -1314,7 +1330,7 @@ fn run_with_stdin_validator(
     input: &[u8],
 ) -> std::process::Output {
     let mut child = command(root)
-        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI_VALIDATOR", successful_validator())
         .args(arguments)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

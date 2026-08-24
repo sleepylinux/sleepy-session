@@ -110,6 +110,13 @@ fn key(program: &str, args: &[&str]) -> (String, Vec<String>) {
     )
 }
 
+fn executable_on_path(program: &str) -> std::path::PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("tests require PATH"))
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{program} is not available on PATH"))
+}
+
 fn base_runner() -> ScriptedRunner {
     ScriptedRunner::default()
         .output(
@@ -606,7 +613,10 @@ fn process_runner_kills_and_reaps_a_superseded_real_child() {
     let survived = root.path().join("survived");
     fs::write(
         &script,
-        "#!/bin/sh\necho $$ > \"$1\"\nwhile :; do :; done\necho survived > \"$2\"\n",
+        format!(
+            "#!{}\necho $$ > \"$1\"\nwhile :; do :; done\necho survived > \"$2\"\n",
+            executable_on_path("sh").display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();

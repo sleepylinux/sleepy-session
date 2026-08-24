@@ -1464,7 +1464,10 @@ mod process_lifecycle_tests {
 
     #[test]
     fn event_stream_termination_joins_reader_before_returning() {
-        let child = Command::new("/bin/true").spawn().unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "__sleepy_event_stream_child__"])
+            .spawn()
+            .unwrap();
         let (_sender, receiver) = mpsc::channel();
         let completed = Arc::new(AtomicBool::new(false));
         let completed_in_reader = Arc::clone(&completed);

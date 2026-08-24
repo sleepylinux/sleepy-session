@@ -4,7 +4,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Component, Path, PathBuf},
@@ -318,13 +318,18 @@ impl SecureDir {
     }
 
     pub fn entries(&self) -> Result<Vec<OsString>, StoreError> {
-        let duplicate = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if duplicate < 0 {
-            return Err(StoreError::io(io::Error::last_os_error()));
-        }
-        let stream = unsafe { libc::fdopendir(duplicate) };
+        let current = CString::new(".").expect("static current directory has no NUL");
+        let descriptor = openat_owned(
+            self.as_raw_fd(),
+            &current,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        )
+        .map_err(StoreError::io)?;
+        let descriptor = descriptor.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(descriptor) };
         if stream.is_null() {
-            unsafe { libc::close(duplicate) };
+            unsafe { libc::close(descriptor) };
             return Err(StoreError::io(io::Error::last_os_error()));
         }
         let mut entries = Vec::new();
@@ -691,6 +696,18 @@ mod static_store_resolution_tests {
 
     fn read_test_store(target: &Path, store_root: &Path) -> Result<Vec<u8>, StoreError> {
         read_store_regular_for_policy(target, store_root, unsafe { libc::geteuid() }, 40)
+    }
+
+    #[test]
+    fn directory_entries_can_be_enumerated_repeatedly() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("first"), b"first").unwrap();
+        fs::write(temp.path().join("second"), b"second").unwrap();
+        let directory = SecureDir::open_writable(temp.path(), false).unwrap();
+        let expected = vec![OsString::from("first"), OsString::from("second")];
+
+        assert_eq!(directory.entries().unwrap(), expected);
+        assert_eq!(directory.entries().unwrap(), expected);
     }
 
     #[test]
