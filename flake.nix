@@ -16,6 +16,7 @@
       packageFor = system:
         let
           pkgs = import nixpkgs { inherit system; };
+          niriContract = assert pkgs.niri.version == "26.04"; pkgs.niri;
         in
         pkgs.rustPlatform.buildRustPackage {
           pname = "sleepy-session";
@@ -26,6 +27,7 @@
             # Cargo.lock fixes the SDK revision; this avoids an invented vendor hash.
             allowBuiltinFetchGit = true;
           };
+          SLEEPY_NIRI_CONTRACT = "${niriContract}/bin/niri";
           passthru.sleepy-sdk-source = sleepy-sdk;
           meta.license = pkgs.lib.licenses.gpl3Only;
         };

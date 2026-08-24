@@ -38,6 +38,35 @@ fn preset(bindings: &[(&str, &str)]) -> PresetDocument {
     }
 }
 
+fn all_actions_preset() -> PresetDocument {
+    preset(&[
+        ("workspace.next", "Mod+Page_Down"),
+        ("app.terminal.open", "Mod+Return"),
+        ("session.powerOff", "Mod+Shift+P"),
+        ("audio.volume.up", "XF86AudioRaiseVolume"),
+        ("window.focus.left", "Mod+Left"),
+        ("surface.controlCenter.toggle", "Mod+C"),
+        ("media.previous", "XF86AudioPrev"),
+        ("session.power", "Mod+P"),
+        ("display.brightness.down", "XF86MonBrightnessDown"),
+        ("window.focus.right", "Mod+Right"),
+        ("session.logout", "Mod+Shift+E"),
+        ("audio.volume.toggleMute", "XF86AudioMute"),
+        ("launcher.open", "Mod+D"),
+        ("media.next", "XF86AudioNext"),
+        ("window.focus.down", "Mod+Down"),
+        ("workspace.previous", "Mod+Page_Up"),
+        ("session.lock", "Mod+L"),
+        ("audio.microphone.toggleMute", "XF86AudioMicMute"),
+        ("window.close", "Mod+Q"),
+        ("media.playPause", "XF86AudioPlay"),
+        ("window.focus.up", "Mod+Up"),
+        ("session.reboot", "Mod+Shift+R"),
+        ("audio.volume.down", "XF86AudioLowerVolume"),
+        ("display.brightness.up", "XF86MonBrightnessUp"),
+    ])
+}
+
 fn compile_rollback_hanging_niri(root: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
     let source = root.path().join("rollback-hang.rs");
     let executable = root.path().join("rollback-hang");
@@ -92,32 +121,7 @@ fn main() {
 
 #[test]
 fn compiler_golden_maps_every_closed_action_to_typed_niri_kdl() {
-    let candidate = preset(&[
-        ("workspace.next", "Mod+Page_Down"),
-        ("app.terminal.open", "Mod+Return"),
-        ("session.powerOff", "Mod+Shift+P"),
-        ("audio.volume.up", "XF86AudioRaiseVolume"),
-        ("window.focus.left", "Mod+Left"),
-        ("surface.controlCenter.toggle", "Mod+C"),
-        ("media.previous", "XF86AudioPrev"),
-        ("session.power", "Mod+P"),
-        ("display.brightness.down", "XF86MonBrightnessDown"),
-        ("window.focus.right", "Mod+Right"),
-        ("session.logout", "Mod+Shift+E"),
-        ("audio.volume.toggleMute", "XF86AudioMute"),
-        ("launcher.open", "Mod+D"),
-        ("media.next", "XF86AudioNext"),
-        ("window.focus.down", "Mod+Down"),
-        ("workspace.previous", "Mod+Page_Up"),
-        ("session.lock", "Mod+L"),
-        ("audio.microphone.toggleMute", "XF86AudioMicMute"),
-        ("window.close", "Mod+Q"),
-        ("media.playPause", "XF86AudioPlay"),
-        ("window.focus.up", "Mod+Up"),
-        ("session.reboot", "Mod+Shift+R"),
-        ("audio.volume.down", "XF86AudioLowerVolume"),
-        ("display.brightness.up", "XF86MonBrightnessUp"),
-    ]);
+    let candidate = all_actions_preset();
 
     let rendered = compile_bindings(&candidate).unwrap();
 
@@ -131,7 +135,7 @@ fn compiler_golden_maps_every_closed_action_to_typed_niri_kdl() {
         "spawn \"ghostty\"",
         "spawn \"fuzzel\"",
         "focus-column-left",
-        "focus-workspace-next",
+        "focus-workspace-down",
         "toggleControlCenter",
     ] {
         assert!(
@@ -139,6 +143,35 @@ fn compiler_golden_maps_every_closed_action_to_typed_niri_kdl() {
             "missing {required} from {rendered}"
         );
     }
+}
+
+#[test]
+fn compiler_registry_validates_with_pinned_niri() {
+    let Some(niri) = std::env::var_os("SLEEPY_NIRI_CONTRACT") else {
+        return;
+    };
+    let version = Command::new(&niri).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert!(
+        String::from_utf8_lossy(&version.stdout).starts_with("niri 26.04 "),
+        "contract must run against Niri 26.04, got {}",
+        String::from_utf8_lossy(&version.stdout).trim()
+    );
+
+    let root = TempDir::new().unwrap();
+    let config = root.path().join("config.kdl");
+    fs::write(&config, compile_bindings(&all_actions_preset()).unwrap()).unwrap();
+    let output = Command::new(niri)
+        .args(["validate", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "generated registry failed Niri 26.04 validation:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

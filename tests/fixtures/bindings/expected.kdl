@@ -21,6 +21,6 @@ binds {
     Mod+Left { focus-column-left; }
     Mod+Right { focus-column-right; }
     Mod+Up { focus-window-up; }
-    Mod+Page_Down { focus-workspace-next; }
-    Mod+Page_Up { focus-workspace-previous; }
+    Mod+Page_Down { focus-workspace-down; }
+    Mod+Page_Up { focus-workspace-up; }
 }
