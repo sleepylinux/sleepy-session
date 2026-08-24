@@ -27,6 +27,7 @@
             allowBuiltinFetchGit = true;
           };
           passthru.sleepy-sdk-source = sleepy-sdk;
+          meta.license = pkgs.lib.licenses.gpl3Only;
         };
     in
     {
@@ -34,7 +35,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           package = packageFor system;
-          userUnit = pkgs.writeTextDir "share/systemd/user/sleepy-session.service" ''
+          userUnit = (pkgs.writeTextDir "share/systemd/user/sleepy-session.service" ''
             [Unit]
             Description=Initialize Sleepy session settings state
 
@@ -45,7 +46,11 @@
 
             [Install]
             WantedBy=default.target
-          '';
+          '').overrideAttrs (old: {
+            meta = (old.meta or {}) // {
+              license = pkgs.lib.licenses.gpl3Only;
+            };
+          });
         in {
           default = package;
           sleepy-session = package;
