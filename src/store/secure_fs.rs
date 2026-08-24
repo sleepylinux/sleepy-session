@@ -242,6 +242,21 @@ impl SecureDir {
         Ok(File::from(descriptor))
     }
 
+    pub fn validate_private_file_if_present(&self, name: &OsStr) -> Result<(), StoreError> {
+        let Some(descriptor) =
+            self.open_regular_optional(name, libc::O_RDONLY | libc::O_NONBLOCK)?
+        else {
+            return Ok(());
+        };
+        let metadata = fstat(descriptor.as_raw_fd()).map_err(StoreError::io)?;
+        if metadata.st_mode & 0o777 != 0o600 {
+            return Err(StoreError::unsafe_path(
+                self.display_path.join(name).display(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn atomic_replace(
         &self,
         name: &OsStr,

@@ -2,6 +2,7 @@
 
 pub mod bindings;
 pub mod cli;
+pub mod sessiond;
 mod store;
 pub mod system;
 
