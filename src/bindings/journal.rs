@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::store::PublicationBoundary;
+
 use super::{secure_fs::BindingFileSystem, ApplyStage, BindingError, BindingPaths};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -69,6 +71,7 @@ impl TransactionJournal {
             .read_optional(BindingFileSystem::journal_name())
             .map_err(BindingError::from_store)?
         else {
+            cleanup_orphan_journal_temps(fs)?;
             return Ok(None);
         };
         let journal: Self = serde_json::from_slice(&bytes)
@@ -149,20 +152,12 @@ impl TransactionJournal {
             previous_active_preset_id,
             artifacts,
         };
-        journal.persist_initial(fs)?;
+        journal.persist_initial(fs, paths)?;
         for (artifact, (old, new)) in journal.artifacts.iter().zip(sidecars.iter()) {
             let dir = fs.artifact_dir(artifact.kind);
-            dir.write_new(
-                BindingFileSystem::sidecar_name(&artifact.old_artifact)?,
-                old,
-            )
-            .map_err(BindingError::from_store)?;
+            publish_sidecar(fs, paths, artifact.kind, &artifact.old_artifact, old)?;
             paths.observe(sidecar_stage(artifact.kind, false))?;
-            dir.write_new(
-                BindingFileSystem::sidecar_name(&artifact.new_artifact)?,
-                new,
-            )
-            .map_err(BindingError::from_store)?;
+            publish_sidecar(fs, paths, artifact.kind, &artifact.new_artifact, new)?;
             paths.observe(sidecar_stage(artifact.kind, true))?;
             dir.sync().map_err(BindingError::from_store)?;
         }
@@ -261,14 +256,26 @@ impl TransactionJournal {
             )
             .map_err(BindingError::from_store)
     }
-    fn persist_initial(&self, fs: &BindingFileSystem) -> Result<(), BindingError> {
+    fn persist_initial(
+        &self,
+        fs: &BindingFileSystem,
+        paths: &BindingPaths,
+    ) -> Result<(), BindingError> {
         let bytes = serde_json::to_vec(self)
             .map_err(|e| BindingError::new("invalid_journal", e.to_string()))?;
+        let temporary = format!(
+            ".bindings-transaction.json.{}.prepare.tmp",
+            self.transaction_id
+        );
         fs.handles
             .presets
-            .write_new(BindingFileSystem::journal_name(), &bytes)
-            .map_err(BindingError::from_store)?;
-        fs.handles.presets.sync().map_err(BindingError::from_store)
+            .publish_new(
+                temporary.as_ref(),
+                BindingFileSystem::journal_name(),
+                &bytes,
+                |boundary| observe_publication(paths, boundary),
+            )
+            .map_err(BindingError::from_store)
     }
 
     pub fn cleanup(
@@ -283,6 +290,11 @@ impl TransactionJournal {
                 .map_err(BindingError::from_store)?;
             dir.remove_file(BindingFileSystem::sidecar_name(&a.new_artifact)?)
                 .map_err(BindingError::from_store)?;
+            for sidecar in [&a.old_artifact, &a.new_artifact] {
+                let temporary = publication_temp(BindingFileSystem::sidecar_name(sidecar)?);
+                dir.remove_file(temporary.as_ref())
+                    .map_err(BindingError::from_store)?;
+            }
             dirs.insert(a.kind);
         }
         paths.observe(ApplyStage::ArtifactsRemoved)?;
@@ -348,6 +360,9 @@ impl TransactionJournal {
                     "binding transaction sidecar path is invalid",
                 ));
             }
+            if !self.sidecars_complete {
+                continue;
+            }
             for (path, expected_hash) in [
                 (&a.old_artifact, &a.old_hash),
                 (&a.new_artifact, &a.new_hash),
@@ -375,6 +390,86 @@ impl TransactionJournal {
         }
         Ok(())
     }
+}
+
+fn publish_sidecar(
+    fs: &BindingFileSystem,
+    paths: &BindingPaths,
+    kind: ArtifactKind,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), BindingError> {
+    let name = BindingFileSystem::sidecar_name(path)?;
+    let temporary = publication_temp(name);
+    fs.artifact_dir(kind)
+        .publish_new(temporary.as_ref(), name, bytes, |boundary| {
+            observe_publication(paths, boundary)
+        })
+        .map_err(BindingError::from_store)
+}
+
+fn publication_temp(name: &std::ffi::OsStr) -> String {
+    format!("{}.publish.tmp", name.to_string_lossy())
+}
+
+fn cleanup_orphan_journal_temps(fs: &BindingFileSystem) -> Result<(), BindingError> {
+    let prefix = ".bindings-transaction.json.";
+    let suffix = ".prepare.tmp";
+    let mut removed = false;
+    for name in fs
+        .handles
+        .presets
+        .entries()
+        .map_err(BindingError::from_store)?
+    {
+        let Some(name_utf8) = name.to_str() else {
+            continue;
+        };
+        let Some(id) = name_utf8
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if Uuid::parse_str(id)
+            .map(|uuid| uuid.hyphenated().to_string() == id)
+            .unwrap_or(false)
+        {
+            fs.handles
+                .presets
+                .remove_file(&name)
+                .map_err(BindingError::from_store)?;
+            removed = true;
+        }
+    }
+    if removed {
+        fs.handles
+            .presets
+            .sync()
+            .map_err(BindingError::from_store)?;
+    }
+    Ok(())
+}
+
+fn observe_publication(
+    paths: &BindingPaths,
+    boundary: PublicationBoundary,
+) -> Result<(), crate::StoreError> {
+    let stage = match boundary {
+        PublicationBoundary::PartialWritten => ApplyStage::PublicationPartialWritten,
+        PublicationBoundary::FileSyncStarted => ApplyStage::PublicationFileSyncStarted,
+        PublicationBoundary::FileSynced => ApplyStage::PublicationFileSynced,
+        PublicationBoundary::Renamed => ApplyStage::PublicationRenamed,
+        PublicationBoundary::DirectorySyncStarted => ApplyStage::PublicationDirectorySyncStarted,
+        PublicationBoundary::DirectorySynced => ApplyStage::PublicationDirectorySynced,
+    };
+    paths.observe(stage).map_err(|error| {
+        crate::StoreError::binding_with_details(
+            error.code(),
+            error.message().to_owned(),
+            error.details().cloned(),
+        )
+    })
 }
 
 fn install(

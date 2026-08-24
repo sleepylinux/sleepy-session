@@ -36,6 +36,16 @@ pub(crate) struct StoreHandles {
     pub presets: SecureDir,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationBoundary {
+    PartialWritten,
+    FileSyncStarted,
+    FileSynced,
+    Renamed,
+    DirectorySyncStarted,
+    DirectorySynced,
+}
+
 impl StoreHandles {
     pub fn open(paths: &StorePaths, create: bool) -> Result<Self, StoreError> {
         let config_root = SecureDir::open_writable(paths.config_root(), create)?;
@@ -218,6 +228,48 @@ impl SecureDir {
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .map_err(StoreError::io)
+    }
+
+    pub fn publish_new(
+        &self,
+        temporary: &OsStr,
+        destination: &OsStr,
+        bytes: &[u8],
+        mut observe: impl FnMut(PublicationBoundary) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        if self.exists(destination)? {
+            return Err(StoreError::conflict(format!(
+                "{} already exists",
+                self.display_path.join(destination).display()
+            )));
+        }
+        let path = self.display_path.join(temporary);
+        let temporary_c = c_string(temporary, &path)?;
+        let descriptor = openat_owned(
+            self.as_raw_fd(),
+            &temporary_c,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+        .map_err(|error| map_open_error(&path, error))?;
+        let mut file = File::from(descriptor);
+        let split = if bytes.is_empty() {
+            0
+        } else {
+            (bytes.len() / 2).max(1)
+        };
+        file.write_all(&bytes[..split]).map_err(StoreError::io)?;
+        observe(PublicationBoundary::PartialWritten)?;
+        file.write_all(&bytes[split..]).map_err(StoreError::io)?;
+        observe(PublicationBoundary::FileSyncStarted)?;
+        file.sync_all().map_err(StoreError::io)?;
+        observe(PublicationBoundary::FileSynced)?;
+        drop(file);
+        self.rename(temporary, destination)?;
+        observe(PublicationBoundary::Renamed)?;
+        observe(PublicationBoundary::DirectorySyncStarted)?;
+        self.sync().map_err(StoreError::commit_state_unknown)?;
+        observe(PublicationBoundary::DirectorySynced)
     }
 
     pub fn rename(&self, source: &OsStr, destination: &OsStr) -> Result<(), StoreError> {

@@ -10,7 +10,7 @@ pub use defaults::Defaults;
 pub use error::StoreError;
 pub use import_export::ImportMode;
 pub use paths::StorePaths;
-pub(crate) use secure_fs::{SecureDir, StoreHandles};
+pub(crate) use secure_fs::{PublicationBoundary, SecureDir, StoreHandles};
 pub(crate) use state::{parse_preset, StateCandidate};
 pub use state::{
     InspectionDocumentReport, InspectionIssue, InspectionReport, PresetMutationObserver,

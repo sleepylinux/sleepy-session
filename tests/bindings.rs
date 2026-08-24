@@ -562,6 +562,28 @@ struct FailOnceObserver {
     failed: Mutex<bool>,
 }
 
+#[derive(Debug)]
+struct FailNthObserver {
+    target: ApplyStage,
+    occurrence: usize,
+    seen: Mutex<usize>,
+}
+
+impl ApplyObserver for FailNthObserver {
+    fn reached(&self, stage: ApplyStage) -> Result<(), String> {
+        if stage != self.target {
+            return Ok(());
+        }
+        let mut seen = self.seen.lock().unwrap();
+        *seen += 1;
+        if *seen == self.occurrence {
+            Err("simulated ENOSPC during atomic publication".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl ApplyObserver for FailOnceObserver {
     fn reached(&self, stage: ApplyStage) -> Result<(), String> {
         let mut failed = self.failed.lock().unwrap();
@@ -949,6 +971,57 @@ fn sidecar_fsync_crashes_leave_a_discoverable_safe_preparation_record() {
             apply_active_bindings(&paths, &retry_validator, &successful_online(retry_events))
                 .unwrap();
         assert_eq!(retry.status, ApplyStatus::Committed);
+    }
+}
+
+#[test]
+fn journal_and_sidecar_publication_recovers_every_actual_write_sync_boundary() {
+    let boundaries = [
+        ApplyStage::PublicationPartialWritten,
+        ApplyStage::PublicationFileSyncStarted,
+        ApplyStage::PublicationFileSynced,
+        ApplyStage::PublicationRenamed,
+        ApplyStage::PublicationDirectorySyncStarted,
+        ApplyStage::PublicationDirectorySynced,
+    ];
+    for boundary in boundaries {
+        for occurrence in 1..=7 {
+            let (_temp, base_paths) = apply_fixture();
+            let unrelated = base_paths
+                .store()
+                .state_root()
+                .join("sleepy/unrelated.keep");
+            fs::write(&unrelated, b"unrelated\n").unwrap();
+            let paths = base_paths.clone().with_observer(Arc::new(FailNthObserver {
+                target: boundary,
+                occurrence,
+                seen: Mutex::new(0),
+            }));
+
+            let error = apply_active_bindings(
+                &paths,
+                &InitializingValidator,
+                &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), "fault_injected", "{boundary:?} #{occurrence}");
+
+            let recovered = reconcile_bindings(
+                &base_paths,
+                &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .unwrap();
+            assert!(recovered.is_none(), "{boundary:?} #{occurrence}");
+            assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated\n");
+            assert!(!base_paths.journal().exists());
+            let retry = apply_active_bindings(
+                &base_paths,
+                &InitializingValidator,
+                &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .unwrap();
+            assert_eq!(retry.status, ApplyStatus::ReloadPending);
+        }
     }
 }
 

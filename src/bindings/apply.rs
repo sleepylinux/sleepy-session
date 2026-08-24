@@ -269,6 +269,12 @@ pub trait ApplyObserver: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyStage {
     WritableDirectoriesOpened,
+    PublicationPartialWritten,
+    PublicationFileSyncStarted,
+    PublicationFileSynced,
+    PublicationRenamed,
+    PublicationDirectorySyncStarted,
+    PublicationDirectorySynced,
     PreparedSynced,
     PresetRenamed,
     PresetDirectorySynced,
