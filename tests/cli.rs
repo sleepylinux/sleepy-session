@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::Write,
+    os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
 };
 
@@ -47,6 +48,122 @@ fn run_with_stdin(root: &TempDir, arguments: &[&str], input: &[u8]) -> std::proc
         .unwrap();
     child.stdin.take().unwrap().write_all(input).unwrap();
     child.wait_with_output().unwrap()
+}
+
+#[test]
+fn cli_system_commands_require_and_echo_a_positive_client_generation() {
+    let root = TempDir::new().unwrap();
+    for arguments in [
+        vec!["system", "show"],
+        vec!["system", "show", "--generation", "0"],
+        vec![
+            "system",
+            "set",
+            "network.enabled",
+            "true",
+            "--generation",
+            "0",
+        ],
+        vec![
+            "session",
+            "perform",
+            "lock",
+            "confirmed",
+            "--generation",
+            "0",
+        ],
+    ] {
+        let output = command(&root).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
+            "invalid_generation"
+        );
+    }
+}
+
+#[test]
+fn cli_system_set_rejects_mismatched_and_read_only_values_before_execution() {
+    let root = TempDir::new().unwrap();
+    for arguments in [
+        vec![
+            "system",
+            "set",
+            "network.enabled",
+            "0.5",
+            "--generation",
+            "1",
+        ],
+        vec![
+            "system",
+            "set",
+            "battery.status",
+            "true",
+            "--generation",
+            "1",
+        ],
+        vec![
+            "system",
+            "set",
+            "power.profile",
+            "turbo",
+            "--generation",
+            "1",
+        ],
+    ] {
+        let output = command(&root).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
+            "invalid_request"
+        );
+    }
+}
+
+#[test]
+fn cli_session_perform_requires_literal_confirmation() {
+    let root = TempDir::new().unwrap();
+    let output = command(&root)
+        .args(["session", "perform", "powerOff", "yes", "--generation", "4"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
+        "confirmation_required"
+    );
+}
+
+#[test]
+fn cli_session_perform_echoes_generation_in_typed_result() {
+    let root = TempDir::new().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let swaylock = bin.join("swaylock");
+    fs::write(&swaylock, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&swaylock, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = command(&root)
+        .env("PATH", &bin)
+        .args([
+            "session",
+            "perform",
+            "lock",
+            "confirmed",
+            "--generation",
+            "184",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result =
+        sleepy_sdk::validate_session_action_result(std::str::from_utf8(&output.stdout).unwrap())
+            .unwrap();
+    assert_eq!(result.generation, 184);
+    assert_eq!(result.status, sleepy_sdk::SessionActionStatus::Initiated);
 }
 
 #[test]

@@ -2,6 +2,7 @@
 
 pub mod cli;
 mod store;
+pub mod system;
 
 pub use store::{
     Defaults, ImportMode, InspectionDocumentReport, InspectionIssue, InspectionReport,

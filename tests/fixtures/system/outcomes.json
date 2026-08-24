@@ -1,0 +1,14 @@
+{
+  "adapters": [
+    "nmcli",
+    "bluetoothctl",
+    "wpctl",
+    "brightnessctl",
+    "powerprofilesctl",
+    "upower",
+    "playerctl",
+    "gammastep",
+    "session"
+  ],
+  "outcomes": ["valid", "unsupported", "malformed", "nonzero", "timeout"]
+}
