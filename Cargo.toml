@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 fs2 = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "4c4f7989b957f41f3748ddfb092b0348e2ba9e88" }
+sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "2edbe8310eee69c40e4f75924da67a57942bd1c3" }
 uuid = { version = "1.24", features = ["v4"] }
 
 [dev-dependencies]
