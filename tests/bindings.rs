@@ -558,6 +558,71 @@ fn apply_fault_seams_reconcile_each_rename_fsync_reload_and_cleanup_boundary() {
     }
 }
 
+#[test]
+fn rejected_candidate_cannot_be_resurrected_after_any_rollback_install_crash() {
+    let rollback_stages = [
+        ApplyStage::RollbackPresetRenamed,
+        ApplyStage::RollbackPresetDirectorySynced,
+        ApplyStage::RollbackSettingsRenamed,
+        ApplyStage::RollbackSettingsDirectorySynced,
+        ApplyStage::RollbackBindingsRenamed,
+        ApplyStage::RollbackBindingsDirectorySynced,
+    ];
+
+    for stage in rollback_stages {
+        let (_temp, base_paths) = apply_fixture();
+        let old_settings = fs::read(base_paths.store().settings_path()).unwrap();
+        let old_presets = fs::read(base_paths.store().presets_path()).unwrap();
+        let old_bindings = fs::read(base_paths.generated_include()).unwrap();
+        let paths = base_paths.with_observer(Arc::new(FailOnceObserver {
+            target: stage,
+            failed: Mutex::new(false),
+        }));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let validator = RecordingValidator {
+            live_include: paths.generated_include().to_owned(),
+            events: Arc::clone(&events),
+            failure: None,
+        };
+        let rejected = ScriptedReloader::online(
+            events,
+            vec![
+                Some(ConfigLoaded { failed: true }),
+                Some(ConfigLoaded { failed: false }),
+            ],
+        );
+
+        let error = apply_active_bindings(&paths, &validator, &rejected).unwrap_err();
+        assert_eq!(
+            error.code(),
+            "fault_injected",
+            "unexpected failure at {stage:?}"
+        );
+        assert!(paths.journal().exists());
+
+        let restart_events = Arc::new(Mutex::new(Vec::new()));
+        let recovered = reconcile_bindings(
+            &paths,
+            &ScriptedReloader::online(restart_events, vec![Some(ConfigLoaded { failed: false })]),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            recovered.status,
+            ApplyStatus::RolledBackConfirmed,
+            "candidate resurrected after {stage:?}"
+        );
+        assert_eq!(
+            fs::read(paths.store().settings_path()).unwrap(),
+            old_settings
+        );
+        assert_eq!(fs::read(paths.store().presets_path()).unwrap(), old_presets);
+        assert_eq!(fs::read(paths.generated_include()).unwrap(), old_bindings);
+        assert!(!paths.journal().exists());
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn apply_rejects_symlinked_writable_files_and_malicious_static_links() {

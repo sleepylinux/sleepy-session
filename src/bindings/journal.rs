@@ -345,16 +345,23 @@ fn install(
             "durable transaction artifact hash mismatch",
         ));
     }
-    atomic_replace_observed(paths, artifact.kind, &artifact.destination, &bytes)
+    atomic_replace_observed(paths, artifact.kind, target, &artifact.destination, &bytes)
 }
 
 fn atomic_replace(destination: &Path, bytes: &[u8]) -> Result<(), BindingError> {
-    atomic_replace_observed(None, ArtifactKind::Settings, destination, bytes)
+    atomic_replace_observed(
+        None,
+        ArtifactKind::Settings,
+        RecoveryTarget::Candidate,
+        destination,
+        bytes,
+    )
 }
 
 fn atomic_replace_observed(
     paths: Option<&BindingPaths>,
     kind: ArtifactKind,
+    target: RecoveryTarget,
     destination: &Path,
     bytes: &[u8],
 ) -> Result<(), BindingError> {
@@ -371,21 +378,48 @@ fn atomic_replace_observed(
     fs::rename(&temporary, destination)
         .map_err(|error| io_error("rename transaction artifact", error))?;
     if let Some(paths) = paths {
-        paths.observe(match kind {
-            ArtifactKind::Preset => ApplyStage::PresetRenamed,
-            ArtifactKind::Settings => ApplyStage::SettingsRenamed,
-            ArtifactKind::Bindings => ApplyStage::BindingsRenamed,
-        })?;
+        paths.observe(replacement_stage(kind, target, false))?;
     }
     sync_directory(parent)?;
     if let Some(paths) = paths {
-        paths.observe(match kind {
-            ArtifactKind::Preset => ApplyStage::PresetDirectorySynced,
-            ArtifactKind::Settings => ApplyStage::SettingsDirectorySynced,
-            ArtifactKind::Bindings => ApplyStage::BindingsDirectorySynced,
-        })?;
+        paths.observe(replacement_stage(kind, target, true))?;
     }
     Ok(())
+}
+
+fn replacement_stage(kind: ArtifactKind, target: RecoveryTarget, synced: bool) -> ApplyStage {
+    match (target, kind, synced) {
+        (RecoveryTarget::Candidate, ArtifactKind::Preset, false) => ApplyStage::PresetRenamed,
+        (RecoveryTarget::Candidate, ArtifactKind::Preset, true) => {
+            ApplyStage::PresetDirectorySynced
+        }
+        (RecoveryTarget::Candidate, ArtifactKind::Settings, false) => ApplyStage::SettingsRenamed,
+        (RecoveryTarget::Candidate, ArtifactKind::Settings, true) => {
+            ApplyStage::SettingsDirectorySynced
+        }
+        (RecoveryTarget::Candidate, ArtifactKind::Bindings, false) => ApplyStage::BindingsRenamed,
+        (RecoveryTarget::Candidate, ArtifactKind::Bindings, true) => {
+            ApplyStage::BindingsDirectorySynced
+        }
+        (RecoveryTarget::Previous, ArtifactKind::Preset, false) => {
+            ApplyStage::RollbackPresetRenamed
+        }
+        (RecoveryTarget::Previous, ArtifactKind::Preset, true) => {
+            ApplyStage::RollbackPresetDirectorySynced
+        }
+        (RecoveryTarget::Previous, ArtifactKind::Settings, false) => {
+            ApplyStage::RollbackSettingsRenamed
+        }
+        (RecoveryTarget::Previous, ArtifactKind::Settings, true) => {
+            ApplyStage::RollbackSettingsDirectorySynced
+        }
+        (RecoveryTarget::Previous, ArtifactKind::Bindings, false) => {
+            ApplyStage::RollbackBindingsRenamed
+        }
+        (RecoveryTarget::Previous, ArtifactKind::Bindings, true) => {
+            ApplyStage::RollbackBindingsDirectorySynced
+        }
+    }
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), BindingError> {

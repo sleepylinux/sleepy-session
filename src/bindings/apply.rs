@@ -204,6 +204,12 @@ pub enum ApplyStage {
     ArtifactDirectoriesSynced,
     JournalRemoved,
     JournalDirectorySynced,
+    RollbackPresetRenamed,
+    RollbackPresetDirectorySynced,
+    RollbackSettingsRenamed,
+    RollbackSettingsDirectorySynced,
+    RollbackBindingsRenamed,
+    RollbackBindingsDirectorySynced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,8 +767,13 @@ fn reconcile_bindings_locked(
             .drain_initial()
             .map_err(|message| BindingError::new("reload_failed", message))?;
     }
+    if target == RecoveryTarget::Previous {
+        journal.set_recovery_target(paths, target)?;
+    }
     journal.install_target(paths, target)?;
-    journal.set_recovery_target(paths, target)?;
+    if target == RecoveryTarget::Candidate {
+        journal.set_recovery_target(paths, target)?;
+    }
     journal.set_phase(paths, JournalPhase::ReloadPending)?;
     let active_preset_id = journal.active_preset_id_for(target)?;
 
@@ -798,8 +809,8 @@ fn reconcile_bindings_locked(
         }
         Ok(None) | Err(_) => None,
     };
-    journal.restore_all(paths)?;
     journal.set_recovery_target(paths, RecoveryTarget::Previous)?;
+    journal.restore_all(paths)?;
     journal.set_phase(paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
     let confirmed = match rollback_stream.as_mut() {
@@ -902,8 +913,8 @@ fn apply_candidate_locked(
         }
         Ok(None) | Err(_) => None,
     };
-    journal.restore_all(paths)?;
     journal.set_recovery_target(paths, RecoveryTarget::Previous)?;
+    journal.restore_all(paths)?;
     journal.set_phase(paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
     let rollback_confirmed = match rollback_stream.as_mut() {
