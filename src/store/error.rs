@@ -46,7 +46,7 @@ impl StoreError {
     pub(crate) fn apply_required(id: &str) -> Self {
         Self {
             code: "apply_required",
-            message: format!("preset {id:?} is active; use the journaled apply path"),
+            message: format!("preset {id:?} requires the journaled apply path"),
             details: None,
         }
     }
@@ -106,10 +106,22 @@ impl StoreError {
         }
     }
 
+    pub(crate) fn binding_with_details(
+        code: &'static str,
+        message: String,
+        details: Option<Value>,
+    ) -> Self {
+        Self {
+            code,
+            message,
+            details,
+        }
+    }
+
     pub fn invalid_command() -> Self {
         Self {
             code: "invalid_command",
-            message: "expected a settings, presets, keybindings, or state inspect command with the documented arguments".to_owned(),
+            message: "expected a settings, presets, keybindings, bindings, or state command with the documented arguments".to_owned(),
             details: None,
         }
     }

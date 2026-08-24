@@ -51,6 +51,11 @@ pub struct StateStore {
 
 pub struct StateInspector;
 
+pub(crate) struct StateCandidate {
+    pub settings: SettingsDocument,
+    pub user_presets: Vec<PresetDocument>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InspectionReport {
@@ -294,6 +299,15 @@ impl StateStore {
         Ok(store)
     }
 
+    pub(crate) fn for_repair(paths: StorePaths, defaults: Defaults) -> Self {
+        Self {
+            paths,
+            defaults,
+            replacement_observer: None,
+            mutation_observer: None,
+        }
+    }
+
     /// Adds a replacement-stage observer to a cloned store handle.
     pub fn with_replacement_observer(mut self, observer: Arc<dyn ReplacementObserver>) -> Self {
         self.replacement_observer = Some(observer);
@@ -377,10 +391,7 @@ impl StateStore {
             if store.find_preset(id)?.is_none() {
                 return Err(StoreError::not_found(id));
             }
-            let mut settings = store.load_settings()?;
-            settings.active_preset_id = id.to_owned();
-            store.write_settings(&settings)?;
-            serde_json::to_value(settings).map_err(|error| StoreError::invalid(error.to_string()))
+            Err(StoreError::apply_required(id))
         })
     }
 
@@ -392,18 +403,22 @@ impl StateStore {
                     "settings activePresetId does not exist",
                 ));
             }
+            if store.load_settings()?.active_preset_id != settings.active_preset_id {
+                return Err(StoreError::apply_required(&settings.active_preset_id));
+            }
             store.write_settings(&settings)?;
             serde_json::to_value(settings).map_err(|error| StoreError::invalid(error.to_string()))
         })
     }
 
-    pub(super) fn with_transaction<T>(
+    pub(crate) fn with_transaction<T>(
         &self,
         operation: impl FnOnce(&Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         // A single configuration-root lock establishes the order for all settings/preset operations.
         self.paths.reject_symlinks()?;
         fs::create_dir_all(self.paths.settings_dir()).map_err(StoreError::io)?;
+        fs::create_dir_all(self.paths.presets_dir()).map_err(StoreError::io)?;
         self.paths.reject_symlinks()?;
         let lock = OpenOptions::new()
             .read(true)
@@ -416,6 +431,26 @@ impl StateStore {
         let result = operation(self);
         FileExt::unlock(&lock).map_err(StoreError::io)?;
         result
+    }
+
+    pub(crate) fn with_candidate_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Self, StateCandidate) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.with_transaction(|store| {
+            let candidate = StateCandidate {
+                settings: store.load_settings()?,
+                user_presets: store.load_user_presets()?,
+            };
+            operation(store, candidate)
+        })
+    }
+
+    pub(crate) fn with_repair_candidate_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.with_transaction(operation)
     }
 
     pub(super) fn observe_mutation(&self, stage: PresetMutationStage) -> Result<(), StoreError> {
@@ -435,12 +470,12 @@ impl StateStore {
         Ok(())
     }
 
-    pub(super) fn load_settings(&self) -> Result<SettingsDocument, StoreError> {
+    pub(crate) fn load_settings(&self) -> Result<SettingsDocument, StoreError> {
         let input = fs::read_to_string(self.paths.settings_path()).map_err(StoreError::io)?;
         validate_settings(&input).map_err(|error| StoreError::invalid(error.to_string()))
     }
 
-    pub(super) fn load_user_presets(&self) -> Result<Vec<PresetDocument>, StoreError> {
+    pub(crate) fn load_user_presets(&self) -> Result<Vec<PresetDocument>, StoreError> {
         let input = fs::read_to_string(self.paths.presets_path()).map_err(StoreError::io)?;
         let presets: Vec<Value> =
             serde_json::from_str(&input).map_err(|error| StoreError::invalid(error.to_string()))?;
@@ -471,7 +506,7 @@ impl StateStore {
         Ok(presets)
     }
 
-    pub(super) fn find_preset(&self, id: &str) -> Result<Option<PresetDocument>, StoreError> {
+    pub(crate) fn find_preset(&self, id: &str) -> Result<Option<PresetDocument>, StoreError> {
         if let Some(preset) = self.defaults.builtins.iter().find(|preset| preset.id == id) {
             return Ok(Some(preset.clone()));
         }
@@ -534,7 +569,7 @@ fn parse_settings(value: Value) -> Result<SettingsDocument, StoreError> {
     validate_settings(&value.to_string()).map_err(|error| StoreError::invalid(error.to_string()))
 }
 
-pub(super) fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
+pub(crate) fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
     if let Ok(document) = serde_json::from_value::<PresetDocument>(value.clone()) {
         validate_keybindings_with_reserved(&document.keybindings, &packaged_reserved_keybindings())
             .map_err(StoreError::keybinding_conflict)?;

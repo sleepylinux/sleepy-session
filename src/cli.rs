@@ -18,10 +18,18 @@ use std::{
 use serde_json::{json, Value};
 use sleepy_sdk::{
     canonicalize_accelerator, packaged_reserved_keybindings, validate_keybindings,
-    validate_keybindings_with_reserved,
+    validate_keybindings_with_reserved, PresetDocument,
 };
 
-use crate::{Defaults, ImportMode, StateInspector, StateStore, StoreError, StorePaths};
+use crate::{
+    bindings::{
+        activate_and_apply, apply_active_bindings, compile_bindings,
+        import_replace_active_and_apply, mutate_keybinding_and_apply, reconcile_bindings,
+        repair_state, update_active_bindings_and_apply, BindingPaths, NiriReloader, NiriValidator,
+        RepairBundle,
+    },
+    Defaults, ImportMode, StateInspector, StateStore, StoreError, StorePaths,
+};
 
 const MAX_JSON_INPUT_BYTES: u64 = 1024 * 1024;
 
@@ -34,12 +42,17 @@ enum CliCommand {
         id: String,
         input: String,
     },
+    PresetsUpdateApply {
+        id: String,
+        input: String,
+    },
     PresetsDelete(String),
     PresetsValidate(String),
     PresetsImport {
         input: String,
         mode: ImportMode,
     },
+    PresetsImportApply(String),
     PresetsExport(String),
     PresetsDuplicate {
         source: String,
@@ -50,8 +63,14 @@ enum CliCommand {
         name: String,
     },
     PresetsActivate(String),
+    PresetsActivateApply(String),
     KeybindingsList(String),
     KeybindingsSet {
+        id: String,
+        action: String,
+        accelerator: String,
+    },
+    KeybindingsSetApply {
         id: String,
         action: String,
         accelerator: String,
@@ -60,8 +79,16 @@ enum CliCommand {
         id: String,
         action: String,
     },
+    KeybindingsUnsetApply {
+        id: String,
+        action: String,
+    },
     KeybindingsValidate(String),
     StateInspect,
+    StateRepair(String),
+    BindingsRender,
+    BindingsInitialize,
+    BindingsReconcile,
 }
 
 pub fn run(arguments: Vec<String>) -> Result<Value, StoreError> {
@@ -84,6 +111,17 @@ fn parse(arguments: Vec<String>) -> Result<CliCommand, StoreError> {
             if command == "presets" && action == "update" && input_flag == "--input" =>
         {
             CliCommand::PresetsUpdate {
+                id: id.clone(),
+                input: input.clone(),
+            }
+        }
+        [command, action, id, input_flag, input, apply]
+            if command == "presets"
+                && action == "update"
+                && input_flag == "--input"
+                && apply == "--apply" =>
+        {
+            CliCommand::PresetsUpdateApply {
                 id: id.clone(),
                 input: input.clone(),
             }
@@ -115,6 +153,16 @@ fn parse(arguments: Vec<String>) -> Result<CliCommand, StoreError> {
                 mode: parse_import_mode(mode)?,
             }
         }
+        [command, action, input_flag, input, mode_flag, mode, apply]
+            if command == "presets"
+                && action == "import"
+                && input_flag == "--input"
+                && mode_flag == "--mode"
+                && mode == "replace"
+                && apply == "--apply" =>
+        {
+            CliCommand::PresetsImportApply(input.clone())
+        }
         [command, action, id] if command == "presets" && action == "export" => {
             CliCommand::PresetsExport(id.clone())
         }
@@ -133,6 +181,11 @@ fn parse(arguments: Vec<String>) -> Result<CliCommand, StoreError> {
         [command, action, id] if command == "presets" && action == "activate" => {
             CliCommand::PresetsActivate(id.clone())
         }
+        [command, action, id, apply]
+            if command == "presets" && action == "activate" && apply == "--apply" =>
+        {
+            CliCommand::PresetsActivateApply(id.clone())
+        }
         [command, action, preset_flag, id]
             if command == "keybindings" && action == "list" && preset_flag == "--preset" =>
         {
@@ -147,10 +200,33 @@ fn parse(arguments: Vec<String>) -> Result<CliCommand, StoreError> {
                 accelerator: accelerator.clone(),
             }
         }
+        [command, action, preset_flag, id, semantic_action, accelerator, apply]
+            if command == "keybindings"
+                && action == "set"
+                && preset_flag == "--preset"
+                && apply == "--apply" =>
+        {
+            CliCommand::KeybindingsSetApply {
+                id: id.clone(),
+                action: semantic_action.clone(),
+                accelerator: accelerator.clone(),
+            }
+        }
         [command, action, preset_flag, id, semantic_action]
             if command == "keybindings" && action == "unset" && preset_flag == "--preset" =>
         {
             CliCommand::KeybindingsUnset {
+                id: id.clone(),
+                action: semantic_action.clone(),
+            }
+        }
+        [command, action, preset_flag, id, semantic_action, apply]
+            if command == "keybindings"
+                && action == "unset"
+                && preset_flag == "--preset"
+                && apply == "--apply" =>
+        {
+            CliCommand::KeybindingsUnsetApply {
                 id: id.clone(),
                 action: semantic_action.clone(),
             }
@@ -161,6 +237,23 @@ fn parse(arguments: Vec<String>) -> Result<CliCommand, StoreError> {
             CliCommand::KeybindingsValidate(input.clone())
         }
         [command, action] if command == "state" && action == "inspect" => CliCommand::StateInspect,
+        [command, action, bundle_flag, input, apply]
+            if command == "state"
+                && action == "repair"
+                && bundle_flag == "--bundle"
+                && apply == "--apply" =>
+        {
+            CliCommand::StateRepair(input.clone())
+        }
+        [command, action] if command == "bindings" && action == "render" => {
+            CliCommand::BindingsRender
+        }
+        [command, action] if command == "bindings" && action == "initialize" => {
+            CliCommand::BindingsInitialize
+        }
+        [command, action] if command == "bindings" && action == "reconcile" => {
+            CliCommand::BindingsReconcile
+        }
         _ => return Err(StoreError::invalid_command()),
     };
     Ok(command)
@@ -189,6 +282,18 @@ fn execute(command: CliCommand) -> Result<Value, StoreError> {
             let candidate = read_json_input(&input)?;
             open_store(paths)?.update_user_preset(&id, candidate)
         }
+        CliCommand::PresetsUpdateApply { id, input } => {
+            let candidate = read_json_input(&input)?;
+            let binding_paths = BindingPaths::from_environment();
+            let (validator, reloader) = niri_services();
+            binding_value(update_active_bindings_and_apply(
+                &id,
+                candidate,
+                &binding_paths,
+                &validator,
+                &reloader,
+            ))
+        }
         CliCommand::PresetsValidate(input) => {
             let candidate = read_json_input(&input)?;
             open_store(paths)?.validate_preset_candidate(candidate)
@@ -197,9 +302,85 @@ fn execute(command: CliCommand) -> Result<Value, StoreError> {
             let candidate = read_json_input(&input)?;
             open_store(paths)?.import_preset(candidate, mode)
         }
+        CliCommand::PresetsImportApply(input) => {
+            let candidate = read_json_input(&input)?;
+            let binding_paths = BindingPaths::from_environment();
+            let (validator, reloader) = niri_services();
+            binding_value(import_replace_active_and_apply(
+                candidate,
+                &binding_paths,
+                &validator,
+                &reloader,
+            ))
+        }
         CliCommand::KeybindingsValidate(input) => {
             let candidate = read_json_input(&input)?;
             validate_keybinding_map(candidate)
+        }
+        CliCommand::PresetsActivateApply(id) => {
+            let binding_paths = BindingPaths::from_environment();
+            let (validator, reloader) = niri_services();
+            binding_value(activate_and_apply(
+                &id,
+                &binding_paths,
+                &validator,
+                &reloader,
+            ))
+        }
+        CliCommand::KeybindingsSetApply {
+            id,
+            action,
+            accelerator,
+        } => {
+            let binding_paths = BindingPaths::from_environment();
+            let (validator, reloader) = niri_services();
+            binding_value(mutate_keybinding_and_apply(
+                &id,
+                &action,
+                Some(&accelerator),
+                &binding_paths,
+                &validator,
+                &reloader,
+            ))
+        }
+        CliCommand::KeybindingsUnsetApply { id, action } => {
+            let binding_paths = BindingPaths::from_environment();
+            let (validator, reloader) = niri_services();
+            binding_value(mutate_keybinding_and_apply(
+                &id,
+                &action,
+                None,
+                &binding_paths,
+                &validator,
+                &reloader,
+            ))
+        }
+        CliCommand::StateRepair(input) => {
+            let value = read_json_input(&input)?;
+            let bundle: RepairBundle = serde_json::from_value(value)
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            let binding_paths = BindingPaths::from_environment();
+            let (validator, reloader) = niri_services();
+            binding_value(repair_state(bundle, &binding_paths, &validator, &reloader))
+        }
+        CliCommand::BindingsInitialize => {
+            let binding_paths = BindingPaths::from_environment();
+            let (validator, reloader) = niri_services();
+            binding_value(apply_active_bindings(&binding_paths, &validator, &reloader))
+        }
+        CliCommand::BindingsReconcile => {
+            let binding_paths = BindingPaths::from_environment();
+            let (_, reloader) = niri_services();
+            let report =
+                reconcile_bindings(&binding_paths, &reloader).map_err(binding_store_error)?;
+            serde_json::to_value(report).map_err(StoreError::io)
+        }
+        CliCommand::BindingsRender => {
+            let store = open_store(paths)?;
+            let active: PresetDocument = serde_json::from_value(store.active_preset_json()?)
+                .map_err(|error| StoreError::invalid(error.to_string()))?;
+            let kdl = compile_bindings(&active).map_err(binding_store_error)?;
+            Ok(json!({"activePresetId": active.id, "kdl": kdl}))
         }
         command => {
             let store = open_store(paths)?;
@@ -225,13 +406,46 @@ fn execute(command: CliCommand) -> Result<Value, StoreError> {
                 }
                 CliCommand::PresetsCreate(_)
                 | CliCommand::PresetsUpdate { .. }
+                | CliCommand::PresetsUpdateApply { .. }
                 | CliCommand::PresetsValidate(_)
                 | CliCommand::PresetsImport { .. }
+                | CliCommand::PresetsImportApply(_)
+                | CliCommand::PresetsActivateApply(_)
                 | CliCommand::KeybindingsValidate(_)
-                | CliCommand::StateInspect => unreachable!("handled before store open"),
+                | CliCommand::KeybindingsSetApply { .. }
+                | CliCommand::KeybindingsUnsetApply { .. }
+                | CliCommand::StateInspect
+                | CliCommand::StateRepair(_)
+                | CliCommand::BindingsRender
+                | CliCommand::BindingsInitialize
+                | CliCommand::BindingsReconcile => unreachable!("handled before store open"),
             }
         }
     }
+}
+
+fn niri_services() -> (NiriValidator, NiriReloader) {
+    let validator = std::env::var_os("SLEEPY_NIRI_VALIDATOR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("niri"));
+    let niri = std::env::var_os("SLEEPY_NIRI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("niri"));
+    (NiriValidator::new(validator), NiriReloader::new(niri))
+}
+
+fn binding_value<T: serde::Serialize>(
+    result: Result<T, crate::bindings::BindingError>,
+) -> Result<Value, StoreError> {
+    serde_json::to_value(result.map_err(binding_store_error)?).map_err(StoreError::io)
+}
+
+fn binding_store_error(error: crate::bindings::BindingError) -> StoreError {
+    StoreError::binding_with_details(
+        error.code(),
+        error.message().to_owned(),
+        error.details().cloned(),
+    )
 }
 
 fn open_store(paths: StorePaths) -> Result<StateStore, StoreError> {
@@ -404,29 +618,7 @@ fn open_regular_file(_path: &Path) -> Result<File, StoreError> {
 }
 
 fn default_state() -> Result<Defaults, StoreError> {
-    Defaults::from_json(
-        json!({
-            "schemaVersion": 1,
-            "activePresetId": "builtin.sleepy",
-            "appearanceMode": "dark",
-            "paletteSource": "sleepy",
-            "reducedMotion": false,
-            "effectsProfile": "full",
-            "panelVisibility": "always",
-            "webSearchEnabled": true
-        }),
-        vec![json!({
-            "schemaVersion": 1,
-            "id": "builtin.sleepy",
-            "name": "Sleepy",
-            "origin": "builtin",
-            "basePresetId": null,
-            "layouts": {},
-            "drawers": { "leftQuickSettings": {} },
-            "keybindings": {},
-            "pluginRequirements": []
-        })],
-    )
+    Ok(Defaults::packaged())
 }
 
 #[cfg(all(test, target_os = "linux"))]

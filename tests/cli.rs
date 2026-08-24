@@ -49,6 +49,24 @@ fn run_with_stdin(root: &TempDir, arguments: &[&str], input: &[u8]) -> std::proc
     child.wait_with_output().unwrap()
 }
 
+fn seed_active_preset(root: &TempDir, id: &str) {
+    let path = root.path().join("config/sleepy/settings.json");
+    let mut settings: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    settings["activePresetId"] = json!(id);
+    fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+}
+
+fn prepare_niri_tree(root: &TempDir) {
+    let niri = root.path().join("config/niri");
+    fs::create_dir_all(&niri).unwrap();
+    fs::write(
+        niri.join("config.kdl"),
+        "include optional=true \"sleepy-user-bindings.kdl\"\n",
+    )
+    .unwrap();
+    fs::write(niri.join("sleepy-user-bindings.kdl"), "binds {}\n").unwrap();
+}
+
 #[test]
 fn cli_preset_crud_validate_import_and_export_round_trip() {
     let root = TempDir::new().unwrap();
@@ -290,12 +308,7 @@ fn cli_keybinding_mutations_return_immutable_apply_required_and_structured_confl
         json!(["app.terminal.open", "launcher.open"])
     );
 
-    assert!(command(&root)
-        .args(["presets", "activate", USER_ID])
-        .output()
-        .unwrap()
-        .status
-        .success());
+    seed_active_preset(&root, USER_ID);
     let active = command(&root)
         .args([
             "keybindings",
@@ -351,12 +364,7 @@ fn cli_keybinding_error_precedence_checks_target_before_requested_binding() {
         .unwrap()
         .status
         .success());
-    assert!(command(&root)
-        .args(["presets", "activate", USER_ID])
-        .output()
-        .unwrap()
-        .status
-        .success());
+    seed_active_preset(&root, USER_ID);
     let before = fs::read(&presets_path).unwrap();
 
     for accelerator in ["Mod+Return", "not a chord"] {
@@ -607,11 +615,256 @@ fn cli_uses_xdg_roots_for_json_settings_and_preset_operations() {
         .args(["presets", "activate", &id])
         .output()
         .unwrap();
-    assert!(activate.status.success());
+    assert!(!activate.status.success());
     assert_eq!(
-        serde_json::from_slice::<Value>(&activate.stdout).unwrap()["activePresetId"],
-        id
+        serde_json::from_slice::<Value>(&activate.stderr).unwrap()["error"]["code"],
+        "apply_required"
     );
+}
+
+#[test]
+fn cli_bindings_render_uses_packaged_defaults_and_exact_typed_ipc_argv() {
+    let root = TempDir::new().unwrap();
+
+    let output = command(&root)
+        .args(["bindings", "render"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = serde_json::from_slice::<Value>(&output.stdout).unwrap();
+    assert_eq!(rendered["activePresetId"], "builtin.sleepy");
+    let kdl = rendered["kdl"].as_str().unwrap();
+    assert!(kdl.contains("Mod+Return { spawn \"ghostty\"; }"));
+    assert!(kdl.contains("Mod+D { spawn \"fuzzel\"; }"));
+    assert!(kdl.contains("focus-column-left"));
+    assert!(kdl.contains(
+        "spawn \"quickshell\" \"ipc\" \"--config\" \"sleepy\" \"call\" \"sleepy\" \"toggleControlCenter\""
+    ));
+}
+
+#[test]
+fn cli_activation_apply_and_builtin_edit_use_the_offline_journal_path() {
+    let root = TempDir::new().unwrap();
+    prepare_niri_tree(&root);
+    let create_input = write_json(&root, "active.json", &user_preset(USER_ID, "Active"));
+    assert!(command(&root)
+        .args(["presets", "create", "--input", &create_input])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let activate = command(&root)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .args(["presets", "activate", USER_ID, "--apply"])
+        .output()
+        .unwrap();
+
+    assert!(
+        activate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&activate.stderr)
+    );
+    let report = serde_json::from_slice::<Value>(&activate.stdout).unwrap();
+    assert_eq!(report["status"], "reloadPending");
+    assert_eq!(report["activePresetId"], USER_ID);
+    assert!(root
+        .path()
+        .join("state/sleepy/bindings-transaction.json")
+        .exists());
+
+    let second = TempDir::new().unwrap();
+    prepare_niri_tree(&second);
+    assert!(command(&second)
+        .args(["settings", "show"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let edit = command(&second)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .args([
+            "keybindings",
+            "set",
+            "--preset",
+            "builtin.sleepy",
+            "app.terminal.open",
+            "Mod+T",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        edit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&edit.stderr)
+    );
+    let report = serde_json::from_slice::<Value>(&edit.stdout).unwrap();
+    assert_ne!(report["activePresetId"], "builtin.sleepy");
+    assert_eq!(report["status"], "reloadPending");
+}
+
+#[test]
+fn cli_online_reload_keeps_child_output_out_of_structured_json() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new().unwrap();
+    prepare_niri_tree(&root);
+    fs::create_dir_all(root.path().join("state")).unwrap();
+    let fake_niri = root.path().join("fake-niri");
+    fs::write(
+        &fake_niri,
+        "#!/bin/sh\nif [ \"$2\" = \"--json\" ]; then\n  sleep 0.1\n  printf '%s\\n' '{\"ConfigLoaded\":{\"failed\":false}}'\n  sleep 1\nelse\n  printf '%s\\n' 'niri-child-noise'\nfi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_niri, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = command(&root)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .env("SLEEPY_NIRI", &fake_niri)
+        .env("NIRI_SOCKET", root.path().join("niri.sock"))
+        .args(["bindings", "initialize"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = serde_json::from_slice::<Value>(&output.stdout).unwrap();
+    assert_eq!(report["status"], "committed");
+}
+
+#[test]
+fn cli_active_apply_conflict_keeps_structured_action_details_without_writing() {
+    let root = TempDir::new().unwrap();
+    prepare_niri_tree(&root);
+    assert!(command(&root)
+        .args(["settings", "show"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let settings_before = fs::read(root.path().join("config/sleepy/settings.json")).unwrap();
+    let presets_before = fs::read(root.path().join("state/sleepy/presets.json")).unwrap();
+    let bindings_before =
+        fs::read(root.path().join("config/niri/sleepy-user-bindings.kdl")).unwrap();
+
+    let output = command(&root)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .args([
+            "keybindings",
+            "set",
+            "--preset",
+            "builtin.sleepy",
+            "launcher.open",
+            "Mod+Return",
+            "--apply",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "keybinding_conflict");
+    assert_eq!(error["error"]["details"]["accelerator"], "Mod+Return");
+    assert_eq!(
+        error["error"]["details"]["actions"],
+        json!(["app.terminal.open", "launcher.open"])
+    );
+    assert_eq!(
+        fs::read(root.path().join("config/sleepy/settings.json")).unwrap(),
+        settings_before
+    );
+    assert_eq!(
+        fs::read(root.path().join("state/sleepy/presets.json")).unwrap(),
+        presets_before
+    );
+    assert_eq!(
+        fs::read(root.path().join("config/niri/sleepy-user-bindings.kdl")).unwrap(),
+        bindings_before
+    );
+}
+
+#[test]
+fn cli_state_repair_accepts_only_complete_bundle_apply_and_preserves_originals() {
+    let root = TempDir::new().unwrap();
+    prepare_niri_tree(&root);
+    assert!(command(&root)
+        .args(["settings", "show"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let settings_path = root.path().join("config/sleepy/settings.json");
+    let presets_path = root.path().join("state/sleepy/presets.json");
+    fs::write(&settings_path, b"broken settings").unwrap();
+    fs::write(&presets_path, b"broken presets").unwrap();
+    let bundle = json!({
+        "settings": {
+            "schemaVersion": 1,
+            "activePresetId": "builtin.sleepy",
+            "appearanceMode": "dark",
+            "paletteSource": "sleepy",
+            "reducedMotion": false,
+            "effectsProfile": "full",
+            "panelVisibility": "always",
+            "webSearchEnabled": true
+        },
+        "presets": []
+    });
+
+    let repaired = run_with_stdin_validator(
+        &root,
+        &["state", "repair", "--bundle", "-", "--apply"],
+        bundle.to_string().as_bytes(),
+    );
+
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&repaired.stdout).unwrap()["status"],
+        "reloadPending"
+    );
+    let backups = fs::read_dir(root.path().join("state/sleepy/recovery"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        fs::read(backups[0].path().join("settings.json")).unwrap(),
+        b"broken settings"
+    );
+    assert_eq!(
+        fs::read(backups[0].path().join("presets.json")).unwrap(),
+        b"broken presets"
+    );
+}
+
+fn run_with_stdin_validator(
+    root: &TempDir,
+    arguments: &[&str],
+    input: &[u8],
+) -> std::process::Output {
+    let mut child = command(root)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
 }
 
 #[test]

@@ -48,6 +48,17 @@ fn paths(temp: &TempDir) -> StorePaths {
     StorePaths::from_xdg_roots(temp.path().join("config"), temp.path().join("state"))
 }
 
+fn seed_active_preset(paths: &StorePaths, id: &str) {
+    let mut settings: Value =
+        serde_json::from_slice(&fs::read(paths.settings_path()).unwrap()).unwrap();
+    settings["activePresetId"] = json!(id);
+    fs::write(
+        paths.settings_path(),
+        serde_json::to_vec(&settings).unwrap(),
+    )
+    .unwrap();
+}
+
 fn user_preset(id: &str, name: &str) -> Value {
     json!({
         "schemaVersion": 1,
@@ -116,10 +127,11 @@ fn preset_mutation_rejects_every_direct_builtin_mutation() {
 #[test]
 fn preset_mutation_rejects_delete_of_the_active_user_preset() {
     let temp = TempDir::new().unwrap();
-    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let paths = paths(&temp);
+    let store = StateStore::open(paths.clone(), defaults()).unwrap();
     let id = "5268c988-5c83-4921-a592-2c3342e59d61";
     store.create_user_preset(user_preset(id, "Active")).unwrap();
-    store.activate_preset(id).unwrap();
+    seed_active_preset(&paths, id);
 
     let error = store.delete_user_preset(id).unwrap_err();
 
@@ -224,12 +236,13 @@ fn preset_mutation_allows_duplicate_display_names() {
 #[test]
 fn preset_mutation_rejects_active_update_and_replace_until_apply_is_available() {
     let temp = TempDir::new().unwrap();
-    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let paths = paths(&temp);
+    let store = StateStore::open(paths.clone(), defaults()).unwrap();
     let id = "5268c988-5c83-4921-a592-2c3342e59d61";
     store
         .create_user_preset(user_preset(id, "Original"))
         .unwrap();
-    store.activate_preset(id).unwrap();
+    seed_active_preset(&paths, id);
 
     let update = store
         .update_user_preset(id, updated_user_preset(id, "Update"))
@@ -343,7 +356,7 @@ fn rename_updates_only_a_user_preset() {
 }
 
 #[test]
-fn activate_changes_settings_atomically_to_an_existing_preset() {
+fn activate_requires_the_journaled_apply_path_without_changing_settings() {
     let temp = TempDir::new().unwrap();
     let store = StateStore::open(paths(&temp), defaults()).unwrap();
     let id = store.duplicate_preset("builtin.sleepy", "Active").unwrap()["preset"]["id"]
@@ -351,8 +364,12 @@ fn activate_changes_settings_atomically_to_an_existing_preset() {
         .unwrap()
         .to_owned();
 
-    assert_eq!(store.activate_preset(&id).unwrap()["activePresetId"], id);
-    assert_eq!(store.settings_json().unwrap()["activePresetId"], id);
+    let error = store.activate_preset(&id).unwrap_err();
+    assert_eq!(error.code(), "apply_required");
+    assert_eq!(
+        store.settings_json().unwrap()["activePresetId"],
+        "builtin.sleepy"
+    );
 }
 
 #[test]

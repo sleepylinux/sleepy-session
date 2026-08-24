@@ -35,6 +35,14 @@ impl StorePaths {
         self.state_root.join("sleepy").join("presets.json")
     }
 
+    pub fn config_root(&self) -> &std::path::Path {
+        &self.config_root
+    }
+
+    pub fn state_root(&self) -> &std::path::Path {
+        &self.state_root
+    }
+
     pub(crate) fn settings_dir(&self) -> PathBuf {
         self.config_root.join("sleepy")
     }
