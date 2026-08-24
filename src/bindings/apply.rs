@@ -683,7 +683,6 @@ pub fn apply_active_bindings(
                         preset: &preset_bytes,
                         settings: &settings_bytes,
                         bindings: bindings.as_bytes(),
-                        preserve_existing_state: false,
                     },
                 )
                 .map_err(store_binding_error)
@@ -922,7 +921,6 @@ fn apply_store_candidate(
             preset: &preset_bytes,
             settings: &settings_bytes,
             bindings: bindings.as_bytes(),
-            preserve_existing_state: false,
         },
     )
     .map_err(store_binding_error)
@@ -1065,7 +1063,6 @@ pub fn initialize_bindings(
                         preset: &preset_bytes,
                         settings: &settings_bytes,
                         bindings: compiled.as_bytes(),
-                        preserve_existing_state: true,
                     },
                 )
                 .map(Some)
@@ -1176,12 +1173,14 @@ fn reconcile_bindings_locked(
             active_preset_id,
         }));
     };
+    journal.verify_noop_artifacts(fs)?;
     if reload_confirmed(
         paths,
         reloader,
         stream.as_mut(),
         operation_timeout(online_deadline),
     )? {
+        journal.verify_noop_artifacts(fs)?;
         journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
         journal.cleanup(fs, paths)?;
         return Ok(Some(ApplyReport {
@@ -1219,6 +1218,7 @@ fn reconcile_bindings_locked(
     journal.restore_all(fs, paths)?;
     journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
+    journal.verify_noop_artifacts(fs)?;
     let confirmed = match rollback_stream.as_mut() {
         Some(stream) => reload_confirmed(
             paths,
@@ -1229,6 +1229,7 @@ fn reconcile_bindings_locked(
         None => false,
     };
     if confirmed {
+        journal.verify_noop_artifacts(fs)?;
         journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
         journal.cleanup(fs, paths)?;
         Ok(Some(ApplyReport {
@@ -1262,7 +1263,6 @@ struct CandidateArtifacts<'a> {
     preset: &'a [u8],
     settings: &'a [u8],
     bindings: &'a [u8],
-    preserve_existing_state: bool,
 }
 
 fn apply_candidate_locked(
@@ -1302,7 +1302,6 @@ fn apply_candidate_locked(
         artifacts.preset,
         artifacts.settings,
         artifacts.bindings,
-        artifacts.preserve_existing_state,
     )?;
     journal.install_new(fs, paths, ArtifactKind::Preset)?;
     journal.set_phase(fs, paths, JournalPhase::PresetCommitted)?;
@@ -1318,7 +1317,9 @@ fn apply_candidate_locked(
             active_preset_id: active_preset_id.to_owned(),
         });
     };
+    journal.verify_noop_artifacts(fs)?;
     if reload_confirmed(paths, reloader, candidate_stream.as_mut(), RELOAD_TIMEOUT)? {
+        journal.verify_noop_artifacts(fs)?;
         journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
         journal.cleanup(fs, paths)?;
         return Ok(ApplyReport {
@@ -1342,11 +1343,13 @@ fn apply_candidate_locked(
     journal.restore_all(fs, paths)?;
     journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
+    journal.verify_noop_artifacts(fs)?;
     let rollback_confirmed = match rollback_stream.as_mut() {
         Some(stream) => reload_confirmed(paths, reloader, stream.as_mut(), RELOAD_TIMEOUT)?,
         None => false,
     };
     if rollback_confirmed {
+        journal.verify_noop_artifacts(fs)?;
         journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
         journal.cleanup(fs, paths)?;
         Ok(ApplyReport {

@@ -53,8 +53,6 @@ pub(crate) struct TransactionJournal {
     pub transaction_id: String,
     pub phase: JournalPhase,
     pub recovery_target: RecoveryTarget,
-    #[serde(default)]
-    pub preserve_existing_state: bool,
     #[serde(default = "sidecars_complete_for_legacy_journal")]
     pub sidecars_complete: bool,
     pub active_preset_id: String,
@@ -89,7 +87,6 @@ impl TransactionJournal {
         preset_bytes: &[u8],
         settings_bytes: &[u8],
         binding_bytes: &[u8],
-        preserve_existing_state: bool,
     ) -> Result<Self, BindingError> {
         let transaction_id = Uuid::new_v4().hyphenated().to_string();
         let specs = [
@@ -119,15 +116,6 @@ impl TransactionJournal {
                 .map_err(BindingError::from_store)?;
             let old_existed = old.is_some();
             let old = old.unwrap_or_default();
-            if preserve_existing_state
-                && matches!(kind, ArtifactKind::Preset | ArtifactKind::Settings)
-                && old.as_slice() != new_bytes
-            {
-                return Err(BindingError::new(
-                    "concurrent_state_change",
-                    "existing state changed while initializing bindings",
-                ));
-            }
             let name = destination
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -159,7 +147,6 @@ impl TransactionJournal {
             transaction_id,
             phase: JournalPhase::Prepared,
             recovery_target: RecoveryTarget::Candidate,
-            preserve_existing_state,
             sidecars_complete: false,
             active_preset_id: active_preset_id.to_owned(),
             previous_active_preset_id,
@@ -201,12 +188,14 @@ impl TransactionJournal {
         paths: &BindingPaths,
         kind: ArtifactKind,
     ) -> Result<(), BindingError> {
+        if kind == ArtifactKind::Bindings {
+            self.verify_noop_artifacts(fs)?;
+        }
         install(
             fs,
             Some(paths),
             self.artifact(kind),
             RecoveryTarget::Candidate,
-            self.preserve_existing_state,
         )
     }
     pub fn restore_all(
@@ -215,13 +204,10 @@ impl TransactionJournal {
         paths: &BindingPaths,
     ) -> Result<(), BindingError> {
         for a in &self.artifacts {
-            install(
-                fs,
-                Some(paths),
-                a,
-                RecoveryTarget::Previous,
-                self.preserve_existing_state,
-            )?;
+            if a.kind == ArtifactKind::Bindings {
+                self.verify_noop_artifacts(fs)?;
+            }
+            install(fs, Some(paths), a, RecoveryTarget::Previous)?;
         }
         Ok(())
     }
@@ -232,7 +218,19 @@ impl TransactionJournal {
         target: RecoveryTarget,
     ) -> Result<(), BindingError> {
         for a in &self.artifacts {
-            install(fs, Some(paths), a, target, self.preserve_existing_state)?;
+            if a.kind == ArtifactKind::Bindings {
+                self.verify_noop_artifacts(fs)?;
+            }
+            install(fs, Some(paths), a, target)?;
+        }
+        Ok(())
+    }
+
+    pub fn verify_noop_artifacts(&self, fs: &BindingFileSystem) -> Result<(), BindingError> {
+        for artifact in &self.artifacts {
+            if artifact.old_hash == artifact.new_hash {
+                verify_live_noop(fs, artifact)?;
+            }
         }
         Ok(())
     }
@@ -497,11 +495,9 @@ fn install(
     paths: Option<&BindingPaths>,
     artifact: &JournalArtifact,
     target: RecoveryTarget,
-    preserve_existing_state: bool,
 ) -> Result<(), BindingError> {
-    if preserve_existing_state
-        && matches!(artifact.kind, ArtifactKind::Preset | ArtifactKind::Settings)
-    {
+    if artifact.old_hash == artifact.new_hash {
+        verify_live_noop(fs, artifact)?;
         return Ok(());
     }
     let dir = fs.artifact_dir(artifact.kind);
@@ -541,6 +537,28 @@ fn install(
         || observe_store(paths, directory_stage(artifact.kind, target)),
     )
     .map_err(BindingError::from_store)
+}
+
+fn verify_live_noop(
+    fs: &BindingFileSystem,
+    artifact: &JournalArtifact,
+) -> Result<(), BindingError> {
+    let current = fs
+        .artifact_dir(artifact.kind)
+        .read_optional(BindingFileSystem::artifact_name(artifact.kind))
+        .map_err(BindingError::from_store)?;
+    let matches = current
+        .as_deref()
+        .map(hash)
+        .is_some_and(|current_hash| current_hash == artifact.old_hash);
+    if matches {
+        Ok(())
+    } else {
+        Err(BindingError::new(
+            "concurrent_state_change",
+            "transaction artifact changed before a no-op install",
+        ))
+    }
 }
 
 fn observe(paths: Option<&BindingPaths>, stage: ApplyStage) -> Result<(), BindingError> {
