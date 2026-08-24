@@ -3,6 +3,8 @@ use std::{error::Error, fmt};
 use serde_json::{json, Value};
 use sleepy_sdk::KeybindingConflict;
 
+use crate::system::SystemError;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError {
     code: &'static str,
@@ -121,7 +123,23 @@ impl StoreError {
     pub fn invalid_command() -> Self {
         Self {
             code: "invalid_command",
-            message: "expected a settings, presets, keybindings, bindings, or state command with the documented arguments".to_owned(),
+            message: "expected a settings, presets, keybindings, bindings, state, system, or session command with the documented arguments".to_owned(),
+            details: None,
+        }
+    }
+
+    pub(crate) fn system(error: SystemError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.message().to_owned(),
+            details: None,
+        }
+    }
+
+    pub(crate) fn system_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
             details: None,
         }
     }

@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -18,6 +19,53 @@ fn command(root: &TempDir) -> Command {
         .env("XDG_CONFIG_HOME", root.path().join("config"))
         .env("XDG_STATE_HOME", root.path().join("state"));
     command
+}
+
+fn install_fake_system_tools(root: &TempDir) -> std::path::PathBuf {
+    let bin = root.path().join("system-bin");
+    fs::create_dir(&bin).unwrap();
+    let script = r#"#!/bin/sh
+tool=${0##*/}
+case "$tool" in
+  nmcli)
+    if [ "$3" = "WIFI" ]; then printf 'enabled\n'; else printf '*:Sleepy WiFi:73\n'; fi ;;
+  bluetoothctl)
+    if [ "$1" = "show" ]; then printf 'Powered: yes\n'; else printf 'Device AA:BB Moonbuds\n'; fi ;;
+  wpctl)
+    if [ "$1" = "get-volume" ] && [ "$2" = "@DEFAULT_AUDIO_SINK@" ]; then printf 'Volume: 0.42\n'
+    elif [ "$1" = "get-volume" ]; then printf 'Volume: 0.31 [MUTED]\n'
+    else printf 'Audio\n ├─ Sinks:\n │  * 52. Built-in Audio [vol: 0.42]\n ├─ Sources:\n'; fi ;;
+  brightnessctl) printf 'backlight,backlight,500,50%%,1000\n' ;;
+  powerprofilesctl)
+    if [ "$1" = "get" ]; then printf 'balanced\n'
+    elif [ "${SLEEPY_TEST_INVALID_POWER:-}" = "1" ]; then printf '* balanced:\n  balanced:\n'
+    else printf '* balanced:\n  performance:\n  power-saver:\n'; fi ;;
+  upower) printf 'state: charging\npercentage: 81%%\n' ;;
+  playerctl) printf 'Playing\tNight Drive\tSleepy Artist\n' ;;
+  systemctl)
+    if [ "$1" = "--user" ]; then printf 'active\n'; else printf 'systemd 260\n'; fi ;;
+  swaylock) printf 'swaylock 1.8\n' ;;
+  niri) printf 'niri 26.04\n' ;;
+  *) exit 2 ;;
+esac
+"#;
+    for tool in [
+        "nmcli",
+        "bluetoothctl",
+        "wpctl",
+        "brightnessctl",
+        "powerprofilesctl",
+        "upower",
+        "playerctl",
+        "systemctl",
+        "swaylock",
+        "niri",
+    ] {
+        let path = bin.join(tool);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
 }
 
 fn user_preset(id: &str, name: &str) -> Value {
@@ -208,6 +256,168 @@ fn production_niri_processes_timeout_and_reap_validate_version_stream_and_load()
         assert!(started.elapsed() < Duration::from_secs(2), "phase={phase}");
         assert_pid_reaped(&pid_file);
     }
+}
+
+#[test]
+fn cli_system_commands_require_and_echo_a_positive_client_generation() {
+    let root = TempDir::new().unwrap();
+    for arguments in [
+        vec!["system", "show"],
+        vec!["system", "show", "--generation", "0"],
+        vec![
+            "system",
+            "set",
+            "network.enabled",
+            "true",
+            "--generation",
+            "0",
+        ],
+        vec![
+            "session",
+            "perform",
+            "lock",
+            "confirmed",
+            "--generation",
+            "0",
+        ],
+    ] {
+        let output = command(&root).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
+            "invalid_generation"
+        );
+    }
+}
+
+#[test]
+fn cli_system_show_returns_only_an_sdk_validated_snapshot() {
+    let root = TempDir::new().unwrap();
+    let bin = install_fake_system_tools(&root);
+    let output = command(&root)
+        .env("PATH", bin)
+        .args(["system", "show", "--generation", "72"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot =
+        sleepy_sdk::validate_system_snapshot(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(snapshot.generation, 72);
+}
+
+#[test]
+fn cli_system_show_localizes_duplicate_power_profiles_before_assembly() {
+    let root = TempDir::new().unwrap();
+    let bin = install_fake_system_tools(&root);
+    let output = command(&root)
+        .env("PATH", bin)
+        .env("SLEEPY_TEST_INVALID_POWER", "1")
+        .args(["system", "show", "--generation", "73"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot =
+        sleepy_sdk::validate_system_snapshot(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(
+        snapshot.capabilities[&sleepy_sdk::CapabilityId::PowerProfile],
+        sleepy_sdk::CapabilityState::Error
+    );
+    assert_eq!(
+        snapshot.capabilities[&sleepy_sdk::CapabilityId::BatteryStatus],
+        sleepy_sdk::CapabilityState::Available
+    );
+}
+
+#[test]
+fn cli_system_set_rejects_mismatched_and_read_only_values_before_execution() {
+    let root = TempDir::new().unwrap();
+    for arguments in [
+        vec![
+            "system",
+            "set",
+            "network.enabled",
+            "0.5",
+            "--generation",
+            "1",
+        ],
+        vec![
+            "system",
+            "set",
+            "battery.status",
+            "true",
+            "--generation",
+            "1",
+        ],
+        vec![
+            "system",
+            "set",
+            "power.profile",
+            "turbo",
+            "--generation",
+            "1",
+        ],
+    ] {
+        let output = command(&root).args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
+            "invalid_request"
+        );
+    }
+}
+
+#[test]
+fn cli_session_perform_requires_literal_confirmation() {
+    let root = TempDir::new().unwrap();
+    let output = command(&root)
+        .args(["session", "perform", "powerOff", "yes", "--generation", "4"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
+        "confirmation_required"
+    );
+}
+
+#[test]
+fn cli_session_perform_echoes_generation_in_typed_result() {
+    let root = TempDir::new().unwrap();
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let swaylock = bin.join("swaylock");
+    fs::write(&swaylock, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&swaylock, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = command(&root)
+        .env("PATH", &bin)
+        .args([
+            "session",
+            "perform",
+            "lock",
+            "confirmed",
+            "--generation",
+            "184",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result =
+        sleepy_sdk::validate_session_action_result(std::str::from_utf8(&output.stdout).unwrap())
+            .unwrap();
+    assert_eq!(result.generation, 184);
+    assert_eq!(result.status, sleepy_sdk::SessionActionStatus::Initiated);
 }
 
 #[test]
@@ -1138,10 +1348,12 @@ fn invalid_cli_commands_do_not_initialize_xdg_state() {
     let output = command(&root).args(["not-a-command"]).output().unwrap();
 
     assert!(!output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"],
-        "invalid_command"
-    );
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_command");
+    let message = error["error"]["message"].as_str().unwrap();
+    for family in ["bindings", "system", "session"] {
+        assert!(message.contains(family), "missing {family}: {message}");
+    }
     assert!(!root.path().join("config/sleepy/settings.json").exists());
     assert!(!root.path().join("state/sleepy/presets.json").exists());
 }

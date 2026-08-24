@@ -18,7 +18,8 @@ use std::{
 use serde_json::{json, Value};
 use sleepy_sdk::{
     canonicalize_accelerator, packaged_reserved_keybindings, validate_keybindings,
-    validate_keybindings_with_reserved, PresetDocument,
+    validate_keybindings_with_reserved, MediaTransport, PowerProfile, PresetDocument,
+    SessionAction, SessionActionRequest, SystemMutation,
 };
 
 use crate::{
@@ -28,6 +29,7 @@ use crate::{
         repair_state, update_active_bindings_and_apply, BindingPaths, NiriReloader, NiriValidator,
         RepairBundle,
     },
+    system::{ProcessCommandRunner, SystemFacade},
     Defaults, ImportMode, StateInspector, StateStore, StoreError, StorePaths,
 };
 
@@ -90,6 +92,15 @@ enum CliCommand {
     BindingsInitialize,
     BindingsReconcile,
     BindingsReconcileOnlineRequired,
+    SystemShow(u64),
+    SystemSet {
+        generation: u64,
+        mutation: SystemMutation,
+    },
+    SessionPerform {
+        generation: u64,
+        request: SessionActionRequest,
+    },
 }
 
 pub fn run(arguments: Vec<String>) -> Result<Value, StoreError> {
@@ -262,9 +273,128 @@ fn parse(arguments: Vec<String>) -> Result<CliCommand, StoreError> {
         {
             CliCommand::BindingsReconcileOnlineRequired
         }
+        [command, action, generation_flag, generation]
+            if command == "system" && action == "show" && generation_flag == "--generation" =>
+        {
+            CliCommand::SystemShow(parse_generation(generation)?)
+        }
+        [command, action] if command == "system" && action == "show" => {
+            return Err(invalid_generation())
+        }
+        [command, action, capability, value, generation_flag, generation]
+            if command == "system" && action == "set" && generation_flag == "--generation" =>
+        {
+            CliCommand::SystemSet {
+                generation: parse_generation(generation)?,
+                mutation: parse_system_mutation(capability, value)?,
+            }
+        }
+        [command, action, action_name, confirmation, generation_flag, generation]
+            if command == "session" && action == "perform" && generation_flag == "--generation" =>
+        {
+            let generation = parse_generation(generation)?;
+            if confirmation != "confirmed" {
+                return Err(StoreError::system_request(
+                    "confirmation_required",
+                    "session action requires the literal confirmed argument",
+                ));
+            }
+            CliCommand::SessionPerform {
+                generation,
+                request: SessionActionRequest {
+                    schema_version: 1,
+                    action: parse_session_action(action_name)?,
+                    confirmed: true,
+                },
+            }
+        }
+        [command, action, ..] if command == "system" && (action == "show" || action == "set") => {
+            return Err(invalid_generation())
+        }
+        [command, action, ..] if command == "session" && action == "perform" => {
+            return Err(invalid_generation())
+        }
         _ => return Err(StoreError::invalid_command()),
     };
     Ok(command)
+}
+
+fn invalid_generation() -> StoreError {
+    StoreError::system_request(
+        "invalid_generation",
+        "--generation requires a positive u64 supplied by the client",
+    )
+}
+
+fn parse_generation(value: &str) -> Result<u64, StoreError> {
+    let generation = value.parse::<u64>().map_err(|_| invalid_generation())?;
+    if generation == 0 {
+        return Err(invalid_generation());
+    }
+    Ok(generation)
+}
+
+fn parse_system_mutation(capability: &str, value: &str) -> Result<SystemMutation, StoreError> {
+    let invalid = || {
+        StoreError::system_request(
+            "invalid_request",
+            format!("value does not match the closed type for {capability}"),
+        )
+    };
+    let boolean = || match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(invalid()),
+    };
+    let level = || {
+        let level = value.parse::<f64>().map_err(|_| invalid())?;
+        (level.is_finite() && (0.0..=1.0).contains(&level))
+            .then_some(level)
+            .ok_or_else(invalid)
+    };
+    match capability {
+        "network.enabled" => boolean().map(SystemMutation::NetworkEnabled),
+        "bluetooth.enabled" => boolean().map(SystemMutation::BluetoothEnabled),
+        "audio.volume" => level().map(SystemMutation::AudioVolume),
+        "audio.muted" => boolean().map(SystemMutation::AudioMuted),
+        "audio.microphoneLevel" => level().map(SystemMutation::AudioMicrophoneLevel),
+        "audio.microphoneMuted" => boolean().map(SystemMutation::AudioMicrophoneMuted),
+        "audio.outputDevice" if !value.is_empty() => {
+            Ok(SystemMutation::AudioOutputDevice(value.to_owned()))
+        }
+        "display.brightness" => level().map(SystemMutation::DisplayBrightness),
+        "display.nightLightEnabled" => boolean().map(SystemMutation::DisplayNightLightEnabled),
+        "power.profile" => match value {
+            "power-saver" => Ok(SystemMutation::PowerProfile(PowerProfile::PowerSaver)),
+            "balanced" => Ok(SystemMutation::PowerProfile(PowerProfile::Balanced)),
+            "performance" => Ok(SystemMutation::PowerProfile(PowerProfile::Performance)),
+            _ => Err(invalid()),
+        },
+        "media.transport" => match value {
+            "playPause" => Ok(SystemMutation::MediaTransport(MediaTransport::PlayPause)),
+            "next" => Ok(SystemMutation::MediaTransport(MediaTransport::Next)),
+            "previous" => Ok(SystemMutation::MediaTransport(MediaTransport::Previous)),
+            _ => Err(invalid()),
+        },
+        "battery.status" => Err(StoreError::system_request(
+            "invalid_request",
+            "battery.status is read-only",
+        )),
+        _ => Err(invalid()),
+    }
+}
+
+fn parse_session_action(value: &str) -> Result<SessionAction, StoreError> {
+    match value {
+        "lock" => Ok(SessionAction::Lock),
+        "logout" => Ok(SessionAction::Logout),
+        "reboot" => Ok(SessionAction::Reboot),
+        "powerOff" => Ok(SessionAction::PowerOff),
+        _ => Err(StoreError::system_request(
+            "invalid_request",
+            "unknown session action",
+        )),
+    }
 }
 
 fn parse_import_mode(mode: &str) -> Result<ImportMode, StoreError> {
@@ -279,6 +409,30 @@ fn parse_import_mode(mode: &str) -> Result<ImportMode, StoreError> {
 fn execute(command: CliCommand) -> Result<Value, StoreError> {
     let paths = StorePaths::from_environment();
     match command {
+        CliCommand::SystemShow(generation) => serde_json::to_value(
+            SystemFacade::new(ProcessCommandRunner)
+                .snapshot(generation)
+                .map_err(StoreError::system)?,
+        )
+        .map_err(StoreError::io),
+        CliCommand::SystemSet {
+            generation,
+            mutation,
+        } => serde_json::to_value(
+            SystemFacade::new(ProcessCommandRunner)
+                .mutate(generation, mutation)
+                .map_err(StoreError::system)?,
+        )
+        .map_err(StoreError::io),
+        CliCommand::SessionPerform {
+            generation,
+            request,
+        } => serde_json::to_value(
+            SystemFacade::new(ProcessCommandRunner)
+                .perform(generation, request)
+                .map_err(StoreError::system)?,
+        )
+        .map_err(StoreError::io),
         CliCommand::StateInspect => {
             serde_json::to_value(StateInspector::inspect(paths)).map_err(StoreError::io)
         }
@@ -433,10 +587,11 @@ fn execute(command: CliCommand) -> Result<Value, StoreError> {
                 | CliCommand::StateRepair(_)
                 | CliCommand::BindingsRender
                 | CliCommand::BindingsInitialize
-                | CliCommand::BindingsReconcile => unreachable!("handled before store open"),
-                CliCommand::BindingsReconcileOnlineRequired => {
-                    unreachable!("handled before store open")
-                }
+                | CliCommand::BindingsReconcile
+                | CliCommand::BindingsReconcileOnlineRequired
+                | CliCommand::SystemShow(_)
+                | CliCommand::SystemSet { .. }
+                | CliCommand::SessionPerform { .. } => unreachable!("handled before store open"),
             }
         }
     }
