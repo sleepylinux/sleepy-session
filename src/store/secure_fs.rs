@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::{CStr, CString, OsStr, OsString},
     fs::File,
     io::{self, Read, Write},
@@ -393,50 +394,7 @@ impl SecureDir {
     }
 
     pub fn read_root_store_regular(path: &Path) -> Result<Vec<u8>, StoreError> {
-        if !path.starts_with("/nix/store") {
-            return Err(StoreError::unsafe_path(path.display()));
-        }
-        let root = CString::new("/").expect("static root has no NUL");
-        let mut descriptor = openat_owned(
-            libc::AT_FDCWD,
-            &root,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0,
-        )
-        .map_err(StoreError::io)?;
-        let components = path.components().collect::<Vec<_>>();
-        for (index, component) in components.iter().enumerate() {
-            let Component::Normal(component) = component else {
-                if matches!(component, Component::RootDir) {
-                    continue;
-                }
-                return Err(StoreError::unsafe_path(path.display()));
-            };
-            let name = c_string(component, path)?;
-            let final_component = index + 1 == components.len();
-            descriptor = openat_owned(
-                descriptor.as_raw_fd(),
-                &name,
-                libc::O_RDONLY
-                    | libc::O_CLOEXEC
-                    | libc::O_NOFOLLOW
-                    | if final_component {
-                        0
-                    } else {
-                        libc::O_DIRECTORY
-                    },
-                0,
-            )
-            .map_err(|error| map_open_error(path, error))?;
-        }
-        let metadata = fstat(descriptor.as_raw_fd()).map_err(StoreError::io)?;
-        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_uid != 0 {
-            return Err(StoreError::unsafe_path(path.display()));
-        }
-        let mut file = File::from(descriptor);
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(StoreError::io)?;
-        Ok(bytes)
+        read_store_regular_for_policy(path, Path::new("/nix/store"), 0, 40)
     }
 
     pub fn sync(&self) -> Result<(), StoreError> {
@@ -480,6 +438,150 @@ impl SecureDir {
         validate_regular_file(descriptor.as_raw_fd(), &path)?;
         Ok(Some(descriptor))
     }
+}
+
+fn read_store_regular_for_policy(
+    initial_target: &Path,
+    store_root: &Path,
+    required_owner: libc::uid_t,
+    max_symlink_hops: usize,
+) -> Result<Vec<u8>, StoreError> {
+    if !initial_target.is_absolute() {
+        return Err(StoreError::unsafe_path(initial_target.display()));
+    }
+    let mut pending = normalize_store_target(initial_target, store_root, &[])?;
+    let store_descriptor = open_directory_path_no_follow(store_root)?;
+    let mut seen = HashSet::new();
+    let mut followed = 0_usize;
+
+    'resolve: loop {
+        if pending.is_empty() || !seen.insert(pending.clone()) {
+            return Err(StoreError::unsafe_path(initial_target.display()));
+        }
+        let mut directory: Option<OwnedFd> = None;
+        for (index, component) in pending.iter().enumerate() {
+            let parent_descriptor = directory
+                .as_ref()
+                .map(AsRawFd::as_raw_fd)
+                .unwrap_or_else(|| store_descriptor.as_raw_fd());
+            let name = c_string(component, initial_target)?;
+            let final_component = index + 1 == pending.len();
+            let descriptor = if final_component {
+                match openat_owned(
+                    parent_descriptor,
+                    &name,
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0,
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                        open_path_entry(parent_descriptor, &name, initial_target)?
+                    }
+                    Err(error) => return Err(map_open_error(initial_target, error)),
+                }
+            } else {
+                open_path_entry(parent_descriptor, &name, initial_target)?
+            };
+            let metadata = fstat(descriptor.as_raw_fd()).map_err(StoreError::io)?;
+            match metadata.st_mode & libc::S_IFMT {
+                libc::S_IFLNK => {
+                    followed += 1;
+                    if followed > max_symlink_hops {
+                        return Err(StoreError::unsafe_path(initial_target.display()));
+                    }
+                    let target = readlink_fd(descriptor.as_raw_fd())?;
+                    let mut resolved =
+                        normalize_store_target(&target, store_root, &pending[..index])?;
+                    resolved.extend_from_slice(&pending[index + 1..]);
+                    pending = resolved;
+                    continue 'resolve;
+                }
+                libc::S_IFDIR if !final_component => directory = Some(descriptor),
+                libc::S_IFREG if final_component && metadata.st_uid == required_owner => {
+                    let mut file = File::from(descriptor);
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).map_err(StoreError::io)?;
+                    return Ok(bytes);
+                }
+                _ => return Err(StoreError::unsafe_path(initial_target.display())),
+            }
+        }
+    }
+}
+
+fn open_path_entry(
+    directory: i32,
+    name: &CString,
+    display_path: &Path,
+) -> Result<OwnedFd, StoreError> {
+    openat_owned(
+        directory,
+        name,
+        libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0,
+    )
+    .map_err(|error| map_open_error(display_path, error))
+}
+
+fn open_directory_path_no_follow(path: &Path) -> Result<OwnedFd, StoreError> {
+    if !path.is_absolute() {
+        return Err(StoreError::unsafe_path(path.display()));
+    }
+    let root = CString::new("/").expect("static root has no NUL");
+    let mut descriptor = openat_owned(
+        libc::AT_FDCWD,
+        &root,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0,
+    )
+    .map_err(StoreError::io)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(component) => {
+                let name = c_string(component, path)?;
+                descriptor = openat_owned(
+                    descriptor.as_raw_fd(),
+                    &name,
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    0,
+                )
+                .map_err(|error| map_open_error(path, error))?;
+            }
+            _ => return Err(StoreError::unsafe_path(path.display())),
+        }
+    }
+    Ok(descriptor)
+}
+
+fn normalize_store_target(
+    target: &Path,
+    store_root: &Path,
+    relative_parent: &[OsString],
+) -> Result<Vec<OsString>, StoreError> {
+    let (mut resolved, components) = if target.is_absolute() {
+        let relative = target
+            .strip_prefix(store_root)
+            .map_err(|_| StoreError::unsafe_path(target.display()))?;
+        (Vec::new(), relative.components())
+    } else {
+        (relative_parent.to_vec(), target.components())
+    };
+    for component in components {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => resolved.push(component.to_owned()),
+            Component::ParentDir => {
+                if resolved.pop().is_none() {
+                    return Err(StoreError::unsafe_path(target.display()));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(StoreError::unsafe_path(target.display()));
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 fn validate_writable_directory(descriptor: i32, path: &Path) -> Result<(), StoreError> {
@@ -572,5 +674,118 @@ fn map_open_error(path: &Path, error: io::Error) -> StoreError {
         StoreError::unsafe_path(path.display())
     } else {
         StoreError::io(error)
+    }
+}
+
+#[cfg(test)]
+mod static_store_resolution_tests {
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        time::{Duration, Instant},
+    };
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn read_test_store(target: &Path, store_root: &Path) -> Result<Vec<u8>, StoreError> {
+        read_store_regular_for_policy(target, store_root, unsafe { libc::geteuid() }, 40)
+    }
+
+    #[test]
+    fn home_absolute_link_resolves_store_symlink_to_owned_regular() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        let package = store.join("package");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("config.kdl"), b"approved\n").unwrap();
+        symlink(package.join("config.kdl"), store.join("profile.kdl")).unwrap();
+        let home_link = temp.path().join("home-config.kdl");
+        symlink(store.join("profile.kdl"), &home_link).unwrap();
+
+        let bytes = read_test_store(&fs::read_link(home_link).unwrap(), &store).unwrap();
+
+        assert_eq!(bytes, b"approved\n");
+    }
+
+    #[test]
+    fn relative_store_symlink_chain_is_resolved_inside_store() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        fs::create_dir_all(store.join("links/nested")).unwrap();
+        fs::create_dir_all(store.join("package")).unwrap();
+        fs::write(store.join("package/config.kdl"), b"relative-chain\n").unwrap();
+        symlink("nested/second.kdl", store.join("links/first.kdl")).unwrap();
+        symlink(
+            "../../package/config.kdl",
+            store.join("links/nested/second.kdl"),
+        )
+        .unwrap();
+
+        let bytes = read_test_store(&store.join("links/first.kdl"), &store).unwrap();
+
+        assert_eq!(bytes, b"relative-chain\n");
+    }
+
+    #[test]
+    fn static_store_symlink_escape_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        fs::create_dir_all(store.join("links")).unwrap();
+        let outside = temp.path().join("outside.kdl");
+        let outside_directory = temp.path().join("outside-directory");
+        fs::create_dir_all(&outside_directory).unwrap();
+        fs::write(
+            outside_directory.join("config.kdl"),
+            b"component-attacker\n",
+        )
+        .unwrap();
+        fs::write(&outside, b"attacker\n").unwrap();
+        symlink(&outside, store.join("absolute.kdl")).unwrap();
+        symlink("../../outside.kdl", store.join("links/relative.kdl")).unwrap();
+        symlink(&outside_directory, store.join("links/component")).unwrap();
+
+        for target in [
+            store.join("absolute.kdl"),
+            store.join("links/relative.kdl"),
+            store.join("links/component/config.kdl"),
+        ] {
+            let error = read_test_store(&target, &store).unwrap_err();
+            assert_eq!(error.code(), "unsafe_path");
+        }
+    }
+
+    #[test]
+    fn static_store_symlink_loop_is_rejected_within_hop_bound() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        fs::create_dir_all(&store).unwrap();
+        symlink("second.kdl", store.join("first.kdl")).unwrap();
+        symlink("first.kdl", store.join("second.kdl")).unwrap();
+        let started = Instant::now();
+
+        let error = read_test_store(&store.join("first.kdl"), &store).unwrap_err();
+
+        assert_eq!(error.code(), "unsafe_path");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn static_store_final_must_be_owned_regular() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join("store");
+        fs::create_dir_all(store.join("directory")).unwrap();
+        symlink("directory", store.join("not-regular.kdl")).unwrap();
+
+        let error = read_test_store(&store.join("not-regular.kdl"), &store).unwrap_err();
+        assert_eq!(error.code(), "unsafe_path");
+
+        fs::write(store.join("regular.kdl"), b"owned-by-current-user\n").unwrap();
+        let wrong_owner = unsafe { libc::geteuid() }.wrapping_add(1);
+        let error =
+            read_store_regular_for_policy(&store.join("regular.kdl"), &store, wrong_owner, 40)
+                .unwrap_err();
+        assert_eq!(error.code(), "unsafe_path");
     }
 }
