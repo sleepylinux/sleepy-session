@@ -1,7 +1,9 @@
 //! Durable XDG-backed settings and preset state for the Sleepy desktop.
 
+pub mod cli;
 mod store;
 
 pub use store::{
-    Defaults, ReplacementObserver, ReplacementStage, StateStore, StoreError, StorePaths,
+    Defaults, ImportMode, InspectionDocumentReport, InspectionIssue, InspectionReport,
+    ReplacementObserver, ReplacementStage, StateInspector, StateStore, StoreError, StorePaths,
 };

@@ -6,7 +6,9 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use sleepy_session::{Defaults, ReplacementObserver, ReplacementStage, StateStore, StorePaths};
+use sleepy_session::{
+    Defaults, ImportMode, ReplacementObserver, ReplacementStage, StateStore, StorePaths,
+};
 use tempfile::TempDir;
 
 fn defaults() -> Defaults {
@@ -56,6 +58,199 @@ fn user_preset(id: &str, name: &str) -> Value {
         "keybindings": {},
         "pluginRequirements": []
     })
+}
+
+fn updated_user_preset(id: &str, name: &str) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "id": id,
+        "name": name,
+        "origin": "user",
+        "basePresetId": "f34956a5-5d02-4a7f-9728-cf784088b97a",
+        "layouts": {"DP-1": {"main": "terminal"}},
+        "drawers": {"rightNotifications": {"edge": "right"}},
+        "keybindings": {
+            "app.terminal.open": "Mod+Return",
+            "surface.controlCenter.toggle": "Mod+C"
+        },
+        "pluginRequirements": ["org.sleepy.clock"]
+    })
+}
+
+#[test]
+fn preset_mutation_update_replaces_every_field_of_an_inactive_user_preset() {
+    let temp = TempDir::new().unwrap();
+    let paths = paths(&temp);
+    let store = StateStore::open(paths, defaults()).unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    store.create_user_preset(user_preset(id, "Before")).unwrap();
+    let candidate = updated_user_preset(id, "After");
+
+    let output = store.update_user_preset(id, candidate.clone()).unwrap();
+
+    assert_eq!(output["preset"], candidate);
+    assert_eq!(store.preset_json(id).unwrap(), candidate);
+    assert_eq!(store.export_preset(id).unwrap(), candidate);
+}
+
+#[test]
+fn preset_mutation_rejects_every_direct_builtin_mutation() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+
+    let update = store
+        .update_user_preset("builtin.sleepy", builtin_preset())
+        .unwrap_err();
+    let delete = store.delete_user_preset("builtin.sleepy").unwrap_err();
+
+    assert_eq!(update.code(), "immutable_preset");
+    assert_eq!(delete.code(), "immutable_preset");
+    assert_eq!(
+        store.preset_json("builtin.sleepy").unwrap()["name"],
+        "Sleepy"
+    );
+}
+
+#[test]
+fn preset_mutation_rejects_delete_of_the_active_user_preset() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    store.create_user_preset(user_preset(id, "Active")).unwrap();
+    store.activate_preset(id).unwrap();
+
+    let error = store.delete_user_preset(id).unwrap_err();
+
+    assert_eq!(error.code(), "active_preset");
+    assert_eq!(store.preset_json(id).unwrap()["name"], "Active");
+}
+
+#[test]
+fn preset_mutation_rejects_candidate_identity_and_import_conflicts() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let first = "5268c988-5c83-4921-a592-2c3342e59d61";
+    let second = "f34956a5-5d02-4a7f-9728-cf784088b97a";
+    store
+        .create_user_preset(user_preset(first, "Existing"))
+        .unwrap();
+
+    let update = store
+        .update_user_preset(first, user_preset(second, "Wrong identity"))
+        .unwrap_err();
+    let import = store
+        .import_preset(user_preset(first, "Conflict"), ImportMode::Reject)
+        .unwrap_err();
+
+    assert_eq!(update.code(), "preset_conflict");
+    assert_eq!(import.code(), "preset_conflict");
+    assert_eq!(store.preset_json(first).unwrap()["name"], "Existing");
+}
+
+#[test]
+fn preset_mutation_imports_a_builtin_as_a_new_user_copy() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+
+    let output = store
+        .import_preset(builtin_preset(), ImportMode::Reject)
+        .unwrap();
+    let imported = &output["preset"];
+    let id = imported["id"].as_str().unwrap();
+
+    assert!(uuid::Uuid::parse_str(id).is_ok());
+    assert_eq!(imported["origin"], "user");
+    assert_eq!(imported["basePresetId"], "builtin.sleepy");
+    assert_eq!(
+        store.preset_json("builtin.sleepy").unwrap()["origin"],
+        "builtin"
+    );
+}
+
+#[test]
+fn preset_mutation_explicit_replace_updates_an_existing_inactive_user() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    store
+        .create_user_preset(user_preset(id, "Existing"))
+        .unwrap();
+    let replacement = updated_user_preset(id, "Replacement");
+
+    let output = store
+        .import_preset(replacement.clone(), ImportMode::Replace)
+        .unwrap();
+
+    assert_eq!(output["preset"], replacement);
+    assert_eq!(store.preset_json(id).unwrap(), replacement);
+}
+
+#[test]
+fn preset_mutation_invalid_import_preserves_the_existing_bytes_exactly() {
+    let temp = TempDir::new().unwrap();
+    let paths = paths(&temp);
+    let store = StateStore::open(paths.clone(), defaults()).unwrap();
+    let original = b"[\n  ]\n";
+    fs::write(paths.presets_path(), original).unwrap();
+
+    let error = store
+        .import_preset(json!({"schemaVersion": 1}), ImportMode::Reject)
+        .unwrap_err();
+
+    assert_eq!(error.code(), "invalid_document");
+    assert_eq!(fs::read(paths.presets_path()).unwrap(), original);
+}
+
+#[test]
+fn preset_mutation_allows_duplicate_display_names() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let first = "5268c988-5c83-4921-a592-2c3342e59d61";
+    let second = "f34956a5-5d02-4a7f-9728-cf784088b97a";
+    store
+        .create_user_preset(user_preset(first, "Same name"))
+        .unwrap();
+
+    store
+        .import_preset(user_preset(second, "Same name"), ImportMode::Reject)
+        .unwrap();
+
+    assert_eq!(store.preset_json(first).unwrap()["name"], "Same name");
+    assert_eq!(store.preset_json(second).unwrap()["name"], "Same name");
+}
+
+#[test]
+fn preset_mutation_rejects_active_update_and_replace_until_apply_is_available() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    store
+        .create_user_preset(user_preset(id, "Original"))
+        .unwrap();
+    store.activate_preset(id).unwrap();
+
+    let update = store
+        .update_user_preset(id, updated_user_preset(id, "Update"))
+        .unwrap_err();
+    let replace = store
+        .import_preset(updated_user_preset(id, "Replacement"), ImportMode::Replace)
+        .unwrap_err();
+
+    assert_eq!(update.code(), "apply_required");
+    assert_eq!(replace.code(), "apply_required");
+    assert_eq!(store.active_preset_json().unwrap()["name"], "Original");
+}
+
+#[test]
+fn preset_mutation_validation_returns_the_complete_validated_document() {
+    let temp = TempDir::new().unwrap();
+    let store = StateStore::open(paths(&temp), defaults()).unwrap();
+    let candidate = updated_user_preset("5268c988-5c83-4921-a592-2c3342e59d61", "Validated");
+
+    assert_eq!(
+        store.validate_preset_candidate(candidate.clone()).unwrap(),
+        candidate
+    );
 }
 
 #[test]
@@ -387,6 +582,44 @@ impl ReplacementObserver for PauseFirstReplacement {
         }
         Ok(())
     }
+}
+
+#[test]
+fn preset_mutation_concurrent_updates_serialize_the_full_transaction() {
+    let temp = TempDir::new().unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    let initial = StateStore::open(paths(&temp), defaults()).unwrap();
+    initial
+        .create_user_preset(user_preset(id, "Original"))
+        .unwrap();
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let store = initial.with_replacement_observer(Arc::new(PauseFirstReplacement {
+        started: started_sender,
+        release: Mutex::new(release_receiver),
+        seen: Mutex::new(0),
+    }));
+    let first = store.clone();
+    let first_thread =
+        thread::spawn(move || first.update_user_preset(id, updated_user_preset(id, "First")));
+    started_receiver.recv().unwrap();
+    let second = store.clone();
+    let (done_sender, done_receiver) = mpsc::channel();
+    let second_thread = thread::spawn(move || {
+        let result = second.update_user_preset(id, updated_user_preset(id, "Second"));
+        done_sender.send(()).unwrap();
+        result
+    });
+
+    assert!(done_receiver
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    release_sender.send(()).unwrap();
+    first_thread.join().unwrap().unwrap();
+    second_thread.join().unwrap().unwrap();
+    done_receiver.recv().unwrap();
+
+    assert_eq!(store.preset_json(id).unwrap()["name"], "Second");
 }
 
 #[test]

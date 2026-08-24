@@ -1,10 +1,10 @@
 use std::process::ExitCode;
 
-use serde_json::{json, Value};
-use sleepy_session::{Defaults, StateStore, StoreError, StorePaths};
+use serde_json::json;
+use sleepy_session::cli;
 
 fn main() -> ExitCode {
-    match run(std::env::args().skip(1).collect()) {
+    match cli::run(std::env::args().skip(1).collect()) {
         Ok(output) => {
             println!(
                 "{}",
@@ -13,67 +13,17 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
+            let mut output = json!({
+                "error": { "code": error.code(), "message": error.message() }
+            });
+            if let Some(details) = error.details() {
+                output["error"]["details"] = details.clone();
+            }
             eprintln!(
                 "{}",
-                serde_json::to_string(&json!({
-                    "error": { "code": error.code(), "message": error.message() }
-                }))
-                .expect("JSON errors serialize")
+                serde_json::to_string(&output).expect("JSON errors serialize")
             );
             ExitCode::from(1)
         }
     }
-}
-
-fn run(arguments: Vec<String>) -> Result<Value, StoreError> {
-    match arguments.as_slice() {
-        [command, action] if command == "settings" && action == "show" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?.settings_json()
-        }
-        [command, action] if command == "presets" && action == "list" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?.presets_json()
-        }
-        [command, action, source, name] if command == "presets" && action == "duplicate" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?
-                .duplicate_preset(source, name)
-        }
-        [command, action, id, name] if command == "presets" && action == "rename" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?
-                .rename_preset(id, name)
-        }
-        [command, action, id] if command == "presets" && action == "activate" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?.activate_preset(id)
-        }
-        _ => Err(invalid_command()),
-    }
-}
-
-fn default_state() -> Result<Defaults, StoreError> {
-    Defaults::from_json(
-        json!({
-            "schemaVersion": 1,
-            "activePresetId": "builtin.sleepy",
-            "appearanceMode": "dark",
-            "paletteSource": "sleepy",
-            "reducedMotion": false,
-            "effectsProfile": "full",
-            "panelVisibility": "always",
-            "webSearchEnabled": true
-        }),
-        vec![json!({
-            "schemaVersion": 1,
-            "id": "builtin.sleepy",
-            "name": "Sleepy",
-            "origin": "builtin",
-            "basePresetId": null,
-            "layouts": {},
-            "drawers": { "leftQuickSettings": {} },
-            "keybindings": {},
-            "pluginRequirements": []
-        })],
-    )
-}
-
-fn invalid_command() -> StoreError {
-    StoreError::invalid_command()
 }

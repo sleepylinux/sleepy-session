@@ -12,10 +12,10 @@ fn dependency_contract_pins_the_reviewed_gpl_sdk_revision() {
     let lockfile = read_repository_file("Cargo.lock");
 
     assert!(
-        flake.contains("github:sleepylinux/sleepy-sdk/2edbe8310eee69c40e4f75924da67a57942bd1c3")
+        flake.contains("github:sleepylinux/sleepy-sdk/5dc792faea9d743fabbb576ae1b25ed7e1f729f9")
     );
-    assert!(manifest.contains("rev = \"2edbe8310eee69c40e4f75924da67a57942bd1c3\""));
-    assert!(lockfile.contains("#2edbe8310eee69c40e4f75924da67a57942bd1c3"));
+    assert!(manifest.contains("rev = \"5dc792faea9d743fabbb576ae1b25ed7e1f729f9\""));
+    assert!(lockfile.contains("#5dc792faea9d743fabbb576ae1b25ed7e1f729f9"));
     assert_eq!(flake.matches("github:sleepylinux/sleepy-sdk/").count(), 1);
     assert_eq!(manifest.matches("sleepy-sdk =").count(), 1);
     assert_eq!(lockfile.matches("name = \"sleepy-sdk\"").count(), 1);

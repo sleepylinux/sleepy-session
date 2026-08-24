@@ -288,7 +288,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sleepy-sdk"
 version = "0.1.0"
-source = "git+https://github.com/sleepylinux/sleepy-sdk?rev=2edbe8310eee69c40e4f75924da67a57942bd1c3#2edbe8310eee69c40e4f75924da67a57942bd1c3"
+source = "git+https://github.com/sleepylinux/sleepy-sdk?rev=5dc792faea9d743fabbb576ae1b25ed7e1f729f9#5dc792faea9d743fabbb576ae1b25ed7e1f729f9"
 dependencies = [
  "semver",
  "serde",

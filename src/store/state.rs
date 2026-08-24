@@ -8,10 +8,11 @@ use std::{
 };
 
 use fs2::FileExt;
+use serde::Serialize;
 use serde_json::{json, Value};
 use sleepy_sdk::{
-    validate_preset, validate_settings, PresetDocument, PresetOrigin, SettingsDocument,
-    BUILTIN_PRESET_ID,
+    packaged_reserved_keybindings, validate_keybindings_with_reserved, validate_preset,
+    validate_settings, PresetDocument, PresetOrigin, SettingsDocument, BUILTIN_PRESET_ID,
 };
 use uuid::Uuid;
 
@@ -34,6 +35,219 @@ pub struct StateStore {
     paths: StorePaths,
     defaults: Defaults,
     replacement_observer: Option<Arc<dyn ReplacementObserver>>,
+}
+
+pub struct StateInspector;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionReport {
+    pub clean: bool,
+    pub settings: InspectionDocumentReport,
+    pub presets: InspectionDocumentReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionDocumentReport {
+    pub exists: bool,
+    pub byte_length: usize,
+    pub valid: bool,
+    pub issues: Vec<InspectionIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionIssue {
+    pub record_index: Option<usize>,
+    pub record_id: Option<String>,
+    pub actions: Vec<String>,
+    pub code: String,
+    pub message: String,
+}
+
+impl StateInspector {
+    pub fn inspect(paths: StorePaths) -> InspectionReport {
+        if let Err(error) = paths.reject_symlinks() {
+            let issue = inspection_issue(None, None, Vec::new(), &error);
+            let document = InspectionDocumentReport {
+                exists: false,
+                byte_length: 0,
+                valid: false,
+                issues: vec![issue],
+            };
+            return InspectionReport {
+                clean: false,
+                settings: document.clone(),
+                presets: document,
+            };
+        }
+
+        let (mut settings, active_id) = inspect_settings(&paths);
+        let (presets, preset_ids) = inspect_presets(&paths);
+        if settings.valid {
+            if let Some(active_id) = active_id {
+                if active_id != BUILTIN_PRESET_ID && !preset_ids.contains(&active_id) {
+                    let error = StoreError::invalid("settings activePresetId does not exist");
+                    settings.valid = false;
+                    settings
+                        .issues
+                        .push(inspection_issue(None, None, Vec::new(), &error));
+                }
+            }
+        }
+        InspectionReport {
+            clean: settings.valid && presets.valid,
+            settings,
+            presets,
+        }
+    }
+}
+
+fn inspect_settings(paths: &StorePaths) -> (InspectionDocumentReport, Option<String>) {
+    let bytes = match fs::read(paths.settings_path()) {
+        Ok(bytes) => bytes,
+        Err(error) => return (unreadable_document(error), None),
+    };
+    let byte_length = bytes.len();
+    let input = match std::str::from_utf8(&bytes) {
+        Ok(input) => input,
+        Err(error) => {
+            return (
+                invalid_document_report(
+                    byte_length,
+                    StoreError::invalid(format!("settings are not UTF-8: {error}")),
+                ),
+                None,
+            )
+        }
+    };
+    match validate_settings(input) {
+        Ok(settings) => (
+            InspectionDocumentReport {
+                exists: true,
+                byte_length,
+                valid: true,
+                issues: Vec::new(),
+            },
+            Some(settings.active_preset_id),
+        ),
+        Err(error) => (
+            invalid_document_report(byte_length, StoreError::invalid(error.to_string())),
+            None,
+        ),
+    }
+}
+
+fn inspect_presets(paths: &StorePaths) -> (InspectionDocumentReport, BTreeSet<String>) {
+    let bytes = match fs::read(paths.presets_path()) {
+        Ok(bytes) => bytes,
+        Err(error) => return (unreadable_document(error), BTreeSet::new()),
+    };
+    let byte_length = bytes.len();
+    let input = match std::str::from_utf8(&bytes) {
+        Ok(input) => input,
+        Err(error) => {
+            return (
+                invalid_document_report(
+                    byte_length,
+                    StoreError::invalid(format!("presets are not UTF-8: {error}")),
+                ),
+                BTreeSet::new(),
+            )
+        }
+    };
+    let records: Vec<Value> = match serde_json::from_str(input) {
+        Ok(records) => records,
+        Err(error) => {
+            return (
+                invalid_document_report(byte_length, StoreError::invalid(error.to_string())),
+                BTreeSet::new(),
+            )
+        }
+    };
+
+    let mut issues = Vec::new();
+    let mut ids = BTreeSet::new();
+    for (index, record) in records.into_iter().enumerate() {
+        let record_id = record.get("id").and_then(Value::as_str).map(str::to_owned);
+        match parse_preset(record) {
+            Ok(preset) if preset.origin != PresetOrigin::User => {
+                let error = StoreError::invalid("user preset store contains a builtin preset");
+                issues.push(inspection_issue(Some(index), record_id, Vec::new(), &error));
+            }
+            Ok(preset) if !ids.insert(preset.id.clone()) => {
+                let error = StoreError::invalid("user preset store contains duplicate ids");
+                issues.push(inspection_issue(
+                    Some(index),
+                    Some(preset.id),
+                    Vec::new(),
+                    &error,
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let actions = error
+                    .details()
+                    .and_then(|details| details.get("actions"))
+                    .and_then(Value::as_array)
+                    .map(|actions| {
+                        actions
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                issues.push(inspection_issue(Some(index), record_id, actions, &error));
+            }
+        }
+    }
+
+    (
+        InspectionDocumentReport {
+            exists: true,
+            byte_length,
+            valid: issues.is_empty(),
+            issues,
+        },
+        ids,
+    )
+}
+
+fn unreadable_document(error: io::Error) -> InspectionDocumentReport {
+    let exists = error.kind() != io::ErrorKind::NotFound;
+    let error = StoreError::io(error);
+    InspectionDocumentReport {
+        exists,
+        byte_length: 0,
+        valid: false,
+        issues: vec![inspection_issue(None, None, Vec::new(), &error)],
+    }
+}
+
+fn invalid_document_report(byte_length: usize, error: StoreError) -> InspectionDocumentReport {
+    InspectionDocumentReport {
+        exists: true,
+        byte_length,
+        valid: false,
+        issues: vec![inspection_issue(None, None, Vec::new(), &error)],
+    }
+}
+
+fn inspection_issue(
+    record_index: Option<usize>,
+    record_id: Option<String>,
+    actions: Vec<String>,
+    error: &StoreError,
+) -> InspectionIssue {
+    InspectionIssue {
+        record_index,
+        record_id,
+        actions,
+        code: error.code().to_owned(),
+        message: error.message().to_owned(),
+    }
 }
 
 impl fmt::Debug for StateStore {
@@ -164,7 +378,7 @@ impl StateStore {
         })
     }
 
-    fn with_transaction<T>(
+    pub(super) fn with_transaction<T>(
         &self,
         operation: impl FnOnce(&Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
@@ -195,12 +409,12 @@ impl StateStore {
         Ok(())
     }
 
-    fn load_settings(&self) -> Result<SettingsDocument, StoreError> {
+    pub(super) fn load_settings(&self) -> Result<SettingsDocument, StoreError> {
         let input = fs::read_to_string(self.paths.settings_path()).map_err(StoreError::io)?;
         validate_settings(&input).map_err(|error| StoreError::invalid(error.to_string()))
     }
 
-    fn load_user_presets(&self) -> Result<Vec<PresetDocument>, StoreError> {
+    pub(super) fn load_user_presets(&self) -> Result<Vec<PresetDocument>, StoreError> {
         let input = fs::read_to_string(self.paths.presets_path()).map_err(StoreError::io)?;
         let presets: Vec<Value> =
             serde_json::from_str(&input).map_err(|error| StoreError::invalid(error.to_string()))?;
@@ -231,7 +445,7 @@ impl StateStore {
         Ok(presets)
     }
 
-    fn find_preset(&self, id: &str) -> Result<Option<PresetDocument>, StoreError> {
+    pub(super) fn find_preset(&self, id: &str) -> Result<Option<PresetDocument>, StoreError> {
         if let Some(preset) = self.defaults.builtins.iter().find(|preset| preset.id == id) {
             return Ok(Some(preset.clone()));
         }
@@ -253,7 +467,7 @@ impl StateStore {
         )
     }
 
-    fn write_user_presets(&self, presets: &[PresetDocument]) -> Result<(), StoreError> {
+    pub(super) fn write_user_presets(&self, presets: &[PresetDocument]) -> Result<(), StoreError> {
         let ids = presets
             .iter()
             .map(|preset| preset.id.as_str())
@@ -294,7 +508,11 @@ fn parse_settings(value: Value) -> Result<SettingsDocument, StoreError> {
     validate_settings(&value.to_string()).map_err(|error| StoreError::invalid(error.to_string()))
 }
 
-fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
+pub(super) fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
+    if let Ok(document) = serde_json::from_value::<PresetDocument>(value.clone()) {
+        validate_keybindings_with_reserved(&document.keybindings, &packaged_reserved_keybindings())
+            .map_err(StoreError::keybinding_conflict)?;
+    }
     validate_preset(&value.to_string()).map_err(|error| StoreError::invalid(error.to_string()))
 }
 
