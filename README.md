@@ -1,7 +1,8 @@
 # Sleepy Session
 
 `sleepy-session` owns durable, user-owned settings and preset state for the
-Sleepy desktop. It consumes the reviewed `sleepy-sdk` contract revision and
+Sleepy desktop. It consumes the reviewed `sleepy-sdk` contract revision
+`2edbe8310eee69c40e4f75924da67a57942bd1c3` and
 stores v1 documents below XDG paths:
 
 - settings: `$XDG_CONFIG_HOME/sleepy/settings.json`
@@ -51,8 +52,9 @@ cargo build --release
 
 The repository includes a standalone Nix flake. Nix was unavailable during the
 initial local verification; CI or a Nix-enabled host must run `nix flake check`.
-The flake also pins the non-flake `sleepy-sdk` source to the reviewed revision
-and permits Nix to fetch the Git dependency recorded in `Cargo.lock`; no
+The flake also pins the non-flake `sleepy-sdk` source to
+`2edbe8310eee69c40e4f75924da67a57942bd1c3` and permits Nix to fetch the Git
+dependency recorded in `Cargo.lock`; no
 placeholder vendor hash is used.
 
 ## License
