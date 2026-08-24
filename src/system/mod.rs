@@ -19,9 +19,11 @@ use std::{
 };
 
 pub use runner::{
-    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunnerError, RunnerErrorKind,
+    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunControl, RunnerError,
+    RunnerErrorKind,
 };
 use sleepy_sdk::{
+    validate_session_action_result, validate_system_mutation_result, validate_system_snapshot,
     AudioState, BluetoothState, CapabilityDiagnostic, CapabilityErrorKind, CapabilityId,
     CapabilityState, MediaState, MediaTransport, NetworkState, PowerProfile, PowerState,
     SessionAction, SessionActionRequest, SessionActionResult, SessionActionStatus, SystemMutation,
@@ -175,44 +177,75 @@ impl<R: CommandRunner> SystemFacade<R> {
     }
 
     pub fn snapshot(&self, generation: u64) -> Result<SystemSnapshot, SystemError> {
-        self.begin(generation)?;
+        self.accept_generation(generation)?;
+        self.snapshot_accepted(generation)
+    }
+
+    fn snapshot_accepted(&self, generation: u64) -> Result<SystemSnapshot, SystemError> {
         let request_runner = RequestRunner::new(
             self.runner.clone(),
             generation,
             Arc::clone(&self.latest_generation),
         );
         let (sender, receiver) = mpsc::channel();
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::Network(network::probe(&runner))
-        });
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::Bluetooth(bluetooth::probe(&runner))
-        });
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::Audio(audio::probe(&runner))
-        });
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::Brightness(display::probe_brightness(&runner))
-        });
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::NightLight(night_light::probe(&runner))
-        });
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::PowerProfiles(power::probe_profiles(&runner))
-        });
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::Battery(power::probe_battery(&runner))
-        });
-        spawn_probe(request_runner.clone(), sender.clone(), |runner| {
-            ProbeResult::Media(media::probe(&runner))
-        });
-        spawn_probe(request_runner, sender, |runner| {
+        let mut workers = Vec::new();
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::Network(network::probe(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::Bluetooth(bluetooth::probe(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::AudioOutput(audio::probe_output(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::AudioMicrophone(audio::probe_microphone(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::AudioDevices(audio::probe_devices(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::Brightness(display::probe_brightness(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::NightLight(night_light::probe(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::PowerProfiles(power::probe_profiles(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::Battery(power::probe_battery(&runner)),
+        ));
+        workers.push(spawn_probe(
+            request_runner.clone(),
+            sender.clone(),
+            |runner| ProbeResult::Media(media::probe(&runner)),
+        ));
+        workers.push(spawn_probe(request_runner, sender, |runner| {
             ProbeResult::Session(session::probe(&runner))
-        });
+        }));
 
         let started = Instant::now();
         let mut parts = SnapshotParts::default();
-        for _ in 0..9 {
+        for _ in 0..11 {
             let remaining = SNAPSHOT_DEADLINE.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 break;
@@ -222,9 +255,13 @@ impl<R: CommandRunner> SystemFacade<R> {
                 Err(_) => break,
             }
         }
+        drop(receiver);
+        for worker in workers {
+            let _ = worker.join();
+        }
         parts.fill_timeouts();
         self.ensure_current(generation)?;
-        Ok(parts.into_snapshot(generation))
+        validate_assembled_snapshot(parts.into_snapshot(generation))
     }
 
     pub fn mutate(
@@ -232,9 +269,9 @@ impl<R: CommandRunner> SystemFacade<R> {
         generation: u64,
         mutation: SystemMutation,
     ) -> Result<SystemMutationResult, SystemError> {
-        self.begin(generation)?;
+        self.accept_generation(generation)?;
         if let SystemMutation::AudioOutputDevice(id) = &mutation {
-            let before = self.snapshot(generation)?;
+            let before = self.snapshot_accepted(generation)?;
             let valid = before
                 .audio
                 .as_ref()
@@ -247,8 +284,16 @@ impl<R: CommandRunner> SystemFacade<R> {
             }
         }
         let command = mutation_command(&mutation)?;
-        run_mutation(&self.runner, &command)?;
-        let snapshot = self.snapshot(generation)?;
+        let request_runner = RequestRunner::new(
+            self.runner.clone(),
+            generation,
+            Arc::clone(&self.latest_generation),
+        );
+        if let Err(error) = run_mutation(&request_runner, &command) {
+            self.ensure_current(generation)?;
+            return Err(error);
+        }
+        let snapshot = self.snapshot_accepted(generation)?;
         if !mutation_confirmed(&mutation, &snapshot) {
             if let Some(diagnostic) = snapshot.diagnostics.get(&mutation_capability(&mutation)) {
                 return Err(SystemError::new(
@@ -267,7 +312,7 @@ impl<R: CommandRunner> SystemFacade<R> {
                 "fresh readback did not confirm the requested mutation",
             ));
         }
-        Ok(SystemMutationResult {
+        validate_assembled_mutation_result(SystemMutationResult {
             schema_version: SCHEMA_VERSION,
             generation,
             mutation,
@@ -280,7 +325,7 @@ impl<R: CommandRunner> SystemFacade<R> {
         generation: u64,
         request: SessionActionRequest,
     ) -> Result<SessionActionResult, SystemError> {
-        self.begin(generation)?;
+        self.accept_generation(generation)?;
         if request.schema_version != SCHEMA_VERSION {
             return Err(SystemError::new(
                 SystemErrorKind::InvalidRequest,
@@ -294,7 +339,12 @@ impl<R: CommandRunner> SystemFacade<R> {
             ));
         }
         let action = request.action;
-        let result = match run_checked(&self.runner, session::command(action)) {
+        let request_runner = RequestRunner::new(
+            self.runner.clone(),
+            generation,
+            Arc::clone(&self.latest_generation),
+        );
+        let result = match run_checked(&request_runner, session::command(action)) {
             Ok(_) => SessionActionResult {
                 schema_version: SCHEMA_VERSION,
                 generation,
@@ -311,19 +361,34 @@ impl<R: CommandRunner> SystemFacade<R> {
             },
         };
         self.ensure_current(generation)?;
-        Ok(result)
+        validate_assembled_session_result(result)
     }
 
-    fn begin(&self, generation: u64) -> Result<(), SystemError> {
+    fn accept_generation(&self, generation: u64) -> Result<(), SystemError> {
         if generation == 0 {
             return Err(SystemError::new(
                 SystemErrorKind::InvalidGeneration,
                 "generation must be a positive u64 supplied by the client",
             ));
         }
-        self.latest_generation
-            .fetch_max(generation, Ordering::SeqCst);
-        Ok(())
+        let mut current = self.latest_generation.load(Ordering::SeqCst);
+        loop {
+            if generation <= current {
+                return Err(SystemError::new(
+                    SystemErrorKind::Stale,
+                    "generation must be strictly greater than every accepted request",
+                ));
+            }
+            match self.latest_generation.compare_exchange(
+                current,
+                generation,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn ensure_current(&self, generation: u64) -> Result<(), SystemError> {
@@ -367,25 +432,36 @@ impl<R: CommandRunner> CommandRunner for RequestRunner<R> {
         }
         let mut command = command.clone();
         command.timeout = command.timeout.min(remaining);
-        self.inner.run(&command)
+        let control = RunControl::for_generation(
+            self.deadline,
+            self.generation,
+            Arc::clone(&self.latest_generation),
+        );
+        self.inner.run_controlled(&command, &control)
     }
 }
 
-fn spawn_probe<R, F>(runner: R, sender: mpsc::Sender<ProbeResult>, probe: F)
+fn spawn_probe<R, F>(
+    runner: R,
+    sender: mpsc::Sender<ProbeResult>,
+    probe: F,
+) -> std::thread::JoinHandle<()>
 where
     R: CommandRunner,
     F: FnOnce(R) -> ProbeResult + Send + 'static,
 {
     std::thread::spawn(move || {
         let _ = sender.send(probe(runner));
-    });
+    })
 }
 
 #[derive(Default)]
 struct SnapshotParts {
     network: Option<Result<NetworkState, ProbeFailure>>,
     bluetooth: Option<Result<BluetoothState, ProbeFailure>>,
-    audio: Option<Result<AudioState, ProbeFailure>>,
+    audio_output: Option<Result<audio::LevelState, ProbeFailure>>,
+    audio_microphone: Option<Result<audio::LevelState, ProbeFailure>>,
+    audio_devices: Option<Result<audio::DeviceState, ProbeFailure>>,
     brightness: Option<Result<f64, ProbeFailure>>,
     night_light: Option<Result<bool, ProbeFailure>>,
     power_profiles: Option<ProfileProbe>,
@@ -400,7 +476,9 @@ type BatteryProbe = Result<(Option<f64>, Option<bool>), ProbeFailure>;
 enum ProbeResult {
     Network(Result<NetworkState, ProbeFailure>),
     Bluetooth(Result<BluetoothState, ProbeFailure>),
-    Audio(Result<AudioState, ProbeFailure>),
+    AudioOutput(Result<audio::LevelState, ProbeFailure>),
+    AudioMicrophone(Result<audio::LevelState, ProbeFailure>),
+    AudioDevices(Result<audio::DeviceState, ProbeFailure>),
     Brightness(Result<f64, ProbeFailure>),
     NightLight(Result<bool, ProbeFailure>),
     PowerProfiles(ProfileProbe),
@@ -414,7 +492,9 @@ impl SnapshotParts {
         match result {
             ProbeResult::Network(value) => self.network = Some(value),
             ProbeResult::Bluetooth(value) => self.bluetooth = Some(value),
-            ProbeResult::Audio(value) => self.audio = Some(value),
+            ProbeResult::AudioOutput(value) => self.audio_output = Some(value),
+            ProbeResult::AudioMicrophone(value) => self.audio_microphone = Some(value),
+            ProbeResult::AudioDevices(value) => self.audio_devices = Some(value),
             ProbeResult::Brightness(value) => self.brightness = Some(value),
             ProbeResult::NightLight(value) => self.night_light = Some(value),
             ProbeResult::PowerProfiles(value) => self.power_profiles = Some(value),
@@ -429,7 +509,11 @@ impl SnapshotParts {
             .get_or_insert_with(|| Err(ProbeFailure::timeout()));
         self.bluetooth
             .get_or_insert_with(|| Err(ProbeFailure::timeout()));
-        self.audio
+        self.audio_output
+            .get_or_insert_with(|| Err(ProbeFailure::timeout()));
+        self.audio_microphone
+            .get_or_insert_with(|| Err(ProbeFailure::timeout()));
+        self.audio_devices
             .get_or_insert_with(|| Err(ProbeFailure::timeout()));
         self.brightness
             .get_or_insert_with(|| Err(ProbeFailure::timeout()));
@@ -458,15 +542,24 @@ impl SnapshotParts {
             &mut capabilities,
             &mut diagnostics,
         );
-        let audio = record_group(
-            self.audio.expect("filled"),
+        let audio_output = record_group(
+            self.audio_output.expect("filled"),
+            &[CapabilityId::AudioVolume, CapabilityId::AudioMuted],
+            &mut capabilities,
+            &mut diagnostics,
+        );
+        let audio_microphone = record_group(
+            self.audio_microphone.expect("filled"),
             &[
-                CapabilityId::AudioVolume,
-                CapabilityId::AudioMuted,
                 CapabilityId::AudioMicrophoneLevel,
                 CapabilityId::AudioMicrophoneMuted,
-                CapabilityId::AudioOutputDevice,
             ],
+            &mut capabilities,
+            &mut diagnostics,
+        );
+        let audio_devices = record_group(
+            self.audio_devices.expect("filled"),
+            &[CapabilityId::AudioOutputDevice],
             &mut capabilities,
             &mut diagnostics,
         );
@@ -502,6 +595,31 @@ impl SnapshotParts {
         );
         let display = (brightness.is_some() || night_light.is_some())
             .then(|| display::state(brightness, night_light.unwrap_or(false)));
+        let audio = (audio_output.is_some()
+            || audio_microphone.is_some()
+            || audio_devices.is_some())
+        .then(|| {
+            let output = audio_output.unwrap_or(audio::LevelState {
+                level: 0.0,
+                muted: false,
+            });
+            let microphone = audio_microphone.unwrap_or(audio::LevelState {
+                level: 0.0,
+                muted: false,
+            });
+            let devices = audio_devices.unwrap_or(audio::DeviceState {
+                selected_id: None,
+                devices: Vec::new(),
+            });
+            AudioState {
+                volume: output.level,
+                muted: output.muted,
+                microphone_level: microphone.level,
+                microphone_muted: microphone.muted,
+                output_device_id: devices.selected_id,
+                output_devices: devices.devices,
+            }
+        });
         let power = (profiles.is_some() || battery.is_some()).then(|| {
             let (current_profile, available_profiles) = profiles.unwrap_or_default();
             let (battery_level, charging) = battery.unwrap_or_default();
@@ -561,6 +679,55 @@ fn record_group<T>(
             None
         }
     }
+}
+
+fn validate_assembled_snapshot(snapshot: SystemSnapshot) -> Result<SystemSnapshot, SystemError> {
+    let json = serde_json::to_string(&snapshot).map_err(|error| {
+        SystemError::new(
+            SystemErrorKind::Parse,
+            format!("could not serialize assembled snapshot: {error}"),
+        )
+    })?;
+    validate_system_snapshot(&json).map_err(|error| {
+        SystemError::new(
+            SystemErrorKind::Parse,
+            format!("assembled snapshot violates the SDK contract: {error}"),
+        )
+    })
+}
+
+fn validate_assembled_mutation_result(
+    result: SystemMutationResult,
+) -> Result<SystemMutationResult, SystemError> {
+    let json = serde_json::to_string(&result).map_err(|error| {
+        SystemError::new(
+            SystemErrorKind::Parse,
+            format!("could not serialize assembled mutation result: {error}"),
+        )
+    })?;
+    validate_system_mutation_result(&json).map_err(|error| {
+        SystemError::new(
+            SystemErrorKind::Parse,
+            format!("assembled mutation result violates the SDK contract: {error}"),
+        )
+    })
+}
+
+fn validate_assembled_session_result(
+    result: SessionActionResult,
+) -> Result<SessionActionResult, SystemError> {
+    let json = serde_json::to_string(&result).map_err(|error| {
+        SystemError::new(
+            SystemErrorKind::Parse,
+            format!("could not serialize assembled session result: {error}"),
+        )
+    })?;
+    validate_session_action_result(&json).map_err(|error| {
+        SystemError::new(
+            SystemErrorKind::Parse,
+            format!("assembled session result violates the SDK contract: {error}"),
+        )
+    })
 }
 
 pub fn mutation_command(mutation: &SystemMutation) -> Result<CommandSpec, SystemError> {

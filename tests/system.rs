@@ -1,6 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    fs,
+    os::unix::fs::PermissionsExt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -9,8 +14,8 @@ use sleepy_sdk::{
     SessionActionRequest, SessionActionStatus, SystemMutation,
 };
 use sleepy_session::system::{
-    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunnerError, RunnerErrorKind,
-    SystemErrorKind, SystemFacade,
+    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunControl, RunnerError,
+    RunnerErrorKind, SystemErrorKind, SystemFacade,
 };
 
 #[derive(Clone, Default)]
@@ -59,6 +64,24 @@ impl ScriptedRunner {
 
 impl CommandRunner for ScriptedRunner {
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+        self.execute(command, None)
+    }
+
+    fn run_controlled(
+        &self,
+        command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        self.execute(command, Some(control))
+    }
+}
+
+impl ScriptedRunner {
+    fn execute(
+        &self,
+        command: &CommandSpec,
+        control: Option<&RunControl>,
+    ) -> Result<CommandOutput, RunnerError> {
         self.calls.lock().unwrap().push(command.clone());
         let response = self
             .responses
@@ -67,8 +90,14 @@ impl CommandRunner for ScriptedRunner {
             .get(&(command.program.clone(), command.args.clone()))
             .cloned()
             .unwrap_or_else(|| panic!("unexpected command: {command:?}"));
-        if !response.delay.is_zero() {
-            std::thread::sleep(response.delay);
+        let started = Instant::now();
+        while started.elapsed() < response.delay {
+            if control
+                .is_some_and(|control| control.is_cancelled() || control.remaining().is_zero())
+            {
+                return Err(RunnerError::timeout("scripted request cancelled"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
         response.result
     }
@@ -330,18 +359,216 @@ fn mutation_uses_typed_fixed_command_then_confirmed_same_generation_readback() {
 }
 
 #[test]
-fn fixture_matrix_names_every_adapter_and_required_outcome() {
-    let matrix: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/system/outcomes.json")).unwrap();
-    assert_eq!(matrix["adapters"].as_array().unwrap().len(), 9);
-    assert_eq!(
-        matrix["outcomes"],
-        serde_json::json!(["valid", "unsupported", "malformed", "nonzero", "timeout"])
-    );
-    assert_eq!(
-        include_str!("fixtures/system/nmcli-malformed.txt").trim(),
-        "maybe"
-    );
+fn executable_adapter_fixture_matrix_classifies_every_outcome() {
+    struct AdapterCase {
+        name: &'static str,
+        program: &'static str,
+        args: &'static [&'static str],
+        malformed: &'static str,
+        capability: CapabilityId,
+    }
+    let cases = [
+        AdapterCase {
+            name: "network",
+            program: "nmcli",
+            args: &["--terse", "--fields", "WIFI", "general"],
+            malformed: include_str!("fixtures/system/nmcli-malformed.txt"),
+            capability: CapabilityId::NetworkEnabled,
+        },
+        AdapterCase {
+            name: "bluetooth",
+            program: "bluetoothctl",
+            args: &["show"],
+            malformed: include_str!("fixtures/system/bluetoothctl-malformed.txt"),
+            capability: CapabilityId::BluetoothEnabled,
+        },
+        AdapterCase {
+            name: "audio-output",
+            program: "wpctl",
+            args: &["get-volume", "@DEFAULT_AUDIO_SINK@"],
+            malformed: include_str!("fixtures/system/wpctl-volume-malformed.txt"),
+            capability: CapabilityId::AudioVolume,
+        },
+        AdapterCase {
+            name: "audio-microphone",
+            program: "wpctl",
+            args: &["get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+            malformed: include_str!("fixtures/system/wpctl-volume-malformed.txt"),
+            capability: CapabilityId::AudioMicrophoneLevel,
+        },
+        AdapterCase {
+            name: "audio-devices",
+            program: "wpctl",
+            args: &["status", "--name"],
+            malformed: include_str!("fixtures/system/wpctl-status-duplicate-id.txt"),
+            capability: CapabilityId::AudioOutputDevice,
+        },
+        AdapterCase {
+            name: "brightness",
+            program: "brightnessctl",
+            args: &["--machine-readable", "info"],
+            malformed: include_str!("fixtures/system/brightnessctl-malformed.txt"),
+            capability: CapabilityId::DisplayBrightness,
+        },
+        AdapterCase {
+            name: "night-light",
+            program: "systemctl",
+            args: &["--user", "is-active", "gammastep.service"],
+            malformed: include_str!("fixtures/system/gammastep-malformed.txt"),
+            capability: CapabilityId::DisplayNightLightEnabled,
+        },
+        AdapterCase {
+            name: "power-profile",
+            program: "powerprofilesctl",
+            args: &["get"],
+            malformed: include_str!("fixtures/system/powerprofilesctl-malformed.txt"),
+            capability: CapabilityId::PowerProfile,
+        },
+        AdapterCase {
+            name: "battery",
+            program: "upower",
+            args: &[
+                "--show-info",
+                "/org/freedesktop/UPower/devices/DisplayDevice",
+            ],
+            malformed: include_str!("fixtures/system/upower-malformed.txt"),
+            capability: CapabilityId::BatteryStatus,
+        },
+        AdapterCase {
+            name: "media",
+            program: "playerctl",
+            args: &[
+                "metadata",
+                "--format",
+                "{{status}}\\t{{title}}\\t{{artist}}",
+            ],
+            malformed: include_str!("fixtures/system/playerctl-malformed.txt"),
+            capability: CapabilityId::MediaTransport,
+        },
+    ];
+
+    for case in cases {
+        let valid = SystemFacade::new(base_runner()).snapshot(1).unwrap();
+        assert_eq!(
+            valid.capabilities[&case.capability],
+            CapabilityState::Available,
+            "{} valid",
+            case.name
+        );
+
+        let outcomes = [
+            (
+                "unsupported",
+                ScriptedResponse {
+                    delay: Duration::ZERO,
+                    result: Err(RunnerError::spawn("fixture executable missing")),
+                },
+                CapabilityState::Unavailable,
+                sleepy_sdk::CapabilityErrorKind::Unsupported,
+            ),
+            (
+                "malformed",
+                ScriptedResponse {
+                    delay: Duration::ZERO,
+                    result: Ok(CommandOutput {
+                        status: 0,
+                        stdout: case.malformed.as_bytes().to_vec(),
+                        stderr: vec![],
+                    }),
+                },
+                CapabilityState::Error,
+                sleepy_sdk::CapabilityErrorKind::Parse,
+            ),
+            (
+                "nonzero",
+                ScriptedResponse {
+                    delay: Duration::ZERO,
+                    result: Ok(CommandOutput {
+                        status: 8,
+                        stdout: vec![],
+                        stderr: b"fixture failure".to_vec(),
+                    }),
+                },
+                CapabilityState::Error,
+                sleepy_sdk::CapabilityErrorKind::Command,
+            ),
+            (
+                "timeout",
+                ScriptedResponse {
+                    delay: Duration::ZERO,
+                    result: Err(RunnerError::timeout("fixture timeout")),
+                },
+                CapabilityState::Error,
+                sleepy_sdk::CapabilityErrorKind::Timeout,
+            ),
+        ];
+        for (outcome, response, expected_state, expected_kind) in outcomes {
+            let snapshot =
+                SystemFacade::new(base_runner().failure(case.program, case.args, response))
+                    .snapshot(1)
+                    .unwrap();
+            assert_eq!(
+                snapshot.capabilities[&case.capability], expected_state,
+                "{} {outcome}",
+                case.name
+            );
+            assert_eq!(
+                snapshot.diagnostics[&case.capability].kind, expected_kind,
+                "{} {outcome}",
+                case.name
+            );
+        }
+    }
+
+    for (outcome, response, expected) in [
+        ("valid", None, CapabilityState::Available),
+        (
+            "unsupported",
+            Some(Err(RunnerError::spawn("missing"))),
+            CapabilityState::Unavailable,
+        ),
+        (
+            "malformed-payload-ignored",
+            Some(Ok(CommandOutput {
+                status: 0,
+                stdout: b"not a version".to_vec(),
+                stderr: vec![],
+            })),
+            CapabilityState::Available,
+        ),
+        (
+            "nonzero",
+            Some(Ok(CommandOutput {
+                status: 8,
+                stdout: vec![],
+                stderr: vec![],
+            })),
+            CapabilityState::Error,
+        ),
+        (
+            "timeout",
+            Some(Err(RunnerError::timeout("timeout"))),
+            CapabilityState::Busy,
+        ),
+    ] {
+        let runner = match response {
+            None => base_runner(),
+            Some(result) => base_runner().failure(
+                "swaylock",
+                &["--version"],
+                ScriptedResponse {
+                    delay: Duration::ZERO,
+                    result,
+                },
+            ),
+        };
+        let snapshot = SystemFacade::new(runner).snapshot(1).unwrap();
+        assert_eq!(
+            snapshot.session_actions[&SessionAction::Lock],
+            expected,
+            "session {outcome}"
+        );
+    }
 }
 
 #[test]
@@ -369,6 +596,58 @@ fn process_runner_rejects_output_over_the_capture_limit() {
     let error = ProcessCommandRunner.run(&command).unwrap_err();
     assert_eq!(error.kind(), RunnerErrorKind::Io);
     assert!(error.message().contains("bounded capture limit"));
+}
+
+#[test]
+fn process_runner_kills_and_reaps_a_superseded_real_child() {
+    let root = tempfile::TempDir::new().unwrap();
+    let script = root.path().join("observable-child");
+    let pid_file = root.path().join("pid");
+    let survived = root.path().join("survived");
+    fs::write(
+        &script,
+        "#!/bin/sh\necho $$ > \"$1\"\nwhile :; do :; done\necho survived > \"$2\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let latest = Arc::new(AtomicU64::new(1));
+    let control = RunControl::for_generation(
+        Instant::now() + Duration::from_secs(5),
+        1,
+        Arc::clone(&latest),
+    );
+    let command = CommandSpec {
+        program: script.to_string_lossy().into_owned(),
+        args: vec![
+            pid_file.to_string_lossy().into_owned(),
+            survived.to_string_lossy().into_owned(),
+        ],
+        env: vec![("LC_ALL".to_owned(), "C".to_owned())],
+        timeout: Duration::from_secs(5),
+    };
+    let child = std::thread::spawn(move || ProcessCommandRunner.run_controlled(&command, &control));
+    for _ in 0..200 {
+        if pid_file.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    latest.store(2, Ordering::SeqCst);
+    let error = child.join().unwrap().unwrap_err();
+    assert_eq!(error.kind(), RunnerErrorKind::Cancelled);
+    assert!(!survived.exists());
+    let alive = unsafe { libc::kill(pid, 0) };
+    assert_eq!(alive, -1, "cancelled child PID must have been reaped");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
 }
 
 #[test]
@@ -654,6 +933,38 @@ fn generation_zero_is_rejected_for_every_operation() {
 }
 
 #[test]
+fn lower_and_equal_generations_are_rejected_before_destructive_execution() {
+    let runner = ScriptedRunner::default().output("swaylock", &["--daemonize"], "");
+    let facade = SystemFacade::new(runner.clone());
+    facade
+        .perform(
+            10,
+            SessionActionRequest {
+                schema_version: 1,
+                action: SessionAction::Lock,
+                confirmed: true,
+            },
+        )
+        .unwrap();
+    let accepted_calls = runner.calls().len();
+
+    for generation in [9, 10] {
+        let error = facade
+            .perform(
+                generation,
+                SessionActionRequest {
+                    schema_version: 1,
+                    action: SessionAction::PowerOff,
+                    confirmed: true,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), SystemErrorKind::Stale);
+        assert_eq!(runner.calls().len(), accepted_calls);
+    }
+}
+
+#[test]
 fn nonzero_timeout_and_parse_failures_keep_distinct_diagnostics() {
     let nonzero = ScriptedResponse {
         delay: Duration::ZERO,
@@ -781,6 +1092,81 @@ fn absent_battery_does_not_disable_power_profiles() {
     assert_eq!(
         snapshot.power.unwrap().current_profile,
         Some(PowerProfile::Balanced)
+    );
+}
+
+#[test]
+fn missing_microphone_preserves_healthy_output_audio_capabilities() {
+    let runner = base_runner().failure(
+        "wpctl",
+        &["get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+        ScriptedResponse {
+            delay: Duration::ZERO,
+            result: Err(RunnerError::spawn("no microphone")),
+        },
+    );
+    let snapshot = SystemFacade::new(runner).snapshot(1).unwrap();
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::AudioVolume],
+        CapabilityState::Available
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::AudioMuted],
+        CapabilityState::Available
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::AudioMicrophoneLevel],
+        CapabilityState::Unavailable
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::AudioMicrophoneMuted],
+        CapabilityState::Unavailable
+    );
+    assert_eq!(snapshot.audio.unwrap().volume, 0.42);
+}
+
+#[test]
+fn duplicate_or_multiple_default_audio_devices_are_parse_errors_only_for_devices() {
+    for fixture in [
+        include_str!("fixtures/system/wpctl-status-duplicate-id.txt"),
+        include_str!("fixtures/system/wpctl-status-two-defaults.txt"),
+    ] {
+        let runner = base_runner().output("wpctl", &["status", "--name"], fixture);
+        let snapshot = SystemFacade::new(runner).snapshot(1).unwrap();
+        assert_eq!(
+            snapshot.capabilities[&CapabilityId::AudioVolume],
+            CapabilityState::Available
+        );
+        assert_eq!(
+            snapshot.capabilities[&CapabilityId::AudioOutputDevice],
+            CapabilityState::Error
+        );
+        assert_eq!(
+            snapshot.diagnostics[&CapabilityId::AudioOutputDevice].kind,
+            sleepy_sdk::CapabilityErrorKind::Parse
+        );
+    }
+}
+
+#[test]
+fn power_current_profile_must_be_in_available_profiles() {
+    let runner = base_runner().output(
+        "powerprofilesctl",
+        &["list"],
+        include_str!("fixtures/system/powerprofilesctl-missing-current.txt"),
+    );
+    let snapshot = SystemFacade::new(runner).snapshot(1).unwrap();
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::PowerProfile],
+        CapabilityState::Error
+    );
+    assert_eq!(
+        snapshot.diagnostics[&CapabilityId::PowerProfile].kind,
+        sleepy_sdk::CapabilityErrorKind::Parse
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::BatteryStatus],
+        CapabilityState::Available
     );
 }
 

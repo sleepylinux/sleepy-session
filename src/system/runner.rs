@@ -2,6 +2,10 @@ use std::{
     fmt,
     io::Read,
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -91,6 +95,56 @@ impl std::error::Error for RunnerError {}
 
 pub trait CommandRunner: Clone + Send + Sync + 'static {
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError>;
+
+    fn run_controlled(
+        &self,
+        command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        if control.is_cancelled() {
+            return Err(RunnerError::cancelled());
+        }
+        self.run(command)
+    }
+}
+
+#[derive(Clone)]
+pub struct RunControl {
+    deadline: Instant,
+    generation: Option<u64>,
+    latest_generation: Option<Arc<AtomicU64>>,
+}
+
+impl RunControl {
+    pub fn for_generation(
+        deadline: Instant,
+        generation: u64,
+        latest_generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            deadline,
+            generation: Some(generation),
+            latest_generation: Some(latest_generation),
+        }
+    }
+
+    fn for_timeout(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+            generation: None,
+            latest_generation: None,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.generation
+            .zip(self.latest_generation.as_ref())
+            .is_some_and(|(generation, latest)| generation < latest.load(Ordering::SeqCst))
+    }
+
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -98,6 +152,27 @@ pub struct ProcessCommandRunner;
 
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+        self.execute(spec, &RunControl::for_timeout(spec.timeout))
+    }
+
+    fn run_controlled(
+        &self,
+        spec: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        self.execute(spec, control)
+    }
+}
+
+impl ProcessCommandRunner {
+    fn execute(
+        &self,
+        spec: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        if control.is_cancelled() {
+            return Err(RunnerError::cancelled());
+        }
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -119,23 +194,23 @@ impl CommandRunner for ProcessCommandRunner {
         let stderr_reader = thread::spawn(move || read_capped(stderr));
         let started = Instant::now();
         let status = loop {
+            if control.is_cancelled() {
+                terminate_and_reap(&mut child, stdout_reader, stderr_reader);
+                return Err(RunnerError::cancelled());
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() < spec.timeout => {
+                Ok(None) if started.elapsed() < spec.timeout && !control.remaining().is_zero() => {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
+                    terminate_and_reap(&mut child, stdout_reader, stderr_reader);
                     return Err(RunnerError::timeout(
                         "adapter command exceeded its deadline",
                     ));
                 }
                 Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_and_reap(&mut child, stdout_reader, stderr_reader);
                     return Err(RunnerError::new(
                         RunnerErrorKind::Io,
                         format!("could not wait for adapter command: {error}"),
@@ -155,6 +230,17 @@ impl CommandRunner for ProcessCommandRunner {
             stderr,
         })
     }
+}
+
+fn terminate_and_reap(
+    child: &mut std::process::Child,
+    stdout_reader: thread::JoinHandle<Result<Vec<u8>, RunnerError>>,
+    stderr_reader: thread::JoinHandle<Result<Vec<u8>, RunnerError>>,
+) {
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
 }
 
 fn read_capped(mut reader: impl Read) -> Result<Vec<u8>, RunnerError> {

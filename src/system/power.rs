@@ -24,6 +24,11 @@ pub(crate) fn probe_profiles<R: CommandRunner>(
     if available_profiles.is_empty() {
         return Err(ProbeFailure::parse("powerprofilesctl reported no profiles"));
     }
+    if current_profile.is_some_and(|current| !available_profiles.contains(&current)) {
+        return Err(ProbeFailure::parse(
+            "powerprofilesctl current profile is not available",
+        ));
+    }
     Ok((current_profile, available_profiles))
 }
 

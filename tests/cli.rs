@@ -18,6 +18,53 @@ fn command(root: &TempDir) -> Command {
     command
 }
 
+fn install_fake_system_tools(root: &TempDir) -> std::path::PathBuf {
+    let bin = root.path().join("system-bin");
+    fs::create_dir(&bin).unwrap();
+    let script = r#"#!/bin/sh
+tool=${0##*/}
+case "$tool" in
+  nmcli)
+    if [ "$3" = "WIFI" ]; then printf 'enabled\n'; else printf '*:Sleepy WiFi:73\n'; fi ;;
+  bluetoothctl)
+    if [ "$1" = "show" ]; then printf 'Powered: yes\n'; else printf 'Device AA:BB Moonbuds\n'; fi ;;
+  wpctl)
+    if [ "$1" = "get-volume" ] && [ "$2" = "@DEFAULT_AUDIO_SINK@" ]; then printf 'Volume: 0.42\n'
+    elif [ "$1" = "get-volume" ]; then printf 'Volume: 0.31 [MUTED]\n'
+    else printf 'Audio\n ├─ Sinks:\n │  * 52. Built-in Audio [vol: 0.42]\n ├─ Sources:\n'; fi ;;
+  brightnessctl) printf 'backlight,backlight,500,50%%,1000\n' ;;
+  powerprofilesctl)
+    if [ "$1" = "get" ]; then printf 'balanced\n'
+    elif [ "${SLEEPY_TEST_INVALID_POWER:-}" = "1" ]; then printf '* balanced:\n  balanced:\n'
+    else printf '* balanced:\n  performance:\n  power-saver:\n'; fi ;;
+  upower) printf 'state: charging\npercentage: 81%%\n' ;;
+  playerctl) printf 'Playing\tNight Drive\tSleepy Artist\n' ;;
+  systemctl)
+    if [ "$1" = "--user" ]; then printf 'active\n'; else printf 'systemd 260\n'; fi ;;
+  swaylock) printf 'swaylock 1.8\n' ;;
+  niri) printf 'niri 26.04\n' ;;
+  *) exit 2 ;;
+esac
+"#;
+    for tool in [
+        "nmcli",
+        "bluetoothctl",
+        "wpctl",
+        "brightnessctl",
+        "powerprofilesctl",
+        "upower",
+        "playerctl",
+        "systemctl",
+        "swaylock",
+        "niri",
+    ] {
+        let path = bin.join(tool);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
 fn user_preset(id: &str, name: &str) -> Value {
     json!({
         "schemaVersion": 1,
@@ -80,6 +127,44 @@ fn cli_system_commands_require_and_echo_a_positive_client_generation() {
             "invalid_generation"
         );
     }
+}
+
+#[test]
+fn cli_system_show_returns_only_an_sdk_validated_snapshot() {
+    let root = TempDir::new().unwrap();
+    let bin = install_fake_system_tools(&root);
+    let output = command(&root)
+        .env("PATH", bin)
+        .args(["system", "show", "--generation", "72"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot =
+        sleepy_sdk::validate_system_snapshot(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(snapshot.generation, 72);
+}
+
+#[test]
+fn cli_system_show_rejects_an_sdk_invalid_assembled_snapshot() {
+    let root = TempDir::new().unwrap();
+    let bin = install_fake_system_tools(&root);
+    let output = command(&root)
+        .env("PATH", bin)
+        .env("SLEEPY_TEST_INVALID_POWER", "1")
+        .args(["system", "show", "--generation", "73"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "parse");
+    assert!(error["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("SDK contract"));
 }
 
 #[test]

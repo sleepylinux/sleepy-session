@@ -1,27 +1,45 @@
-use sleepy_sdk::{AudioOutputDevice, AudioState};
+use std::collections::BTreeSet;
+
+use sleepy_sdk::AudioOutputDevice;
 
 use super::{run_checked, CommandRunner, CommandSpec, ProbeFailure};
 
-pub(crate) fn probe<R: CommandRunner>(runner: &R) -> Result<AudioState, ProbeFailure> {
-    let sink = run_checked(
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LevelState {
+    pub(crate) level: f64,
+    pub(crate) muted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceState {
+    pub(crate) selected_id: Option<String>,
+    pub(crate) devices: Vec<AudioOutputDevice>,
+}
+
+pub(crate) fn probe_output<R: CommandRunner>(runner: &R) -> Result<LevelState, ProbeFailure> {
+    let output = run_checked(
         runner,
         CommandSpec::new("wpctl", ["get-volume", "@DEFAULT_AUDIO_SINK@"]),
     )?;
-    let source = run_checked(
+    let (level, muted) = parse_volume(&output)?;
+    Ok(LevelState { level, muted })
+}
+
+pub(crate) fn probe_microphone<R: CommandRunner>(runner: &R) -> Result<LevelState, ProbeFailure> {
+    let output = run_checked(
         runner,
         CommandSpec::new("wpctl", ["get-volume", "@DEFAULT_AUDIO_SOURCE@"]),
     )?;
+    let (level, muted) = parse_volume(&output)?;
+    Ok(LevelState { level, muted })
+}
+
+pub(crate) fn probe_devices<R: CommandRunner>(runner: &R) -> Result<DeviceState, ProbeFailure> {
     let status = run_checked(runner, CommandSpec::new("wpctl", ["status", "--name"]))?;
-    let (volume, muted) = parse_volume(&sink)?;
-    let (microphone_level, microphone_muted) = parse_volume(&source)?;
-    let (output_device_id, output_devices) = parse_sinks(&status)?;
-    Ok(AudioState {
-        volume,
-        muted,
-        microphone_level,
-        microphone_muted,
-        output_device_id,
-        output_devices,
+    let (selected_id, devices) = parse_sinks(&status)?;
+    Ok(DeviceState {
+        selected_id,
+        devices,
     })
 }
 
@@ -48,6 +66,7 @@ fn parse_sinks(bytes: &[u8]) -> Result<(Option<String>, Vec<AudioOutputDevice>),
         .map_err(|_| ProbeFailure::parse("wpctl status output is not UTF-8"))?;
     let mut in_sinks = false;
     let mut devices = Vec::new();
+    let mut ids = BTreeSet::new();
     for line in text.lines() {
         let trimmed = line.trim_start_matches([' ', '│', '├', '─']);
         if trimmed == "Sinks:" {
@@ -68,6 +87,9 @@ fn parse_sinks(bytes: &[u8]) -> Result<(Option<String>, Vec<AudioOutputDevice>),
         if id.parse::<u64>().is_err() {
             return Err(ProbeFailure::parse("wpctl sink id is invalid"));
         }
+        if !ids.insert(id.to_owned()) {
+            return Err(ProbeFailure::parse("wpctl sink ids are not unique"));
+        }
         let label = rest.split(" [").next().unwrap_or(rest).trim().to_owned();
         if label.is_empty() {
             return Err(ProbeFailure::parse("wpctl sink label is empty"));
@@ -81,9 +103,12 @@ fn parse_sinks(bytes: &[u8]) -> Result<(Option<String>, Vec<AudioOutputDevice>),
     if devices.is_empty() {
         return Err(ProbeFailure::parse("wpctl did not report any sinks"));
     }
-    let default = devices
-        .iter()
-        .find(|device| device.is_default)
-        .map(|device| device.id.clone());
+    let defaults: Vec<_> = devices.iter().filter(|device| device.is_default).collect();
+    if defaults.len() != 1 {
+        return Err(ProbeFailure::parse(
+            "wpctl sinks require exactly one default",
+        ));
+    }
+    let default = Some(defaults[0].id.clone());
     Ok((default, devices))
 }
