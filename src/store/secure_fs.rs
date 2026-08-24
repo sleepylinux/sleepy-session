@@ -47,6 +47,18 @@ pub(crate) enum PublicationBoundary {
     DirectorySynced,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SecureFileSnapshot {
+    bytes: Vec<u8>,
+    device: u64,
+    inode: u64,
+    size: i64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
 pub(crate) enum SecureEntry {
     Regular(Vec<u8>),
     Directory(SecureDir),
@@ -171,6 +183,35 @@ impl SecureDir {
         })
     }
 
+    pub fn snapshot_regular(&self, name: &OsStr) -> Result<Option<SecureFileSnapshot>, StoreError> {
+        let Some(file) = self.open_regular_optional(name, libc::O_RDONLY | libc::O_NONBLOCK)?
+        else {
+            return Ok(None);
+        };
+        let before = fstat(file.as_raw_fd()).map_err(StoreError::io)?;
+        let mut file = File::from(file);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(StoreError::io)?;
+        let after = fstat(file.as_raw_fd()).map_err(StoreError::io)?;
+        let before = snapshot_metadata(before);
+        let after = snapshot_metadata(after);
+        if before != after {
+            return Err(StoreError::conflict(format!(
+                "{} changed while it was being snapshotted",
+                self.display_path.join(name).display()
+            )));
+        }
+        Ok(Some(SecureFileSnapshot { bytes, ..before }))
+    }
+
+    pub fn snapshot_matches(
+        &self,
+        name: &OsStr,
+        expected: &SecureFileSnapshot,
+    ) -> Result<bool, StoreError> {
+        Ok(self.snapshot_regular(name)?.as_ref() == Some(expected))
+    }
+
     pub fn exists(&self, name: &OsStr) -> Result<bool, StoreError> {
         match self.open_regular_optional(name, libc::O_RDONLY | libc::O_NONBLOCK)? {
             Some(_) => Ok(true),
@@ -242,6 +283,27 @@ impl SecureDir {
         temporary: &OsStr,
         destination: &OsStr,
         bytes: &[u8],
+        observe: impl FnMut(PublicationBoundary) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.publish_new_inner(temporary, destination, bytes, false, observe)
+    }
+
+    pub fn publish_new_no_replace(
+        &self,
+        temporary: &OsStr,
+        destination: &OsStr,
+        bytes: &[u8],
+        observe: impl FnMut(PublicationBoundary) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        self.publish_new_inner(temporary, destination, bytes, true, observe)
+    }
+
+    fn publish_new_inner(
+        &self,
+        temporary: &OsStr,
+        destination: &OsStr,
+        bytes: &[u8],
+        no_replace: bool,
         mut observe: impl FnMut(PublicationBoundary) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         if self.exists(destination)? {
@@ -259,24 +321,36 @@ impl SecureDir {
             0o600,
         )
         .map_err(|error| map_open_error(&path, error))?;
-        let mut file = File::from(descriptor);
-        let split = if bytes.is_empty() {
-            0
-        } else {
-            (bytes.len() / 2).max(1)
-        };
-        file.write_all(&bytes[..split]).map_err(StoreError::io)?;
-        observe(PublicationBoundary::PartialWritten)?;
-        file.write_all(&bytes[split..]).map_err(StoreError::io)?;
-        observe(PublicationBoundary::FileSyncStarted)?;
-        file.sync_all().map_err(StoreError::io)?;
-        observe(PublicationBoundary::FileSynced)?;
-        drop(file);
-        self.rename(temporary, destination)?;
-        observe(PublicationBoundary::Renamed)?;
-        observe(PublicationBoundary::DirectorySyncStarted)?;
-        self.sync().map_err(StoreError::commit_state_unknown)?;
-        observe(PublicationBoundary::DirectorySynced)
+        let mut published = false;
+        let result = (|| {
+            let mut file = File::from(descriptor);
+            let split = if bytes.is_empty() {
+                0
+            } else {
+                (bytes.len() / 2).max(1)
+            };
+            file.write_all(&bytes[..split]).map_err(StoreError::io)?;
+            observe(PublicationBoundary::PartialWritten)?;
+            file.write_all(&bytes[split..]).map_err(StoreError::io)?;
+            observe(PublicationBoundary::FileSyncStarted)?;
+            file.sync_all().map_err(StoreError::io)?;
+            observe(PublicationBoundary::FileSynced)?;
+            drop(file);
+            if no_replace {
+                self.rename_no_replace(temporary, destination)?;
+            } else {
+                self.rename(temporary, destination)?;
+            }
+            published = true;
+            observe(PublicationBoundary::Renamed)?;
+            observe(PublicationBoundary::DirectorySyncStarted)?;
+            self.sync().map_err(StoreError::commit_state_unknown)?;
+            observe(PublicationBoundary::DirectorySynced)
+        })();
+        if result.is_err() && !published {
+            let _ = self.remove_file(temporary);
+        }
+        result
     }
 
     pub fn rename(&self, source: &OsStr, destination: &OsStr) -> Result<(), StoreError> {
@@ -293,6 +367,46 @@ impl SecureDir {
             )
         };
         cvt(result).map_err(StoreError::io)
+    }
+
+    fn rename_no_replace(&self, source: &OsStr, destination: &OsStr) -> Result<(), StoreError> {
+        let source_path = self.display_path.join(source);
+        let destination_path = self.display_path.join(destination);
+        let source = c_string(source, &source_path)?;
+        let destination = c_string(destination, &destination_path)?;
+        #[cfg(target_os = "linux")]
+        {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    self.as_raw_fd(),
+                    source.as_ptr(),
+                    self.as_raw_fd(),
+                    destination.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    Err(StoreError::conflict(format!(
+                        "{} already exists",
+                        destination_path.display()
+                    )))
+                } else {
+                    Err(StoreError::io(error))
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source, destination);
+            Err(StoreError::unsupported(
+                "atomic no-replace publication requires renameat2",
+            ))
+        }
     }
 
     pub fn remove_file(&self, name: &OsStr) -> Result<(), StoreError> {
@@ -609,6 +723,19 @@ fn validate_regular_file(descriptor: i32, path: &Path) -> Result<(), StoreError>
         return Err(StoreError::unsafe_path(path.display()));
     }
     Ok(())
+}
+
+fn snapshot_metadata(metadata: libc::stat) -> SecureFileSnapshot {
+    SecureFileSnapshot {
+        bytes: Vec::new(),
+        device: metadata.st_dev,
+        inode: metadata.st_ino,
+        size: metadata.st_size,
+        modified_seconds: metadata.st_mtime,
+        modified_nanoseconds: metadata.st_mtime_nsec,
+        changed_seconds: metadata.st_ctime,
+        changed_nanoseconds: metadata.st_ctime_nsec,
+    }
 }
 
 fn fstat(descriptor: i32) -> io::Result<libc::stat> {

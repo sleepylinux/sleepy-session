@@ -1151,7 +1151,7 @@ fn cli_initialize_reconciles_pending_offline_and_online_required_fails_distinctl
 }
 
 #[test]
-fn cli_initialize_after_online_confirmation_preserves_exact_bytes_and_mtimes() {
+fn cli_initialize_with_matching_include_offline_preserves_exact_bytes_and_mtimes() {
     let root = TempDir::new().unwrap();
     prepare_niri_tree(&root);
     fs::create_dir_all(root.path().join("state")).unwrap();
@@ -1203,7 +1203,7 @@ fn cli_initialize_after_online_confirmation_preserves_exact_bytes_and_mtimes() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&second.stdout).unwrap()["status"],
-        "committed"
+        "reloadPending"
     );
     assert!(!root
         .path()

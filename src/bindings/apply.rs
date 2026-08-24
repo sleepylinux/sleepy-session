@@ -472,6 +472,7 @@ pub enum ApplyStage {
     PublicationRenamed,
     PublicationDirectorySyncStarted,
     PublicationDirectorySynced,
+    BindingStateSnapshotsCaptured,
     NiriSourceEntryEnumerated,
     PreparedSynced,
     PresetRenamed,
@@ -1038,32 +1039,15 @@ pub fn initialize_bindings(
             let include = fs
                 .niri
                 .read_optional(BindingFileSystem::artifact_name(ArtifactKind::Bindings))?;
-            if include.as_deref() == Some(compiled.as_bytes()) {
-                return Ok(Some(ApplyReport {
-                    status: ApplyStatus::Committed,
-                    active_preset_id: settings.active_preset_id,
-                }));
-            }
-            if include.is_none() {
-                let preset_bytes = fs
-                    .handles
-                    .presets
-                    .read(BindingFileSystem::artifact_name(ArtifactKind::Preset))?;
-                let settings_bytes = fs
-                    .handles
-                    .settings
-                    .read(BindingFileSystem::artifact_name(ArtifactKind::Settings))?;
-                return apply_candidate_locked(
+            if include.is_none() || include.as_deref() == Some(compiled.as_bytes()) {
+                return initialize_binding_only_locked(
                     &fs,
                     paths,
                     validator,
                     reloader,
                     &settings.active_preset_id,
-                    CandidateArtifacts {
-                        preset: &preset_bytes,
-                        settings: &settings_bytes,
-                        bindings: compiled.as_bytes(),
-                    },
+                    compiled.as_bytes(),
+                    include.is_none(),
                 )
                 .map(Some)
                 .map_err(store_binding_error);
@@ -1075,6 +1059,297 @@ pub fn initialize_bindings(
         return Ok(report);
     }
     apply_active_bindings(paths, validator, reloader)
+}
+
+fn initialize_binding_only_locked(
+    fs: &BindingFileSystem,
+    paths: &BindingPaths,
+    validator: &dyn BindingValidator,
+    reloader: &dyn BindingReloader,
+    active_preset_id: &str,
+    bindings: &[u8],
+    include_missing: bool,
+) -> Result<ApplyReport, BindingError> {
+    paths.observe(ApplyStage::WritableDirectoriesOpened)?;
+    if fs
+        .handles
+        .presets
+        .exists(BindingFileSystem::journal_name())
+        .map_err(BindingError::from_store)?
+    {
+        return Err(BindingError::new(
+            "transaction_in_progress",
+            "reconcile the existing binding transaction before initializing bindings",
+        ));
+    }
+    if include_missing {
+        validate_candidate_tree(fs, paths, bindings, validator)?;
+    }
+
+    let settings = fs
+        .handles
+        .settings
+        .snapshot_regular(BindingFileSystem::artifact_name(ArtifactKind::Settings))
+        .map_err(BindingError::from_store)?
+        .ok_or_else(|| BindingError::new("concurrent_state_change", "settings disappeared"))?;
+    let presets = fs
+        .handles
+        .presets
+        .snapshot_regular(BindingFileSystem::artifact_name(ArtifactKind::Preset))
+        .map_err(BindingError::from_store)?
+        .ok_or_else(|| BindingError::new("concurrent_state_change", "presets disappeared"))?;
+    paths.observe(ApplyStage::BindingStateSnapshotsCaptured)?;
+    verify_binding_state_snapshots(fs, &settings, &presets)?;
+
+    let mut stream = reloader
+        .subscribe()
+        .map_err(|message| BindingError::new("reload_failed", message))?;
+    if let Some(stream) = stream.as_mut() {
+        stream
+            .await_initial_snapshot(RELOAD_TIMEOUT)
+            .map_err(|message| BindingError::new("reload_failed", message))?;
+    }
+
+    let published = if include_missing {
+        verify_binding_state_snapshots(fs, &settings, &presets)?;
+        let temporary = format!(".sleepy-user-bindings.{}.tmp", Uuid::new_v4());
+        let mut renamed = false;
+        let publication = fs.niri.publish_new_no_replace(
+            temporary.as_ref(),
+            BindingFileSystem::artifact_name(ArtifactKind::Bindings),
+            bindings,
+            |boundary| {
+                if matches!(boundary, crate::store::PublicationBoundary::Renamed) {
+                    renamed = true;
+                }
+                paths
+                    .observe(binding_publication_stage(boundary))
+                    .map_err(store_binding_error)
+            },
+        );
+        if let Err(error) = publication {
+            if !renamed {
+                return Err(BindingError::from_store(error));
+            }
+            let published = fs
+                .niri
+                .snapshot_regular(BindingFileSystem::artifact_name(ArtifactKind::Bindings))
+                .map_err(BindingError::from_store)?;
+            return match published {
+                Some(published) => rollback_new_binding_only_include(
+                    fs,
+                    paths,
+                    reloader,
+                    active_preset_id,
+                    &settings,
+                    &presets,
+                    &published,
+                ),
+                None => Ok(ApplyReport {
+                    status: ApplyStatus::CommitStateUnknown,
+                    active_preset_id: active_preset_id.to_owned(),
+                }),
+            };
+        }
+        Some(
+            fs.niri
+                .snapshot_regular(BindingFileSystem::artifact_name(ArtifactKind::Bindings))
+                .map_err(BindingError::from_store)?
+                .ok_or_else(|| {
+                    BindingError::new("commit_state_unknown", "published bindings disappeared")
+                })?,
+        )
+    } else {
+        Some(
+            fs.niri
+                .snapshot_regular(BindingFileSystem::artifact_name(ArtifactKind::Bindings))
+                .map_err(BindingError::from_store)?
+                .ok_or_else(|| {
+                    BindingError::new("concurrent_state_change", "matching bindings disappeared")
+                })?,
+        )
+    };
+    if !include_missing {
+        let matching = published.expect("matching include has a snapshot");
+        verify_binding_state_snapshots(fs, &settings, &presets)?;
+        verify_binding_snapshot(fs, &matching)?;
+        let Some(mut stream) = stream else {
+            return Ok(ApplyReport {
+                status: ApplyStatus::ReloadPending,
+                active_preset_id: active_preset_id.to_owned(),
+            });
+        };
+        if reload_confirmed(paths, reloader, stream.as_mut(), RELOAD_TIMEOUT)? {
+            verify_binding_state_snapshots(fs, &settings, &presets)?;
+            verify_binding_snapshot(fs, &matching)?;
+            return Ok(ApplyReport {
+                status: ApplyStatus::Committed,
+                active_preset_id: active_preset_id.to_owned(),
+            });
+        }
+        return Ok(ApplyReport {
+            status: ApplyStatus::CommitStateUnknown,
+            active_preset_id: active_preset_id.to_owned(),
+        });
+    }
+
+    let published = published.expect("new include has a snapshot");
+    let candidate_result = (|| -> Result<ApplyReport, BindingError> {
+        verify_binding_state_snapshots(fs, &settings, &presets)?;
+        verify_binding_snapshot(fs, &published)?;
+        let Some(mut stream) = stream else {
+            return Ok(ApplyReport {
+                status: ApplyStatus::ReloadPending,
+                active_preset_id: active_preset_id.to_owned(),
+            });
+        };
+        if reload_confirmed(paths, reloader, stream.as_mut(), RELOAD_TIMEOUT)? {
+            verify_binding_state_snapshots(fs, &settings, &presets)?;
+            verify_binding_snapshot(fs, &published)?;
+            return Ok(ApplyReport {
+                status: ApplyStatus::Committed,
+                active_preset_id: active_preset_id.to_owned(),
+            });
+        }
+        Err(BindingError::new(
+            "reload_rejected",
+            "Niri did not confirm the newly published bindings",
+        ))
+    })();
+    match candidate_result {
+        Ok(report) => Ok(report),
+        Err(_) => rollback_new_binding_only_include(
+            fs,
+            paths,
+            reloader,
+            active_preset_id,
+            &settings,
+            &presets,
+            &published,
+        ),
+    }
+}
+
+fn verify_binding_snapshot(
+    fs: &BindingFileSystem,
+    expected: &crate::store::SecureFileSnapshot,
+) -> Result<(), BindingError> {
+    if fs
+        .niri
+        .snapshot_matches(
+            BindingFileSystem::artifact_name(ArtifactKind::Bindings),
+            expected,
+        )
+        .map_err(BindingError::from_store)?
+    {
+        Ok(())
+    } else {
+        Err(BindingError::new(
+            "concurrent_state_change",
+            "generated bindings changed during initialization",
+        ))
+    }
+}
+
+fn rollback_new_binding_only_include(
+    fs: &BindingFileSystem,
+    paths: &BindingPaths,
+    reloader: &dyn BindingReloader,
+    active_preset_id: &str,
+    settings: &crate::store::SecureFileSnapshot,
+    presets: &crate::store::SecureFileSnapshot,
+    published: &crate::store::SecureFileSnapshot,
+) -> Result<ApplyReport, BindingError> {
+    let unknown = || ApplyReport {
+        status: ApplyStatus::CommitStateUnknown,
+        active_preset_id: active_preset_id.to_owned(),
+    };
+    if !fs
+        .niri
+        .snapshot_matches(
+            BindingFileSystem::artifact_name(ArtifactKind::Bindings),
+            published,
+        )
+        .map_err(BindingError::from_store)?
+    {
+        return Ok(unknown());
+    }
+    if fs
+        .niri
+        .remove_file(BindingFileSystem::artifact_name(ArtifactKind::Bindings))
+        .and_then(|()| fs.niri.sync())
+        .is_err()
+    {
+        return Ok(unknown());
+    }
+    let mut stream = match reloader.subscribe() {
+        Ok(stream) => stream,
+        Err(_) => return Ok(unknown()),
+    };
+    let Some(stream) = stream.as_mut() else {
+        return Ok(unknown());
+    };
+    if stream.await_initial_snapshot(RELOAD_TIMEOUT).is_err()
+        || !reload_confirmed(paths, reloader, stream.as_mut(), RELOAD_TIMEOUT).unwrap_or(false)
+    {
+        return Ok(unknown());
+    }
+    if verify_binding_state_snapshots(fs, settings, presets).is_err() {
+        return Ok(unknown());
+    }
+    Ok(ApplyReport {
+        status: ApplyStatus::RolledBackConfirmed,
+        active_preset_id: active_preset_id.to_owned(),
+    })
+}
+
+fn verify_binding_state_snapshots(
+    fs: &BindingFileSystem,
+    settings: &crate::store::SecureFileSnapshot,
+    presets: &crate::store::SecureFileSnapshot,
+) -> Result<(), BindingError> {
+    for (directory, name, snapshot, document) in [
+        (
+            &fs.handles.settings,
+            BindingFileSystem::artifact_name(ArtifactKind::Settings),
+            settings,
+            "settings",
+        ),
+        (
+            &fs.handles.presets,
+            BindingFileSystem::artifact_name(ArtifactKind::Preset),
+            presets,
+            "presets",
+        ),
+    ] {
+        if !directory
+            .snapshot_matches(name, snapshot)
+            .map_err(BindingError::from_store)?
+        {
+            return Err(BindingError::new(
+                "concurrent_state_change",
+                format!("{document} changed during binding initialization"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn binding_publication_stage(boundary: crate::store::PublicationBoundary) -> ApplyStage {
+    match boundary {
+        crate::store::PublicationBoundary::PartialWritten => ApplyStage::PublicationPartialWritten,
+        crate::store::PublicationBoundary::FileSyncStarted => {
+            ApplyStage::PublicationFileSyncStarted
+        }
+        crate::store::PublicationBoundary::FileSynced => ApplyStage::PublicationFileSynced,
+        crate::store::PublicationBoundary::Renamed => ApplyStage::PublicationRenamed,
+        crate::store::PublicationBoundary::DirectorySyncStarted => {
+            ApplyStage::PublicationDirectorySyncStarted
+        }
+        crate::store::PublicationBoundary::DirectorySynced => {
+            ApplyStage::PublicationDirectorySynced
+        }
+    }
 }
 
 fn reconcile_bindings_mode(

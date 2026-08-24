@@ -251,14 +251,6 @@ struct RecordingValidator {
 
 struct InitializingValidator;
 
-struct ForbiddenValidator;
-
-impl BindingValidator for ForbiddenValidator {
-    fn validate(&self, _staged_root: &Path, _staged_config: &Path) -> Result<(), String> {
-        panic!("coherent initializer must not validate or rewrite")
-    }
-}
-
 impl BindingValidator for InitializingValidator {
     fn validate(&self, staged_root: &Path, staged_config: &Path) -> Result<(), String> {
         assert!(staged_config.starts_with(staged_root));
@@ -593,21 +585,11 @@ fn every_pending_journal_is_compatible_with_the_base_v1_strict_decoder() {
     )
     .unwrap();
     assert_base_v1_journal_compatible(ordinary_paths.journal());
-
-    let (_temp, preserve_paths) = apply_fixture();
-    fs::remove_file(preserve_paths.generated_include()).unwrap();
-    initialize_bindings(
-        &preserve_paths,
-        &InitializingValidator,
-        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .unwrap();
-    assert_base_v1_journal_compatible(preserve_paths.journal());
 }
 
 #[cfg(unix)]
 #[test]
-fn initializer_missing_include_preserves_existing_state_through_online_reconcile() {
+fn initializer_missing_include_publishes_only_bindings_without_a_legacy_journal() {
     let (_temp, paths) = apply_fixture();
     fs::remove_file(paths.generated_include()).unwrap();
     let artifacts = [
@@ -636,7 +618,7 @@ fn initializer_missing_include_preserves_existing_state_through_online_reconcile
 
     assert_eq!(report.status, ApplyStatus::ReloadPending);
     assert!(paths.generated_include().is_file());
-    assert!(paths.journal().is_file());
+    assert!(!paths.journal().exists());
     for (path, (bytes, inode, mtime, mtime_nsec)) in artifacts.iter().zip(&before) {
         let metadata = fs::metadata(path).unwrap();
         assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
@@ -645,18 +627,6 @@ fn initializer_missing_include_preserves_existing_state_through_online_reconcile
         assert_eq!(metadata.mtime_nsec(), *mtime_nsec);
     }
 
-    let reconciled = reconcile_bindings(
-        &paths,
-        &ScriptedReloader::online(
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Some(ConfigLoaded { failed: false })],
-        ),
-    )
-    .unwrap()
-    .unwrap();
-
-    assert_eq!(reconciled.status, ApplyStatus::Committed);
-    assert!(!paths.journal().exists());
     for (path, (bytes, inode, mtime, mtime_nsec)) in artifacts.iter().zip(&before) {
         let metadata = fs::metadata(path).unwrap();
         assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
@@ -667,7 +637,7 @@ fn initializer_missing_include_preserves_existing_state_through_online_reconcile
 }
 
 #[test]
-fn initializer_detects_prepared_state_drift_without_committing_or_clearing_journal() {
+fn initializer_detects_state_drift_before_binding_publication_without_a_journal() {
     let (_temp, base_paths) = apply_fixture();
     fs::remove_file(base_paths.generated_include()).unwrap();
     let mut drifted: serde_json::Value =
@@ -677,7 +647,7 @@ fn initializer_detects_prepared_state_drift_without_committing_or_clearing_journ
     let paths = base_paths
         .clone()
         .with_observer(Arc::new(RewriteFileObserver {
-            target: ApplyStage::PreparedSynced,
+            target: ApplyStage::BindingStateSnapshotsCaptured,
             path: base_paths.store().settings_path().to_owned(),
             bytes: drifted.clone(),
             rewritten: Mutex::new(false),
@@ -693,216 +663,22 @@ fn initializer_detects_prepared_state_drift_without_committing_or_clearing_journ
     assert_eq!(error.code(), "concurrent_state_change");
     assert_eq!(fs::read(paths.store().settings_path()).unwrap(), drifted);
     assert!(!paths.generated_include().exists());
-    assert!(paths.journal().exists());
-
-    let reconciled = reconcile_bindings(
-        &base_paths,
-        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .unwrap_err();
-    assert_eq!(reconciled.code(), "concurrent_state_change");
-    assert!(base_paths.journal().exists());
-}
-
-#[test]
-fn initializer_detects_state_drift_before_bindings_install() {
-    let (_temp, base_paths) = apply_fixture();
-    fs::remove_file(base_paths.generated_include()).unwrap();
-    let mut drifted: serde_json::Value =
-        serde_json::from_slice(&fs::read(base_paths.store().settings_path()).unwrap()).unwrap();
-    drifted["activePresetId"] = serde_json::json!("missing.before-bindings");
-    let drifted = serde_json::to_vec(&drifted).unwrap();
-    let paths = base_paths
-        .clone()
-        .with_observer(Arc::new(RewriteFileObserver {
-            target: ApplyStage::SettingsCommittedSynced,
-            path: base_paths.store().settings_path().to_owned(),
-            bytes: drifted.clone(),
-            rewritten: Mutex::new(false),
-        }));
-
-    let error = initialize_bindings(
-        &paths,
-        &InitializingValidator,
-        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .unwrap_err();
-
-    assert_eq!(error.code(), "concurrent_state_change");
-    assert_eq!(fs::read(paths.store().settings_path()).unwrap(), drifted);
-    assert!(!paths.generated_include().exists());
-    assert!(paths.journal().exists());
-}
-
-#[test]
-fn initializer_detects_state_drift_after_candidate_reload_confirmation() {
-    let (_temp, base_paths) = apply_fixture();
-    fs::remove_file(base_paths.generated_include()).unwrap();
-    let mut drifted: serde_json::Value =
-        serde_json::from_slice(&fs::read(base_paths.store().settings_path()).unwrap()).unwrap();
-    drifted["activePresetId"] = serde_json::json!("missing.after-reload");
-    let drifted = serde_json::to_vec(&drifted).unwrap();
-    let paths = base_paths
-        .clone()
-        .with_observer(Arc::new(RewriteFileObserver {
-            target: ApplyStage::ReloadRequested,
-            path: base_paths.store().settings_path().to_owned(),
-            bytes: drifted.clone(),
-            rewritten: Mutex::new(false),
-        }));
-
-    let error = initialize_bindings(
-        &paths,
-        &InitializingValidator,
-        &ScriptedReloader::online(
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Some(ConfigLoaded { failed: false })],
-        ),
-    )
-    .unwrap_err();
-
-    assert_eq!(error.code(), "concurrent_state_change");
-    assert_eq!(fs::read(paths.store().settings_path()).unwrap(), drifted);
-    assert!(paths.generated_include().exists());
-    assert!(paths.journal().exists());
-}
-
-#[test]
-fn reconcile_detects_state_drift_after_candidate_reload_confirmation() {
-    let (_temp, base_paths) = apply_fixture();
-    fs::remove_file(base_paths.generated_include()).unwrap();
-    initialize_bindings(
-        &base_paths,
-        &InitializingValidator,
-        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .unwrap();
-    let mut drifted: serde_json::Value =
-        serde_json::from_slice(&fs::read(base_paths.store().settings_path()).unwrap()).unwrap();
-    drifted["activePresetId"] = serde_json::json!("missing.reconcile-after-reload");
-    let drifted = serde_json::to_vec(&drifted).unwrap();
-    let paths = base_paths
-        .clone()
-        .with_observer(Arc::new(RewriteFileObserver {
-            target: ApplyStage::ReloadRequested,
-            path: base_paths.store().settings_path().to_owned(),
-            bytes: drifted.clone(),
-            rewritten: Mutex::new(false),
-        }));
-
-    let error = reconcile_bindings(
-        &paths,
-        &ScriptedReloader::online(
-            Arc::new(Mutex::new(Vec::new())),
-            vec![Some(ConfigLoaded { failed: false })],
-        ),
-    )
-    .unwrap_err();
-
-    assert_eq!(error.code(), "concurrent_state_change");
-    assert_eq!(fs::read(paths.store().settings_path()).unwrap(), drifted);
-    assert!(paths.generated_include().exists());
-    assert!(paths.journal().exists());
-}
-
-#[test]
-fn initializer_detects_state_drift_after_rollback_reload_confirmation() {
-    let (_temp, base_paths) = apply_fixture();
-    fs::remove_file(base_paths.generated_include()).unwrap();
-    let mut drifted: serde_json::Value =
-        serde_json::from_slice(&fs::read(base_paths.store().settings_path()).unwrap()).unwrap();
-    drifted["activePresetId"] = serde_json::json!("missing.rollback-after-reload");
-    let drifted = serde_json::to_vec(&drifted).unwrap();
-    let paths = base_paths
-        .clone()
-        .with_observer(Arc::new(RewriteNthFileObserver {
-            target: ApplyStage::ReloadRequested,
-            occurrence: 2,
-            seen: Mutex::new(0),
-            path: base_paths.store().settings_path().to_owned(),
-            bytes: drifted.clone(),
-        }));
-
-    let error = initialize_bindings(
-        &paths,
-        &InitializingValidator,
-        &ScriptedReloader::online(
-            Arc::new(Mutex::new(Vec::new())),
-            vec![
-                Some(ConfigLoaded { failed: true }),
-                Some(ConfigLoaded { failed: false }),
-            ],
-        ),
-    )
-    .unwrap_err();
-
-    assert_eq!(error.code(), "concurrent_state_change");
-    assert_eq!(fs::read(paths.store().settings_path()).unwrap(), drifted);
-    assert!(!paths.generated_include().exists());
-    assert!(paths.journal().exists());
-}
-
-#[test]
-fn reconcile_detects_state_drift_after_rollback_reload_confirmation() {
-    let (_temp, base_paths) = apply_fixture();
-    fs::remove_file(base_paths.generated_include()).unwrap();
-    initialize_bindings(
-        &base_paths,
-        &InitializingValidator,
-        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
-    )
-    .unwrap();
-    let mut drifted: serde_json::Value =
-        serde_json::from_slice(&fs::read(base_paths.store().settings_path()).unwrap()).unwrap();
-    drifted["activePresetId"] = serde_json::json!("missing.reconcile-rollback-after-reload");
-    let drifted = serde_json::to_vec(&drifted).unwrap();
-    let paths = base_paths
-        .clone()
-        .with_observer(Arc::new(RewriteNthFileObserver {
-            target: ApplyStage::ReloadRequested,
-            occurrence: 2,
-            seen: Mutex::new(0),
-            path: base_paths.store().settings_path().to_owned(),
-            bytes: drifted.clone(),
-        }));
-
-    let error = reconcile_bindings(
-        &paths,
-        &ScriptedReloader::online(
-            Arc::new(Mutex::new(Vec::new())),
-            vec![
-                Some(ConfigLoaded { failed: true }),
-                Some(ConfigLoaded { failed: false }),
-            ],
-        ),
-    )
-    .unwrap_err();
-
-    assert_eq!(error.code(), "concurrent_state_change");
-    assert_eq!(fs::read(paths.store().settings_path()).unwrap(), drifted);
-    assert!(!paths.generated_include().exists());
-    assert!(paths.journal().exists());
+    assert!(!paths.journal().exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn initializer_prepared_fault_reconciles_without_replacing_existing_state() {
+fn initializer_detects_same_byte_inode_swap_before_binding_publication() {
     let (_temp, base_paths) = apply_fixture();
     fs::remove_file(base_paths.generated_include()).unwrap();
-    let artifacts = [
-        base_paths.store().settings_path().to_owned(),
-        base_paths.store().presets_path().to_owned(),
-    ];
-    let before = artifacts
-        .iter()
-        .map(|path| {
-            let metadata = fs::metadata(path).unwrap();
-            (fs::read(path).unwrap(), metadata.ino())
-        })
-        .collect::<Vec<_>>();
-    let paths = base_paths.clone().with_observer(Arc::new(FailOnceObserver {
-        target: ApplyStage::PreparedSynced,
-        failed: Mutex::new(false),
+    let settings = base_paths.store().settings_path().to_owned();
+    let bytes = fs::read(&settings).unwrap();
+    let original_inode = fs::metadata(&settings).unwrap().ino();
+    let paths = base_paths.clone().with_observer(Arc::new(SwapFileObserver {
+        target: ApplyStage::BindingStateSnapshotsCaptured,
+        path: settings.clone(),
+        bytes: bytes.clone(),
+        swapped: Mutex::new(false),
     }));
 
     let error = initialize_bindings(
@@ -911,25 +687,149 @@ fn initializer_prepared_fault_reconciles_without_replacing_existing_state() {
         &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
     )
     .unwrap_err();
-    assert_eq!(error.code(), "fault_injected");
-    assert!(base_paths.journal().exists());
 
-    let reconciled = reconcile_bindings(
-        &base_paths,
+    assert_eq!(error.code(), "concurrent_state_change");
+    assert_eq!(fs::read(&settings).unwrap(), bytes);
+    assert_ne!(fs::metadata(&settings).unwrap().ino(), original_inode);
+    assert!(!paths.generated_include().exists());
+    assert!(!paths.journal().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn initializer_detects_same_byte_inode_swap_after_binding_publication() {
+    let (_temp, base_paths) = apply_fixture();
+    fs::remove_file(base_paths.generated_include()).unwrap();
+    let settings = base_paths.store().settings_path().to_owned();
+    let bytes = fs::read(&settings).unwrap();
+    let original_inode = fs::metadata(&settings).unwrap().ino();
+    let paths = base_paths.clone().with_observer(Arc::new(SwapFileObserver {
+        target: ApplyStage::PublicationDirectorySynced,
+        path: settings.clone(),
+        bytes: bytes.clone(),
+        swapped: Mutex::new(false),
+    }));
+
+    let report = initialize_bindings(
+        &paths,
+        &InitializingValidator,
         &ScriptedReloader::online(
             Arc::new(Mutex::new(Vec::new())),
             vec![Some(ConfigLoaded { failed: false })],
         ),
     )
-    .unwrap()
     .unwrap();
-    assert_eq!(reconciled.status, ApplyStatus::RolledBackConfirmed);
-    assert!(!base_paths.journal().exists());
-    assert!(!base_paths.generated_include().exists());
-    for (path, (bytes, inode)) in artifacts.iter().zip(&before) {
-        assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
-        assert_eq!(fs::metadata(path).unwrap().ino(), *inode);
+
+    assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
+    assert_eq!(fs::read(&settings).unwrap(), bytes);
+    assert_ne!(fs::metadata(&settings).unwrap().ino(), original_inode);
+    assert!(!paths.generated_include().exists());
+    assert!(!paths.journal().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn binding_only_publication_faults_preserve_state_and_leave_no_legacy_journal() {
+    for stage in [
+        ApplyStage::PublicationPartialWritten,
+        ApplyStage::PublicationFileSyncStarted,
+        ApplyStage::PublicationFileSynced,
+        ApplyStage::PublicationRenamed,
+        ApplyStage::PublicationDirectorySyncStarted,
+        ApplyStage::PublicationDirectorySynced,
+    ] {
+        let (_temp, base_paths) = apply_fixture();
+        fs::remove_file(base_paths.generated_include()).unwrap();
+        let artifacts = [
+            base_paths.store().settings_path().to_owned(),
+            base_paths.store().presets_path().to_owned(),
+        ];
+        let before = artifacts
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (
+                    fs::read(path).unwrap(),
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let paths = base_paths.clone().with_observer(Arc::new(FailOnceObserver {
+            target: stage,
+            failed: Mutex::new(false),
+        }));
+        let result = initialize_bindings(
+            &paths,
+            &InitializingValidator,
+            &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+        );
+        if matches!(
+            stage,
+            ApplyStage::PublicationPartialWritten
+                | ApplyStage::PublicationFileSyncStarted
+                | ApplyStage::PublicationFileSynced
+        ) {
+            assert_eq!(result.unwrap_err().code(), "fault_injected", "{stage:?}");
+        } else {
+            assert_eq!(
+                result.unwrap().status,
+                ApplyStatus::CommitStateUnknown,
+                "{stage:?}"
+            );
+        }
+        assert!(reconcile_bindings(
+            &base_paths,
+            &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new())))
+        )
+        .unwrap()
+        .is_none());
+        assert!(!base_paths.journal().exists(), "{stage:?}");
+        for (path, (bytes, inode, mtime, mtime_nsec)) in artifacts.iter().zip(&before) {
+            let metadata = fs::metadata(path).unwrap();
+            assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
+            assert_eq!(metadata.ino(), *inode);
+            assert_eq!(metadata.mtime(), *mtime);
+            assert_eq!(metadata.mtime_nsec(), *mtime_nsec);
+        }
+        assert_eq!(
+            initialize_bindings(
+                &base_paths,
+                &InitializingValidator,
+                &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .unwrap()
+            .status,
+            ApplyStatus::ReloadPending
+        );
     }
+}
+
+#[test]
+fn binding_only_publication_never_replaces_a_destination_created_concurrently() {
+    let (_temp, base_paths) = apply_fixture();
+    fs::remove_file(base_paths.generated_include()).unwrap();
+    let external = b"external concurrent bindings\n".to_vec();
+    let paths = base_paths
+        .clone()
+        .with_observer(Arc::new(RewriteFileObserver {
+            target: ApplyStage::PublicationFileSynced,
+            path: base_paths.generated_include().to_owned(),
+            bytes: external.clone(),
+            rewritten: Mutex::new(false),
+        }));
+
+    let error = initialize_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code(), "preset_conflict");
+    assert_eq!(fs::read(paths.generated_include()).unwrap(), external);
+    assert!(!paths.journal().exists());
 }
 
 #[cfg(unix)]
@@ -971,6 +871,57 @@ fn initializer_reload_rejection_rolls_back_without_replacing_existing_state() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn initializer_reload_request_fault_removes_new_include_without_touching_state() {
+    let (_temp, base_paths) = apply_fixture();
+    fs::remove_file(base_paths.generated_include()).unwrap();
+    let artifacts = [
+        base_paths.store().settings_path().to_owned(),
+        base_paths.store().presets_path().to_owned(),
+    ];
+    let before = artifacts
+        .iter()
+        .map(|path| {
+            let metadata = fs::metadata(path).unwrap();
+            (
+                fs::read(path).unwrap(),
+                metadata.ino(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let paths = base_paths.with_observer(Arc::new(FailOnceObserver {
+        target: ApplyStage::ReloadRequested,
+        failed: Mutex::new(false),
+    }));
+
+    let report = initialize_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::online(
+            Arc::new(Mutex::new(Vec::new())),
+            vec![
+                Some(ConfigLoaded { failed: false }),
+                Some(ConfigLoaded { failed: false }),
+            ],
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::RolledBackConfirmed);
+    assert!(!paths.generated_include().exists());
+    assert!(!paths.journal().exists());
+    for (path, (bytes, inode, mtime, mtime_nsec)) in artifacts.iter().zip(&before) {
+        let metadata = fs::metadata(path).unwrap();
+        assert_eq!(fs::read(path).unwrap().as_slice(), bytes.as_slice());
+        assert_eq!(metadata.ino(), *inode);
+        assert_eq!(metadata.mtime(), *mtime);
+        assert_eq!(metadata.mtime_nsec(), *mtime_nsec);
+    }
+}
+
 #[test]
 fn offline_initializer_reconciles_an_existing_pending_journal_idempotently() {
     let (_temp, paths) = apply_fixture();
@@ -991,7 +942,7 @@ fn offline_initializer_reconciles_an_existing_pending_journal_idempotently() {
 }
 
 #[test]
-fn initializer_after_confirmed_reconcile_is_an_exact_noop() {
+fn initializer_with_a_matching_include_reconfirms_runtime_before_reporting_committed() {
     let (_temp, paths) = apply_fixture();
     let offline = ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new())));
     initialize_bindings(&paths, &InitializingValidator, &offline).unwrap();
@@ -1016,22 +967,56 @@ fn initializer_after_confirmed_reconcile_is_an_exact_noop() {
             )
         })
         .collect::<Vec<_>>();
-    let no_reload_events = Arc::new(Mutex::new(Vec::new()));
+    let reload_events = Arc::new(Mutex::new(Vec::new()));
 
     let report = initialize_bindings(
         &paths,
-        &ForbiddenValidator,
-        &ScriptedReloader::offline(Arc::clone(&no_reload_events)),
+        &InitializingValidator,
+        &ScriptedReloader::online(
+            Arc::clone(&reload_events),
+            vec![Some(ConfigLoaded { failed: false })],
+        ),
     )
     .unwrap();
 
     assert_eq!(report.status, ApplyStatus::Committed);
     assert!(!paths.journal().exists());
-    assert!(no_reload_events.lock().unwrap().is_empty());
+    assert!(reload_events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("reload:")));
     for (path, (bytes, modified)) in artifacts.iter().zip(before) {
         assert_eq!(fs::read(path).unwrap(), bytes);
         assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
     }
+}
+
+#[test]
+fn initializer_keeps_a_matching_include_when_runtime_reload_is_not_confirmed() {
+    let (_temp, paths) = apply_fixture();
+    fs::remove_file(paths.generated_include()).unwrap();
+    initialize_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap();
+    let before = fs::read(paths.generated_include()).unwrap();
+
+    let report = initialize_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::online(
+            Arc::new(Mutex::new(Vec::new())),
+            vec![Some(ConfigLoaded { failed: true })],
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::CommitStateUnknown);
+    assert_eq!(fs::read(paths.generated_include()).unwrap(), before);
+    assert!(!paths.journal().exists());
 }
 
 #[test]
@@ -1141,13 +1126,13 @@ struct RewriteFileObserver {
     rewritten: Mutex<bool>,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
-struct RewriteNthFileObserver {
+struct SwapFileObserver {
     target: ApplyStage,
-    occurrence: usize,
-    seen: Mutex<usize>,
-    path: std::path::PathBuf,
+    path: PathBuf,
     bytes: Vec<u8>,
+    swapped: Mutex<bool>,
 }
 
 impl ApplyObserver for FailNthObserver {
@@ -1191,15 +1176,18 @@ impl ApplyObserver for RewriteFileObserver {
     }
 }
 
-impl ApplyObserver for RewriteNthFileObserver {
+#[cfg(unix)]
+impl ApplyObserver for SwapFileObserver {
     fn reached(&self, stage: ApplyStage) -> Result<(), String> {
         if stage != self.target {
             return Ok(());
         }
-        let mut seen = self.seen.lock().unwrap();
-        *seen += 1;
-        if *seen == self.occurrence {
-            fs::write(&self.path, &self.bytes).map_err(|error| error.to_string())?;
+        let mut swapped = self.swapped.lock().unwrap();
+        if !*swapped {
+            let replacement = self.path.with_extension("concurrent-replacement");
+            fs::write(&replacement, &self.bytes).map_err(|error| error.to_string())?;
+            fs::rename(&replacement, &self.path).map_err(|error| error.to_string())?;
+            *swapped = true;
         }
         Ok(())
     }
@@ -1535,6 +1523,10 @@ fn state_changing_active_update_still_reaches_the_preset_rename_fault_boundary()
 #[test]
 fn rejected_candidate_cannot_be_resurrected_after_any_rollback_install_crash() {
     let rollback_stages = [
+        ApplyStage::RollbackPresetRenamed,
+        ApplyStage::RollbackPresetDirectorySynced,
+        ApplyStage::RollbackSettingsRenamed,
+        ApplyStage::RollbackSettingsDirectorySynced,
         ApplyStage::RollbackBindingsRenamed,
         ApplyStage::RollbackBindingsDirectorySynced,
     ];
@@ -1562,7 +1554,15 @@ fn rejected_candidate_cannot_be_resurrected_after_any_rollback_install_crash() {
             ],
         );
 
-        let error = apply_active_bindings(&paths, &validator, &rejected).unwrap_err();
+        let error = mutate_keybinding_and_apply(
+            "builtin.sleepy",
+            "app.terminal.open",
+            Some("Mod+T"),
+            &paths,
+            &validator,
+            &rejected,
+        )
+        .unwrap_err();
         assert_eq!(
             error.code(),
             "fault_injected",
