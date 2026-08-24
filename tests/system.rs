@@ -1171,6 +1171,87 @@ fn power_current_profile_must_be_in_available_profiles() {
 }
 
 #[test]
+fn duplicate_power_profile_headers_degrade_only_the_profile_capability() {
+    let runner = base_runner().output(
+        "powerprofilesctl",
+        &["list"],
+        include_str!("fixtures/system/powerprofilesctl-duplicate.txt"),
+    );
+    let snapshot = SystemFacade::new(runner).snapshot(1).unwrap();
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::PowerProfile],
+        CapabilityState::Error
+    );
+    assert_eq!(
+        snapshot.diagnostics[&CapabilityId::PowerProfile].kind,
+        sleepy_sdk::CapabilityErrorKind::Parse
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::BatteryStatus],
+        CapabilityState::Available
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::NetworkEnabled],
+        CapabilityState::Available
+    );
+    sleepy_sdk::validate_system_snapshot(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+}
+
+#[test]
+fn upower_state_mapping_is_closed_and_unknown_wire_state_is_nullable() {
+    for (state, expected) in [
+        ("charging", Some(true)),
+        ("fully-charged", Some(true)),
+        ("pending-charge", Some(true)),
+        ("discharging", Some(false)),
+        ("pending-discharge", Some(false)),
+        ("empty", Some(false)),
+        ("unknown", None),
+    ] {
+        let output = format!("state: {state}\npercentage: 50%\n");
+        let runner = base_runner().output(
+            "upower",
+            &[
+                "--show-info",
+                "/org/freedesktop/UPower/devices/DisplayDevice",
+            ],
+            &output,
+        );
+        let snapshot = SystemFacade::new(runner).snapshot(1).unwrap();
+        assert_eq!(snapshot.power.unwrap().charging, expected, "state {state}");
+    }
+}
+
+#[test]
+fn unrecognized_upower_state_degrades_only_battery() {
+    let runner = base_runner().output(
+        "upower",
+        &[
+            "--show-info",
+            "/org/freedesktop/UPower/devices/DisplayDevice",
+        ],
+        include_str!("fixtures/system/upower-malformed.txt"),
+    );
+    let snapshot = SystemFacade::new(runner).snapshot(1).unwrap();
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::BatteryStatus],
+        CapabilityState::Error
+    );
+    assert_eq!(
+        snapshot.diagnostics[&CapabilityId::BatteryStatus].kind,
+        sleepy_sdk::CapabilityErrorKind::Parse
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::PowerProfile],
+        CapabilityState::Available
+    );
+    assert_eq!(
+        snapshot.capabilities[&CapabilityId::AudioVolume],
+        CapabilityState::Available
+    );
+}
+
+#[test]
 fn inactive_gammastep_is_available_and_false() {
     let inactive = ScriptedResponse {
         delay: Duration::ZERO,

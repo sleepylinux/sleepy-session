@@ -1,2 +1,2 @@
-state: charging
-percentage: lots
+state: banana
+percentage: 81%

@@ -149,7 +149,7 @@ fn cli_system_show_returns_only_an_sdk_validated_snapshot() {
 }
 
 #[test]
-fn cli_system_show_rejects_an_sdk_invalid_assembled_snapshot() {
+fn cli_system_show_localizes_duplicate_power_profiles_before_assembly() {
     let root = TempDir::new().unwrap();
     let bin = install_fake_system_tools(&root);
     let output = command(&root)
@@ -158,13 +158,21 @@ fn cli_system_show_rejects_an_sdk_invalid_assembled_snapshot() {
         .args(["system", "show", "--generation", "73"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "parse");
-    assert!(error["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("SDK contract"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot =
+        sleepy_sdk::validate_system_snapshot(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(
+        snapshot.capabilities[&sleepy_sdk::CapabilityId::PowerProfile],
+        sleepy_sdk::CapabilityState::Error
+    );
+    assert_eq!(
+        snapshot.capabilities[&sleepy_sdk::CapabilityId::BatteryStatus],
+        sleepy_sdk::CapabilityState::Available
+    );
 }
 
 #[test]

@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use sleepy_sdk::PowerProfile;
 
 use super::{run_checked, CommandRunner, CommandSpec, ProbeFailure};
@@ -23,6 +25,12 @@ pub(crate) fn probe_profiles<R: CommandRunner>(
         .collect::<Result<Vec<_>, _>>()?;
     if available_profiles.is_empty() {
         return Err(ProbeFailure::parse("powerprofilesctl reported no profiles"));
+    }
+    let unique: BTreeSet<_> = available_profiles.iter().copied().collect();
+    if unique.len() != available_profiles.len() {
+        return Err(ProbeFailure::parse(
+            "powerprofilesctl profile headers are not unique",
+        ));
     }
     if current_profile.is_some_and(|current| !available_profiles.contains(&current)) {
         return Err(ProbeFailure::parse(
@@ -67,7 +75,8 @@ pub(crate) fn probe_battery<R: CommandRunner>(
         }
     };
     let battery = text(&battery)?;
-    let state = field(battery, "state:");
+    let state = field(battery, "state:")
+        .ok_or_else(|| ProbeFailure::parse("UPower omitted battery state"))?;
     let percentage = field(battery, "percentage:");
     let battery_level = percentage
         .map(|value| {
@@ -84,7 +93,19 @@ pub(crate) fn probe_battery<R: CommandRunner>(
                 })
         })
         .transpose()?;
-    let charging = state.map(|value| matches!(value, "charging" | "fully-charged"));
+    // `charging` is the UI's "on external power / filling" signal. Pending
+    // charge belongs with it; pending discharge belongs with discharging.
+    // UPower's explicit `unknown` is represented by the SDK's nullable bool.
+    let charging = match state {
+        "charging" | "fully-charged" | "pending-charge" => Some(true),
+        "discharging" | "pending-discharge" | "empty" => Some(false),
+        "unknown" => None,
+        _ => {
+            return Err(ProbeFailure::parse(
+                "UPower returned an unknown battery state",
+            ))
+        }
+    };
     Ok((battery_level, charging))
 }
 
