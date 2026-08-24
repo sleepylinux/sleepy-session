@@ -431,6 +431,46 @@ fn online_required_reconciliation_rejects_an_offline_stream_distinctly() {
     assert!(paths.journal().exists());
 }
 
+struct FailingSnapshotStream;
+
+impl ConfigEventStream for FailingSnapshotStream {
+    fn await_initial_snapshot(&mut self, _timeout: Duration) -> Result<ConfigLoaded, String> {
+        Err("event stream ended before CastsChanged".to_owned())
+    }
+
+    fn next_config_loaded(&mut self, _timeout: Duration) -> Result<Option<ConfigLoaded>, String> {
+        unreachable!("request is forbidden before the initial barrier")
+    }
+}
+
+struct FailingSnapshotReloader;
+
+impl BindingReloader for FailingSnapshotReloader {
+    fn subscribe(&self) -> Result<Option<Box<dyn ConfigEventStream>>, String> {
+        Ok(Some(Box::new(FailingSnapshotStream)))
+    }
+
+    fn request_reload(&self, _trusted_config: &Path) -> Result<(), String> {
+        unreachable!("request is forbidden before the initial barrier")
+    }
+}
+
+#[test]
+fn online_required_reconciliation_maps_a_missing_event_barrier_to_niri_unavailable() {
+    let (_temp, paths) = apply_fixture();
+    apply_active_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap();
+
+    let error = reconcile_bindings_online_required(&paths, &FailingSnapshotReloader).unwrap_err();
+
+    assert_eq!(error.code(), "niri_unavailable");
+    assert!(paths.journal().exists());
+}
+
 #[test]
 fn apply_reconciliation_finishes_pending_candidate_once_and_is_idempotent() {
     let (_temp, paths) = apply_fixture();

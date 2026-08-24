@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     io::{BufRead, BufReader},
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
@@ -141,7 +141,10 @@ impl BindingReloader for NiriReloader {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(socket) = std::env::var_os("NIRI_SOCKET") {
-                if std::fs::metadata(socket).is_ok() {
+                if std::fs::symlink_metadata(socket)
+                    .map(|metadata| metadata.file_type().is_socket())
+                    .unwrap_or(false)
+                {
                     if let Some(stream) = self.subscribe()? {
                         return Ok(stream);
                     }
@@ -881,7 +884,16 @@ fn reconcile_bindings_locked(
     if let Some(stream) = stream.as_mut() {
         stream
             .await_initial_snapshot(RELOAD_TIMEOUT)
-            .map_err(|message| BindingError::new("reload_failed", message))?;
+            .map_err(|message| {
+                BindingError::new(
+                    if online_required {
+                        "niri_unavailable"
+                    } else {
+                        "reload_failed"
+                    },
+                    message,
+                )
+            })?;
     }
     if target == RecoveryTarget::Previous {
         journal.set_recovery_target(fs, target)?;
