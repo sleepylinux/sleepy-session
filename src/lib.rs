@@ -5,5 +5,6 @@ mod store;
 
 pub use store::{
     Defaults, ImportMode, InspectionDocumentReport, InspectionIssue, InspectionReport,
-    ReplacementObserver, ReplacementStage, StateInspector, StateStore, StoreError, StorePaths,
+    PresetMutationObserver, PresetMutationStage, ReplacementObserver, ReplacementStage,
+    StateInspector, StateStore, StoreError, StorePaths,
 };

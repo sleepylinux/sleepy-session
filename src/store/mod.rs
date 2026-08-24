@@ -10,6 +10,6 @@ pub use error::StoreError;
 pub use import_export::ImportMode;
 pub use paths::StorePaths;
 pub use state::{
-    InspectionDocumentReport, InspectionIssue, InspectionReport, ReplacementObserver,
-    ReplacementStage, StateInspector, StateStore,
+    InspectionDocumentReport, InspectionIssue, InspectionReport, PresetMutationObserver,
+    PresetMutationStage, ReplacementObserver, ReplacementStage, StateInspector, StateStore,
 };

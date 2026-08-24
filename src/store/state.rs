@@ -30,11 +30,23 @@ pub enum ReplacementStage {
     RenamedBeforeParentSync,
 }
 
+/// Observable preset-mutation boundary used for deterministic concurrency tests.
+pub trait PresetMutationObserver: Send + Sync {
+    fn reached(&self, stage: PresetMutationStage) -> io::Result<()>;
+}
+
+/// A preset-mutation point at which an observer may pause or fail an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetMutationStage {
+    KeybindingTargetEligible,
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     paths: StorePaths,
     defaults: Defaults,
     replacement_observer: Option<Arc<dyn ReplacementObserver>>,
+    mutation_observer: Option<Arc<dyn PresetMutationObserver>>,
 }
 
 pub struct StateInspector;
@@ -266,6 +278,7 @@ impl StateStore {
             paths,
             defaults,
             replacement_observer: None,
+            mutation_observer: None,
         };
         store.with_transaction(|store| {
             store.initialize()?;
@@ -284,6 +297,12 @@ impl StateStore {
     /// Adds a replacement-stage observer to a cloned store handle.
     pub fn with_replacement_observer(mut self, observer: Arc<dyn ReplacementObserver>) -> Self {
         self.replacement_observer = Some(observer);
+        self
+    }
+
+    /// Adds a preset-mutation observer to a cloned store handle.
+    pub fn with_mutation_observer(mut self, observer: Arc<dyn PresetMutationObserver>) -> Self {
+        self.mutation_observer = Some(observer);
         self
     }
 
@@ -397,6 +416,13 @@ impl StateStore {
         let result = operation(self);
         FileExt::unlock(&lock).map_err(StoreError::io)?;
         result
+    }
+
+    pub(super) fn observe_mutation(&self, stage: PresetMutationStage) -> Result<(), StoreError> {
+        if let Some(observer) = self.mutation_observer.as_deref() {
+            observer.reached(stage).map_err(StoreError::io)?;
+        }
+        Ok(())
     }
 
     fn initialize(&self) -> Result<(), StoreError> {

@@ -5,9 +5,11 @@ use std::{
     time::Duration,
 };
 
+use fs2::FileExt;
 use serde_json::{json, Value};
 use sleepy_session::{
-    Defaults, ImportMode, ReplacementObserver, ReplacementStage, StateStore, StorePaths,
+    Defaults, ImportMode, PresetMutationObserver, PresetMutationStage, ReplacementObserver,
+    ReplacementStage, StateStore, StorePaths,
 };
 use tempfile::TempDir;
 
@@ -582,6 +584,87 @@ impl ReplacementObserver for PauseFirstReplacement {
         }
         Ok(())
     }
+}
+
+struct PauseEligibleKeybindingMutation {
+    paused: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl PresetMutationObserver for PauseEligibleKeybindingMutation {
+    fn reached(&self, stage: PresetMutationStage) -> io::Result<()> {
+        if stage == PresetMutationStage::KeybindingTargetEligible {
+            self.paused.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn keybinding_transaction_holds_lock_from_eligible_snapshot_through_write() {
+    let temp = TempDir::new().unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    let initial = StateStore::open(paths(&temp), defaults()).unwrap();
+    initial
+        .create_user_preset(user_preset(id, "Before"))
+        .unwrap();
+    let (paused_sender, paused_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let store = initial.with_mutation_observer(Arc::new(PauseEligibleKeybindingMutation {
+        paused: paused_sender,
+        release: Mutex::new(release_receiver),
+    }));
+    let key_store = store.clone();
+    let key_thread = thread::spawn(move || {
+        key_store.mutate_user_keybinding(id, "launcher.open", Some("Mod+Space"))
+    });
+    paused_receiver.recv().unwrap();
+
+    let lock_path = temp.path().join("config/sleepy/.sleepy-session.lock");
+    let lock_probe = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    match lock_probe.try_lock_exclusive() {
+        Ok(()) => {
+            FileExt::unlock(&lock_probe).unwrap();
+            panic!("configuration lock was free after the eligible target snapshot");
+        }
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+    }
+
+    let whole_store = store.clone();
+    let (attempted_sender, attempted_receiver) = mpsc::channel();
+    let (completed_sender, completed_receiver) = mpsc::channel();
+    let whole_thread = thread::spawn(move || {
+        attempted_sender.send(()).unwrap();
+        let result =
+            whole_store.update_user_preset(id, updated_user_preset(id, "Serialized whole update"));
+        completed_sender.send(()).unwrap();
+        result
+    });
+    attempted_receiver.recv().unwrap();
+    assert!(completed_receiver
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+
+    release_sender.send(()).unwrap();
+    key_thread.join().unwrap().unwrap();
+    whole_thread.join().unwrap().unwrap();
+    completed_receiver.recv().unwrap();
+
+    let final_preset = store.preset_json(id).unwrap();
+    assert_eq!(final_preset["name"], "Serialized whole update");
+    assert_eq!(final_preset["layouts"]["DP-1"]["main"], "terminal");
+    assert_eq!(
+        final_preset["keybindings"],
+        json!({
+            "app.terminal.open": "Mod+Return",
+            "surface.controlCenter.toggle": "Mod+C"
+        })
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use sleepy_sdk::{canonicalize_accelerator, PresetOrigin, BUILTIN_PRESET_ID};
 
-use super::{state::parse_preset, StateStore, StoreError};
+use super::{state::parse_preset, PresetMutationStage, StateStore, StoreError};
 
 impl StateStore {
     pub fn preset_json(&self, id: &str) -> Result<Value, StoreError> {
@@ -96,6 +96,7 @@ impl StateStore {
             if store.load_settings()?.active_preset_id == id {
                 return Err(StoreError::apply_required(id));
             }
+            store.observe_mutation(PresetMutationStage::KeybindingTargetEligible)?;
 
             match accelerator {
                 Some(accelerator) => {
