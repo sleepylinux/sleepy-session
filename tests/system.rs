@@ -627,12 +627,11 @@ fn process_runner_kills_and_reaps_a_superseded_real_child() {
         timeout: Duration::from_secs(5),
     };
     let child = std::thread::spawn(move || ProcessCommandRunner.run_controlled(&command, &control));
-    for _ in 0..200 {
-        if pid_file.exists() {
-            break;
-        }
+    let readiness_deadline = Instant::now() + Duration::from_secs(4);
+    while !pid_file.exists() && Instant::now() < readiness_deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(pid_file.exists(), "child did not start before its deadline");
     let pid: i32 = fs::read_to_string(&pid_file)
         .unwrap()
         .trim()
