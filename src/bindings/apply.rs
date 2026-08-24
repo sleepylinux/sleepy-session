@@ -1,9 +1,8 @@
 use std::{
     collections::BTreeSet,
     fs,
-    fs::File,
     io::{BufRead, BufReader},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
@@ -25,6 +24,7 @@ use crate::{store::StateCandidate, Defaults, StateStore, StorePaths};
 use super::{
     compile_bindings,
     journal::{io_error, ArtifactKind, JournalPhase, RecoveryTarget, TransactionJournal},
+    secure_fs::BindingFileSystem,
     BindingError,
 };
 
@@ -41,6 +41,10 @@ pub trait ConfigEventStream {
 
 pub trait BindingReloader {
     fn subscribe(&self) -> Result<Option<Box<dyn ConfigEventStream>>, String>;
+    fn subscribe_required(&self, _timeout: Duration) -> Result<Box<dyn ConfigEventStream>, String> {
+        self.subscribe()?
+            .ok_or_else(|| "Niri socket or event stream is unavailable".to_owned())
+    }
     fn request_reload(&self, trusted_config: &Path) -> Result<(), String>;
 }
 
@@ -130,6 +134,23 @@ impl BindingReloader for NiriReloader {
             Ok(())
         } else {
             Err(format!("Niri reload request exited with {status}"))
+        }
+    }
+
+    fn subscribe_required(&self, timeout: Duration) -> Result<Box<dyn ConfigEventStream>, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(socket) = std::env::var_os("NIRI_SOCKET") {
+                if std::fs::metadata(socket).is_ok() {
+                    if let Some(stream) = self.subscribe()? {
+                        return Ok(stream);
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for Niri socket and event stream".to_owned());
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -244,6 +265,7 @@ pub trait ApplyObserver: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyStage {
+    WritableDirectoriesOpened,
     PreparedSynced,
     PresetRenamed,
     PresetDirectorySynced,
@@ -387,37 +409,14 @@ impl BindingPaths {
     }
 
     pub fn validate(&self) -> Result<(), BindingError> {
-        self.store
-            .reject_symlinks()
-            .map_err(BindingError::from_store)?;
-        for path in [
-            self.store.config_root(),
-            self.store.state_root(),
-            self.niri_root(),
-        ] {
-            validate_writable_directory(path)?;
-        }
-        if self.recovery_root.exists() {
-            validate_writable_directory(&self.recovery_root)?;
-        }
-        for path in [self.store.settings_dir(), self.store.presets_dir()] {
-            if path.exists() {
-                validate_writable_directory(&path)?;
-            }
-        }
-        for path in [
-            self.store.settings_path(),
-            self.store.presets_path(),
-            self.generated_include.clone(),
-            self.journal.clone(),
-        ] {
-            validate_writable_file_if_present(&path)?;
-        }
-        if !self.niri_root.starts_with(self.store.config_root())
-            || !self.journal.starts_with(self.store.state_root())
-            || !self.generated_include.starts_with(&self.niri_root)
-            || !self.trusted_config.starts_with(&self.niri_root)
-            || !self.recovery_root.starts_with(self.store.state_root())
+        let expected = Self::from_xdg_roots(self.store.config_root(), self.store.state_root());
+        if !self.store.config_root().is_absolute()
+            || !self.store.state_root().is_absolute()
+            || self.niri_root != expected.niri_root
+            || self.journal != expected.journal
+            || self.generated_include != expected.generated_include
+            || self.trusted_config != expected.trusted_config
+            || self.recovery_root != expected.recovery_root
         {
             return Err(BindingError::new(
                 "unsafe_path",
@@ -434,18 +433,19 @@ pub fn apply_active_bindings(
     reloader: &dyn BindingReloader,
 ) -> Result<ApplyReport, BindingError> {
     prepare_new_transaction(paths)?;
-    let settings_missing = !paths.store().settings_path().exists();
-    let presets_missing = !paths.store().presets_path().exists();
-    if settings_missing && presets_missing {
-        let defaults = Defaults::packaged();
-        let settings = defaults.settings();
-        let active = defaults
-            .builtin(&settings.active_preset_id)
-            .expect("packaged active preset exists");
-        let store = StateStore::for_repair(paths.store.clone(), defaults);
-        return store
-            .with_repair_candidate_transaction(|_| {
+    let defaults = Defaults::packaged();
+    let store = StateStore::for_repair(paths.store.clone(), defaults.clone())
+        .map_err(BindingError::from_store)?;
+    store
+        .with_repair_candidate_transaction(|store| {
+            let (settings_exists, presets_exists) = store.document_presence()?;
+            if !settings_exists && !presets_exists {
+                let settings = defaults.settings();
+                let active = defaults
+                    .builtin(&settings.active_preset_id)
+                    .expect("packaged active preset exists");
                 apply_store_candidate(
+                    store,
                     paths,
                     validator,
                     reloader,
@@ -455,31 +455,31 @@ pub fn apply_active_bindings(
                     },
                     active.clone(),
                 )
-            })
-            .map_err(BindingError::from_store);
-    }
-    let store = StateStore::open(paths.store.clone(), Defaults::packaged())
-        .map_err(BindingError::from_store)?;
-    store
-        .with_transaction(|store| {
-            let settings = store.load_settings()?;
-            let preset = store
-                .find_preset(&settings.active_preset_id)?
-                .ok_or_else(|| crate::StoreError::invalid("active preset does not exist"))?;
-            let users = store.load_user_presets()?;
-            let bindings = compile_bindings(&preset).map_err(store_binding_error)?;
-            let preset_bytes = serde_json::to_vec(&users).map_err(crate::StoreError::io)?;
-            let settings_bytes = serde_json::to_vec(&settings).map_err(crate::StoreError::io)?;
-            apply_candidate_locked(
-                paths,
-                validator,
-                reloader,
-                &settings.active_preset_id,
-                &preset_bytes,
-                &settings_bytes,
-                bindings.as_bytes(),
-            )
-            .map_err(store_binding_error)
+            } else {
+                let settings = store.load_settings()?;
+                let preset = store
+                    .find_preset(&settings.active_preset_id)?
+                    .ok_or_else(|| crate::StoreError::invalid("active preset does not exist"))?;
+                let users = store.load_user_presets()?;
+                let bindings = compile_bindings(&preset).map_err(store_binding_error)?;
+                let preset_bytes = serde_json::to_vec(&users).map_err(crate::StoreError::io)?;
+                let settings_bytes =
+                    serde_json::to_vec(&settings).map_err(crate::StoreError::io)?;
+                apply_candidate_locked(
+                    &BindingFileSystem::open(paths, store.secure_handles())
+                        .map_err(store_binding_error)?,
+                    paths,
+                    validator,
+                    reloader,
+                    &settings.active_preset_id,
+                    CandidateArtifacts {
+                        preset: &preset_bytes,
+                        settings: &settings_bytes,
+                        bindings: bindings.as_bytes(),
+                    },
+                )
+                .map_err(store_binding_error)
+            }
         })
         .map_err(BindingError::from_store)
 }
@@ -499,7 +499,7 @@ pub fn activate_and_apply(
                 .find_preset(id)?
                 .ok_or_else(|| crate::StoreError::not_found(id))?;
             candidate.settings.active_preset_id = id.to_owned();
-            apply_store_candidate(paths, validator, reloader, candidate, preset)
+            apply_store_candidate(store, paths, validator, reloader, candidate, preset)
         })
         .map_err(BindingError::from_store)
 }
@@ -516,7 +516,7 @@ pub fn update_active_bindings_and_apply(
     let store = StateStore::open(paths.store.clone(), Defaults::packaged())
         .map_err(BindingError::from_store)?;
     store
-        .with_candidate_transaction(|_store, mut candidate| {
+        .with_candidate_transaction(|store, mut candidate| {
             require_active_target(&candidate, id)?;
             if replacement.id != id {
                 return Err(crate::StoreError::conflict(format!(
@@ -534,7 +534,7 @@ pub fn update_active_bindings_and_apply(
                 copy.base_preset_id = Some(BUILTIN_PRESET_ID.to_owned());
                 candidate.settings.active_preset_id = copy.id.clone();
                 candidate.user_presets.push(copy.clone());
-                return apply_store_candidate(paths, validator, reloader, candidate, copy);
+                return apply_store_candidate(store, paths, validator, reloader, candidate, copy);
             }
             if replacement.origin != PresetOrigin::User {
                 return Err(crate::StoreError::immutable(id));
@@ -545,7 +545,14 @@ pub fn update_active_bindings_and_apply(
                 .position(|preset| preset.id == id)
                 .ok_or_else(|| crate::StoreError::not_found(id))?;
             candidate.user_presets[position] = replacement.clone();
-            apply_store_candidate(paths, validator, reloader, candidate, replacement.clone())
+            apply_store_candidate(
+                store,
+                paths,
+                validator,
+                reloader,
+                candidate,
+                replacement.clone(),
+            )
         })
         .map_err(BindingError::from_store)
 }
@@ -601,7 +608,7 @@ pub fn mutate_keybinding_and_apply(
                 .position(|candidate| candidate.id == preset.id)
                 .ok_or_else(|| crate::StoreError::not_found(&preset.id))?;
             state.user_presets[position] = preset.clone();
-            apply_store_candidate(paths, validator, reloader, state, preset)
+            apply_store_candidate(store, paths, validator, reloader, state, preset)
         })
         .map_err(BindingError::from_store)
 }
@@ -660,11 +667,15 @@ pub fn repair_state(
             })?
     };
     compile_bindings(&active)?;
-    let store = StateStore::for_repair(paths.store.clone(), defaults);
+    let store =
+        StateStore::for_repair(paths.store.clone(), defaults).map_err(BindingError::from_store)?;
     store
-        .with_repair_candidate_transaction(|_| {
-            backup_original_state(paths).map_err(store_binding_error)?;
+        .with_repair_candidate_transaction(|store| {
+            let fs = BindingFileSystem::open(paths, store.secure_handles())
+                .map_err(store_binding_error)?;
+            backup_original_state(paths, &fs).map_err(store_binding_error)?;
             apply_store_candidate(
+                store,
                 paths,
                 validator,
                 reloader,
@@ -679,6 +690,7 @@ pub fn repair_state(
 }
 
 fn apply_store_candidate(
+    store: &StateStore,
     paths: &BindingPaths,
     validator: &dyn BindingValidator,
     reloader: &dyn BindingReloader,
@@ -693,13 +705,16 @@ fn apply_store_candidate(
         serde_json::to_vec(&candidate.user_presets).map_err(crate::StoreError::io)?;
     let settings_bytes = serde_json::to_vec(&candidate.settings).map_err(crate::StoreError::io)?;
     apply_candidate_locked(
+        &BindingFileSystem::open(paths, store.secure_handles()).map_err(store_binding_error)?,
         paths,
         validator,
         reloader,
         &candidate.settings.active_preset_id,
-        &preset_bytes,
-        &settings_bytes,
-        bindings.as_bytes(),
+        CandidateArtifacts {
+            preset: &preset_bytes,
+            settings: &settings_bytes,
+            bindings: bindings.as_bytes(),
+        },
     )
     .map_err(store_binding_error)
 }
@@ -716,12 +731,6 @@ fn require_active_target(candidate: &StateCandidate, id: &str) -> Result<(), cra
 
 fn prepare_new_transaction(paths: &BindingPaths) -> Result<(), BindingError> {
     paths.validate()?;
-    if paths.journal().exists() {
-        return Err(BindingError::new(
-            "transaction_in_progress",
-            "reconcile the existing binding transaction before starting another",
-        ));
-    }
     Ok(())
 }
 
@@ -748,71 +757,103 @@ fn validate_repair_presets(
     Ok(())
 }
 
-fn backup_original_state(paths: &BindingPaths) -> Result<(), BindingError> {
-    use std::os::unix::fs::DirBuilderExt;
-
-    if !paths.recovery_root().exists() {
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder
-            .create(paths.recovery_root())
-            .map_err(|error| io_error("create recovery root", error))?;
+fn backup_original_state(paths: &BindingPaths, fs: &BindingFileSystem) -> Result<(), BindingError> {
+    let expected = paths.store().state_root().join("sleepy/recovery");
+    if paths.recovery_root() != expected {
+        return Err(BindingError::new(
+            "unsafe_path",
+            "recovery path escapes state root",
+        ));
     }
-    validate_writable_directory(paths.recovery_root())?;
-    let recovery = paths
-        .recovery_root()
-        .join(Uuid::new_v4().hyphenated().to_string());
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder
-        .create(&recovery)
-        .map_err(|error| io_error("create non-overwriting recovery directory", error))?;
-    for (source, name) in [
-        (paths.store().settings_path(), "settings.json"),
-        (paths.store().presets_path(), "presets.json"),
+    let recovery_root = fs
+        .handles
+        .presets
+        .child_writable("recovery".as_ref(), true)
+        .map_err(BindingError::from_store)?;
+    let name = Uuid::new_v4().hyphenated().to_string();
+    let recovery = recovery_root
+        .child_writable(name.as_ref(), true)
+        .map_err(BindingError::from_store)?;
+    for (source, destination) in [
+        (&fs.handles.settings, "settings.json"),
+        (&fs.handles.presets, "presets.json"),
     ] {
-        match fs::read(&source) {
-            Ok(bytes) => write_private_file(&recovery.join(name), &bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(io_error("read malformed original state", error)),
+        if let Some(bytes) = source
+            .read_optional(destination.as_ref())
+            .map_err(BindingError::from_store)?
+        {
+            recovery
+                .write_new(destination.as_ref(), &bytes)
+                .map_err(BindingError::from_store)?;
         }
     }
-    File::open(&recovery)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error("sync recovery directory", error))?;
-    File::open(paths.recovery_root())
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| io_error("sync recovery root", error))
+    recovery.sync().map_err(BindingError::from_store)?;
+    recovery_root.sync().map_err(BindingError::from_store)
 }
 
 pub fn reconcile_bindings(
     paths: &BindingPaths,
     reloader: &dyn BindingReloader,
 ) -> Result<Option<ApplyReport>, BindingError> {
+    reconcile_bindings_mode(paths, reloader, false)
+}
+
+pub fn reconcile_bindings_online_required(
+    paths: &BindingPaths,
+    reloader: &dyn BindingReloader,
+) -> Result<Option<ApplyReport>, BindingError> {
+    reconcile_bindings_mode(paths, reloader, true)
+}
+
+pub fn initialize_bindings(
+    paths: &BindingPaths,
+    validator: &dyn BindingValidator,
+    reloader: &dyn BindingReloader,
+) -> Result<ApplyReport, BindingError> {
+    if let Some(report) = reconcile_bindings(paths, reloader)? {
+        return Ok(report);
+    }
+    apply_active_bindings(paths, validator, reloader)
+}
+
+fn reconcile_bindings_mode(
+    paths: &BindingPaths,
+    reloader: &dyn BindingReloader,
+    online_required: bool,
+) -> Result<Option<ApplyReport>, BindingError> {
     paths.validate()?;
-    let store = StateStore::for_repair(paths.store.clone(), Defaults::packaged());
+    let store = StateStore::for_repair(paths.store.clone(), Defaults::packaged())
+        .map_err(BindingError::from_store)?;
     store
-        .with_repair_candidate_transaction(|_| {
-            reconcile_bindings_locked(paths, reloader).map_err(store_binding_error)
+        .with_repair_candidate_transaction(|store| {
+            let fs = BindingFileSystem::open(paths, store.secure_handles())
+                .map_err(store_binding_error)?;
+            paths
+                .observe(ApplyStage::WritableDirectoriesOpened)
+                .map_err(store_binding_error)?;
+            reconcile_bindings_locked(&fs, paths, reloader, online_required)
+                .map_err(store_binding_error)
         })
         .map_err(BindingError::from_store)
 }
 
 fn reconcile_bindings_locked(
+    fs: &BindingFileSystem,
     paths: &BindingPaths,
     reloader: &dyn BindingReloader,
+    online_required: bool,
 ) -> Result<Option<ApplyReport>, BindingError> {
-    let Some(mut journal) = TransactionJournal::load(paths)? else {
+    let Some(mut journal) = TransactionJournal::load(fs, paths)? else {
         return Ok(None);
     };
     if !journal.sidecars_complete {
-        journal.cleanup(paths)?;
+        journal.cleanup(fs, paths)?;
         return Ok(None);
     }
     if journal.phase == JournalPhase::ReloadConfirmed {
         let status = status_for(journal.recovery_target);
         let active_preset_id = journal.active_preset_id_for(journal.recovery_target)?;
-        journal.cleanup(paths)?;
+        journal.cleanup(fs, paths)?;
         return Ok(Some(ApplyReport {
             status,
             active_preset_id,
@@ -826,22 +867,30 @@ fn reconcile_bindings_locked(
         JournalPhase::BindingsCommitted | JournalPhase::ReloadPending => journal.recovery_target,
         JournalPhase::ReloadConfirmed => unreachable!("handled above"),
     };
-    let mut stream = reloader
-        .subscribe()
-        .map_err(|message| BindingError::new("reload_failed", message))?;
+    let mut stream = if online_required {
+        Some(
+            reloader
+                .subscribe_required(RELOAD_TIMEOUT)
+                .map_err(|message| BindingError::new("niri_unavailable", message))?,
+        )
+    } else {
+        reloader
+            .subscribe()
+            .map_err(|message| BindingError::new("reload_failed", message))?
+    };
     if let Some(stream) = stream.as_mut() {
         stream
             .await_initial_snapshot(RELOAD_TIMEOUT)
             .map_err(|message| BindingError::new("reload_failed", message))?;
     }
     if target == RecoveryTarget::Previous {
-        journal.set_recovery_target(paths, target)?;
+        journal.set_recovery_target(fs, target)?;
     }
-    journal.install_target(paths, target)?;
+    journal.install_target(fs, paths, target)?;
     if target == RecoveryTarget::Candidate {
-        journal.set_recovery_target(paths, target)?;
+        journal.set_recovery_target(fs, target)?;
     }
-    journal.set_phase(paths, JournalPhase::ReloadPending)?;
+    journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
     let active_preset_id = journal.active_preset_id_for(target)?;
 
     let Some(mut stream) = stream else {
@@ -851,8 +900,8 @@ fn reconcile_bindings_locked(
         }));
     };
     if reload_confirmed(paths, reloader, stream.as_mut())? {
-        journal.set_phase(paths, JournalPhase::ReloadConfirmed)?;
-        journal.cleanup(paths)?;
+        journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
+        journal.cleanup(fs, paths)?;
         return Ok(Some(ApplyReport {
             status: status_for(target),
             active_preset_id,
@@ -876,17 +925,17 @@ fn reconcile_bindings_locked(
         }
         Ok(None) | Err(_) => None,
     };
-    journal.set_recovery_target(paths, RecoveryTarget::Previous)?;
-    journal.restore_all(paths)?;
-    journal.set_phase(paths, JournalPhase::ReloadPending)?;
+    journal.set_recovery_target(fs, RecoveryTarget::Previous)?;
+    journal.restore_all(fs, paths)?;
+    journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
     let confirmed = match rollback_stream.as_mut() {
         Some(stream) => reload_confirmed(paths, reloader, stream.as_mut())?,
         None => false,
     };
     if confirmed {
-        journal.set_phase(paths, JournalPhase::ReloadConfirmed)?;
-        journal.cleanup(paths)?;
+        journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
+        journal.cleanup(fs, paths)?;
         Ok(Some(ApplyReport {
             status: ApplyStatus::RolledBackConfirmed,
             active_preset_id: previous_active_preset_id,
@@ -914,22 +963,33 @@ fn store_binding_error(error: BindingError) -> crate::StoreError {
     )
 }
 
+struct CandidateArtifacts<'a> {
+    preset: &'a [u8],
+    settings: &'a [u8],
+    bindings: &'a [u8],
+}
+
 fn apply_candidate_locked(
+    fs: &BindingFileSystem,
     paths: &BindingPaths,
     validator: &dyn BindingValidator,
     reloader: &dyn BindingReloader,
     active_preset_id: &str,
-    preset_bytes: &[u8],
-    settings_bytes: &[u8],
-    binding_bytes: &[u8],
+    artifacts: CandidateArtifacts<'_>,
 ) -> Result<ApplyReport, BindingError> {
-    if paths.journal().exists() {
+    paths.observe(ApplyStage::WritableDirectoriesOpened)?;
+    if fs
+        .handles
+        .presets
+        .exists(BindingFileSystem::journal_name())
+        .map_err(BindingError::from_store)?
+    {
         return Err(BindingError::new(
             "transaction_in_progress",
             "reconcile the existing binding transaction before starting another",
         ));
     }
-    validate_candidate_tree(paths, binding_bytes, validator)?;
+    validate_candidate_tree(fs, paths, artifacts.bindings, validator)?;
     let mut candidate_stream = reloader
         .subscribe()
         .map_err(|message| BindingError::new("reload_failed", message))?;
@@ -940,19 +1000,20 @@ fn apply_candidate_locked(
     }
 
     let mut journal = TransactionJournal::prepare(
+        fs,
         paths,
         active_preset_id,
-        preset_bytes,
-        settings_bytes,
-        binding_bytes,
+        artifacts.preset,
+        artifacts.settings,
+        artifacts.bindings,
     )?;
-    journal.install_new(paths, ArtifactKind::Preset)?;
-    journal.set_phase(paths, JournalPhase::PresetCommitted)?;
-    journal.install_new(paths, ArtifactKind::Settings)?;
-    journal.set_phase(paths, JournalPhase::SettingsCommitted)?;
-    journal.install_new(paths, ArtifactKind::Bindings)?;
-    journal.set_phase(paths, JournalPhase::BindingsCommitted)?;
-    journal.set_phase(paths, JournalPhase::ReloadPending)?;
+    journal.install_new(fs, paths, ArtifactKind::Preset)?;
+    journal.set_phase(fs, paths, JournalPhase::PresetCommitted)?;
+    journal.install_new(fs, paths, ArtifactKind::Settings)?;
+    journal.set_phase(fs, paths, JournalPhase::SettingsCommitted)?;
+    journal.install_new(fs, paths, ArtifactKind::Bindings)?;
+    journal.set_phase(fs, paths, JournalPhase::BindingsCommitted)?;
+    journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
 
     let Some(mut candidate_stream) = candidate_stream else {
         return Ok(ApplyReport {
@@ -961,8 +1022,8 @@ fn apply_candidate_locked(
         });
     };
     if reload_confirmed(paths, reloader, candidate_stream.as_mut())? {
-        journal.set_phase(paths, JournalPhase::ReloadConfirmed)?;
-        journal.cleanup(paths)?;
+        journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
+        journal.cleanup(fs, paths)?;
         return Ok(ApplyReport {
             status: ApplyStatus::Committed,
             active_preset_id: active_preset_id.to_owned(),
@@ -980,17 +1041,17 @@ fn apply_candidate_locked(
         }
         Ok(None) | Err(_) => None,
     };
-    journal.set_recovery_target(paths, RecoveryTarget::Previous)?;
-    journal.restore_all(paths)?;
-    journal.set_phase(paths, JournalPhase::ReloadPending)?;
+    journal.set_recovery_target(fs, RecoveryTarget::Previous)?;
+    journal.restore_all(fs, paths)?;
+    journal.set_phase(fs, paths, JournalPhase::ReloadPending)?;
     let previous_active_preset_id = journal.active_preset_id_for(RecoveryTarget::Previous)?;
     let rollback_confirmed = match rollback_stream.as_mut() {
         Some(stream) => reload_confirmed(paths, reloader, stream.as_mut())?,
         None => false,
     };
     if rollback_confirmed {
-        journal.set_phase(paths, JournalPhase::ReloadConfirmed)?;
-        journal.cleanup(paths)?;
+        journal.set_phase(fs, paths, JournalPhase::ReloadConfirmed)?;
+        journal.cleanup(fs, paths)?;
         Ok(ApplyReport {
             status: ApplyStatus::RolledBackConfirmed,
             active_preset_id: previous_active_preset_id,
@@ -1019,56 +1080,56 @@ fn reload_confirmed(
 }
 
 fn validate_candidate_tree(
-    paths: &BindingPaths,
+    fs: &BindingFileSystem,
+    _paths: &BindingPaths,
     binding_bytes: &[u8],
     validator: &dyn BindingValidator,
 ) -> Result<(), BindingError> {
-    let staging_root = paths
-        .store
-        .state_root()
-        .join("sleepy")
-        .join(format!(".niri-validation-{}", Uuid::new_v4()));
-    fs::create_dir(&staging_root)
-        .map_err(|error| io_error("create Niri validation tree", error))?;
+    let staging_name = format!(".niri-validation-{}", Uuid::new_v4());
+    let staging_root = fs
+        .handles
+        .presets
+        .child_writable(staging_name.as_ref(), true)
+        .map_err(BindingError::from_store)?;
     let result = (|| {
-        copy_config_tree(paths.niri_root(), &staging_root, paths.generated_include())?;
-        let staged_include = staging_root.join(
-            paths
-                .generated_include()
-                .file_name()
-                .expect("generated include has file name"),
-        );
-        write_private_file(&staged_include, binding_bytes)?;
-        let staged_config = staging_root.join(
-            paths
-                .trusted_config()
-                .file_name()
-                .expect("trusted config has file name"),
-        );
+        copy_config_tree(&fs.niri.proc_path(), &staging_root, true)?;
+        staging_root
+            .write_new(
+                BindingFileSystem::artifact_name(ArtifactKind::Bindings),
+                binding_bytes,
+            )
+            .map_err(BindingError::from_store)?;
+        staging_root.sync().map_err(BindingError::from_store)?;
+        let staged_path = staging_root.proc_path();
+        let staged_config = staged_path.join("config.kdl");
         validator
-            .validate(&staging_root, &staged_config)
+            .validate(&staged_path, &staged_config)
             .map_err(|message| BindingError::new("validation_failed", message))
     })();
-    let cleanup = fs::remove_dir_all(&staging_root);
+    let cleanup = remove_tree(&staging_root).and_then(|()| {
+        fs.handles
+            .presets
+            .remove_dir(staging_name.as_ref())
+            .map_err(BindingError::from_store)
+    });
     match (result, cleanup) {
         (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(io_error("remove Niri validation tree", error)),
+        (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
 
 fn copy_config_tree(
     source: &Path,
-    destination: &Path,
-    generated: &Path,
+    destination: &crate::store::SecureDir,
+    root: bool,
 ) -> Result<(), BindingError> {
     for entry in fs::read_dir(source).map_err(|error| io_error("read Niri config tree", error))? {
         let entry = entry.map_err(|error| io_error("read Niri config entry", error))?;
         let source_path = entry.path();
-        if source_path == generated {
+        if root && entry.file_name() == BindingFileSystem::artifact_name(ArtifactKind::Bindings) {
             continue;
         }
-        let destination_path = destination.join(entry.file_name());
         let metadata = fs::symlink_metadata(&source_path)
             .map_err(|error| io_error("inspect Niri config entry", error))?;
         if metadata.file_type().is_symlink() {
@@ -1082,15 +1143,23 @@ fn copy_config_tree(
                     format!("untrusted static Niri symlink: {}", source_path.display()),
                 ));
             }
-            fs::copy(&resolved, &destination_path)
-                .map_err(|error| io_error("copy static Niri file", error))?;
+            let bytes =
+                fs::read(&resolved).map_err(|error| io_error("read static Niri file", error))?;
+            destination
+                .write_new(&entry.file_name(), &bytes)
+                .map_err(BindingError::from_store)?;
         } else if metadata.is_dir() {
-            fs::create_dir(&destination_path)
-                .map_err(|error| io_error("create staged Niri directory", error))?;
-            copy_config_tree(&source_path, &destination_path, generated)?;
+            let child = destination
+                .child_writable(&entry.file_name(), true)
+                .map_err(BindingError::from_store)?;
+            copy_config_tree(&source_path, &child, false)?;
+            child.sync().map_err(BindingError::from_store)?;
         } else if metadata.is_file() {
-            fs::copy(&source_path, &destination_path)
-                .map_err(|error| io_error("copy static Niri file", error))?;
+            let bytes =
+                fs::read(&source_path).map_err(|error| io_error("read static Niri file", error))?;
+            destination
+                .write_new(&entry.file_name(), &bytes)
+                .map_err(BindingError::from_store)?;
         } else {
             return Err(BindingError::new(
                 "unsafe_path",
@@ -1104,51 +1173,24 @@ fn copy_config_tree(
     Ok(())
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), BindingError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| io_error("create staged generated include", error))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| io_error("sync staged generated include", error))
-}
-
-fn validate_writable_directory(path: &Path) -> Result<(), BindingError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| io_error("inspect writable binding directory", error))?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o022 != 0
-    {
-        return Err(BindingError::new(
-            "unsafe_path",
-            format!("unsafe writable binding directory: {}", path.display()),
-        ));
+fn remove_tree(directory: &crate::store::SecureDir) -> Result<(), BindingError> {
+    for name in directory.entries().map_err(BindingError::from_store)? {
+        let path = directory.proc_path().join(&name);
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| io_error("inspect staged entry", error))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let child = directory
+                .child_writable(&name, false)
+                .map_err(BindingError::from_store)?;
+            remove_tree(&child)?;
+            directory
+                .remove_dir(&name)
+                .map_err(BindingError::from_store)?;
+        } else {
+            directory
+                .remove_file(&name)
+                .map_err(BindingError::from_store)?;
+        }
     }
-    Ok(())
-}
-
-pub(crate) fn validate_writable_file_if_present(path: &Path) -> Result<(), BindingError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(io_error("inspect writable binding file", error)),
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o133 != 0
-    {
-        return Err(BindingError::new(
-            "unsafe_path",
-            format!("unsafe writable binding file: {}", path.display()),
-        ));
-    }
-    Ok(())
+    directory.sync().map_err(BindingError::from_store)
 }

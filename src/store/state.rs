@@ -1,11 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    fmt,
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, ffi::OsStr, fmt, io, sync::Arc};
 
 use fs2::FileExt;
 use serde::Serialize;
@@ -16,7 +9,7 @@ use sleepy_sdk::{
 };
 use uuid::Uuid;
 
-use super::{Defaults, StoreError, StorePaths};
+use super::{Defaults, SecureDir, StoreError, StoreHandles, StorePaths};
 
 /// Observable replacement boundary used by callers that need explicit fault injection.
 pub trait ReplacementObserver: Send + Sync {
@@ -44,6 +37,7 @@ pub enum PresetMutationStage {
 #[derive(Clone)]
 pub struct StateStore {
     paths: StorePaths,
+    handles: Arc<StoreHandles>,
     defaults: Defaults,
     replacement_observer: Option<Arc<dyn ReplacementObserver>>,
     mutation_observer: Option<Arc<dyn PresetMutationObserver>>,
@@ -85,23 +79,26 @@ pub struct InspectionIssue {
 
 impl StateInspector {
     pub fn inspect(paths: StorePaths) -> InspectionReport {
-        if let Err(error) = paths.reject_symlinks() {
-            let issue = inspection_issue(None, None, Vec::new(), &error);
-            let document = InspectionDocumentReport {
-                exists: false,
-                byte_length: 0,
-                valid: false,
-                issues: vec![issue],
-            };
-            return InspectionReport {
-                clean: false,
-                settings: document.clone(),
-                presets: document,
-            };
-        }
+        let handles = match StoreHandles::open(&paths, false) {
+            Ok(handles) => handles,
+            Err(error) => {
+                let issue = inspection_issue(None, None, Vec::new(), &error);
+                let document = InspectionDocumentReport {
+                    exists: false,
+                    byte_length: 0,
+                    valid: false,
+                    issues: vec![issue],
+                };
+                return InspectionReport {
+                    clean: false,
+                    settings: document.clone(),
+                    presets: document,
+                };
+            }
+        };
 
-        let (mut settings, active_id) = inspect_settings(&paths);
-        let (presets, preset_ids) = inspect_presets(&paths);
+        let (mut settings, active_id) = inspect_settings(&handles);
+        let (presets, preset_ids) = inspect_presets(&handles);
         if settings.valid {
             if let Some(active_id) = active_id {
                 if active_id != BUILTIN_PRESET_ID && !preset_ids.contains(&active_id) {
@@ -121,10 +118,16 @@ impl StateInspector {
     }
 }
 
-fn inspect_settings(paths: &StorePaths) -> (InspectionDocumentReport, Option<String>) {
-    let bytes = match fs::read(paths.settings_path()) {
-        Ok(bytes) => bytes,
-        Err(error) => return (unreadable_document(error), None),
+fn inspect_settings(handles: &StoreHandles) -> (InspectionDocumentReport, Option<String>) {
+    let bytes = match handles.settings.read_optional(OsStr::new("settings.json")) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return (
+                unreadable_document(io::Error::from(io::ErrorKind::NotFound)),
+                None,
+            )
+        }
+        Err(error) => return (unreadable_store_document(error), None),
     };
     let byte_length = bytes.len();
     let input = match std::str::from_utf8(&bytes) {
@@ -156,10 +159,16 @@ fn inspect_settings(paths: &StorePaths) -> (InspectionDocumentReport, Option<Str
     }
 }
 
-fn inspect_presets(paths: &StorePaths) -> (InspectionDocumentReport, BTreeSet<String>) {
-    let bytes = match fs::read(paths.presets_path()) {
-        Ok(bytes) => bytes,
-        Err(error) => return (unreadable_document(error), BTreeSet::new()),
+fn inspect_presets(handles: &StoreHandles) -> (InspectionDocumentReport, BTreeSet<String>) {
+    let bytes = match handles.presets.read_optional(OsStr::new("presets.json")) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return (
+                unreadable_document(io::Error::from(io::ErrorKind::NotFound)),
+                BTreeSet::new(),
+            )
+        }
+        Err(error) => return (unreadable_store_document(error), BTreeSet::new()),
     };
     let byte_length = bytes.len();
     let input = match std::str::from_utf8(&bytes) {
@@ -243,6 +252,15 @@ fn unreadable_document(error: io::Error) -> InspectionDocumentReport {
     }
 }
 
+fn unreadable_store_document(error: StoreError) -> InspectionDocumentReport {
+    InspectionDocumentReport {
+        exists: true,
+        byte_length: 0,
+        valid: false,
+        issues: vec![inspection_issue(None, None, Vec::new(), &error)],
+    }
+}
+
 fn invalid_document_report(byte_length: usize, error: StoreError) -> InspectionDocumentReport {
     InspectionDocumentReport {
         exists: true,
@@ -279,8 +297,10 @@ impl fmt::Debug for StateStore {
 
 impl StateStore {
     pub fn open(paths: StorePaths, defaults: Defaults) -> Result<Self, StoreError> {
+        let handles = Arc::new(StoreHandles::open(&paths, true)?);
         let store = Self {
             paths,
+            handles,
             defaults,
             replacement_observer: None,
             mutation_observer: None,
@@ -299,13 +319,15 @@ impl StateStore {
         Ok(store)
     }
 
-    pub(crate) fn for_repair(paths: StorePaths, defaults: Defaults) -> Self {
-        Self {
+    pub(crate) fn for_repair(paths: StorePaths, defaults: Defaults) -> Result<Self, StoreError> {
+        let handles = Arc::new(StoreHandles::open(&paths, true)?);
+        Ok(Self {
             paths,
+            handles,
             defaults,
             replacement_observer: None,
             mutation_observer: None,
-        }
+        })
     }
 
     /// Adds a replacement-stage observer to a cloned store handle.
@@ -416,17 +438,10 @@ impl StateStore {
         operation: impl FnOnce(&Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         // A single configuration-root lock establishes the order for all settings/preset operations.
-        self.paths.reject_symlinks()?;
-        fs::create_dir_all(self.paths.settings_dir()).map_err(StoreError::io)?;
-        fs::create_dir_all(self.paths.presets_dir()).map_err(StoreError::io)?;
-        self.paths.reject_symlinks()?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.paths.lock_path())
-            .map_err(StoreError::io)?;
+        let lock = self
+            .handles
+            .settings
+            .open_lock(OsStr::new(".sleepy-session.lock"))?;
         lock.lock_exclusive().map_err(StoreError::io)?;
         let result = operation(self);
         FileExt::unlock(&lock).map_err(StoreError::io)?;
@@ -461,22 +476,26 @@ impl StateStore {
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
-        if !self.paths.settings_path().exists() {
+        if !self.handles.settings.exists(OsStr::new("settings.json"))? {
             self.write_settings(&self.defaults.settings)?;
         }
-        if !self.paths.presets_path().exists() {
+        if !self.handles.presets.exists(OsStr::new("presets.json"))? {
             self.write_user_presets(&[])?;
         }
         Ok(())
     }
 
     pub(crate) fn load_settings(&self) -> Result<SettingsDocument, StoreError> {
-        let input = fs::read_to_string(self.paths.settings_path()).map_err(StoreError::io)?;
+        let bytes = self.handles.settings.read(OsStr::new("settings.json"))?;
+        let input =
+            String::from_utf8(bytes).map_err(|error| StoreError::invalid(error.to_string()))?;
         validate_settings(&input).map_err(|error| StoreError::invalid(error.to_string()))
     }
 
     pub(crate) fn load_user_presets(&self) -> Result<Vec<PresetDocument>, StoreError> {
-        let input = fs::read_to_string(self.paths.presets_path()).map_err(StoreError::io)?;
+        let bytes = self.handles.presets.read(OsStr::new("presets.json"))?;
+        let input =
+            String::from_utf8(bytes).map_err(|error| StoreError::invalid(error.to_string()))?;
         let presets: Vec<Value> =
             serde_json::from_str(&input).map_err(|error| StoreError::invalid(error.to_string()))?;
         let presets = presets
@@ -521,8 +540,8 @@ impl StateStore {
             .map_err(|error| StoreError::invalid(error.to_string()))?;
         let validated = parse_settings(value)?;
         atomic_replace(
-            &self.paths.settings_dir(),
-            &self.paths.settings_path(),
+            &self.handles.settings,
+            OsStr::new("settings.json"),
             &serde_json::to_vec(&validated).map_err(StoreError::io)?,
             self.replacement_observer.as_deref(),
         )
@@ -549,11 +568,22 @@ impl StateStore {
         let mut sorted = presets.to_vec();
         sorted.sort_by(|left, right| left.id.cmp(&right.id));
         atomic_replace(
-            &self.paths.presets_dir(),
-            &self.paths.presets_path(),
+            &self.handles.presets,
+            OsStr::new("presets.json"),
             &serde_json::to_vec(&sorted).map_err(StoreError::io)?,
             self.replacement_observer.as_deref(),
         )
+    }
+
+    pub(crate) fn secure_handles(&self) -> Arc<StoreHandles> {
+        Arc::clone(&self.handles)
+    }
+
+    pub(crate) fn document_presence(&self) -> Result<(bool, bool), StoreError> {
+        Ok((
+            self.handles.settings.exists(OsStr::new("settings.json"))?,
+            self.handles.presets.exists(OsStr::new("presets.json"))?,
+        ))
     }
 }
 
@@ -578,49 +608,28 @@ pub(crate) fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
 }
 
 fn atomic_replace(
-    directory: &Path,
-    destination: &Path,
+    directory: &SecureDir,
+    destination: &OsStr,
     bytes: &[u8],
     observer: Option<&dyn ReplacementObserver>,
 ) -> Result<(), StoreError> {
-    fs::create_dir_all(directory).map_err(StoreError::io)?;
-    let temporary = directory.join(format!(
-        ".{}.{}.tmp",
-        destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        Uuid::new_v4()
-    ));
-    let mut replacement = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(StoreError::io)?;
-    let result = replacement
-        .write_all(bytes)
-        .and_then(|()| replacement.sync_all());
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(StoreError::io(error));
-    }
-    if let Some(observer) = observer {
-        if let Err(error) = observer.reached(ReplacementStage::TemporaryFileSynced) {
-            let _ = fs::remove_file(&temporary);
-            return Err(StoreError::io(error));
-        }
-    }
-    drop(replacement);
-    if let Err(error) = fs::rename(&temporary, destination) {
-        let _ = fs::remove_file(&temporary);
-        return Err(StoreError::io(error));
-    }
-    if let Some(observer) = observer {
-        if let Err(error) = observer.reached(ReplacementStage::RenamedBeforeParentSync) {
-            return Err(StoreError::commit_state_unknown(error));
-        }
-    }
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(StoreError::commit_state_unknown)
+    directory.atomic_replace(
+        destination,
+        bytes,
+        || {
+            observer
+                .map(|observer| observer.reached(ReplacementStage::TemporaryFileSynced))
+                .transpose()
+                .map(|_| ())
+                .map_err(StoreError::io)
+        },
+        || {
+            observer
+                .map(|observer| observer.reached(ReplacementStage::RenamedBeforeParentSync))
+                .transpose()
+                .map(|_| ())
+                .map_err(StoreError::commit_state_unknown)
+        },
+        || Ok(()),
+    )
 }

@@ -744,6 +744,52 @@ fn cli_online_reload_waits_through_delayed_stale_snapshot_and_keeps_json_clean()
 }
 
 #[test]
+fn cli_initialize_reconciles_pending_offline_and_online_required_fails_distinctly() {
+    let root = TempDir::new().unwrap();
+    prepare_niri_tree(&root);
+    let first = command(&root)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .args(["bindings", "initialize"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let journal = fs::read(root.path().join("state/sleepy/bindings-transaction.json")).unwrap();
+
+    let second = command(&root)
+        .env("SLEEPY_NIRI_VALIDATOR", "/bin/true")
+        .args(["bindings", "initialize"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&second.stdout).unwrap()["status"],
+        "reloadPending"
+    );
+    assert_eq!(
+        fs::read(root.path().join("state/sleepy/bindings-transaction.json")).unwrap(),
+        journal
+    );
+
+    let required = command(&root)
+        .args(["bindings", "reconcile", "--online-required"])
+        .output()
+        .unwrap();
+    assert!(!required.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&required.stderr).unwrap()["error"]["code"],
+        "niri_unavailable"
+    );
+}
+
+#[test]
 fn cli_active_apply_conflict_keeps_structured_action_details_without_writing() {
     let root = TempDir::new().unwrap();
     prepare_niri_tree(&root);

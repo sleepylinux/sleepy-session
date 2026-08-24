@@ -526,6 +526,64 @@ struct FailingObserver {
     seen: Arc<Mutex<Vec<ReplacementStage>>>,
 }
 
+#[cfg(unix)]
+struct SwapDirectoryObserver {
+    source: std::path::PathBuf,
+    moved: std::path::PathBuf,
+    attacker: std::path::PathBuf,
+    swapped: Mutex<bool>,
+}
+
+#[cfg(unix)]
+impl ReplacementObserver for SwapDirectoryObserver {
+    fn reached(&self, stage: ReplacementStage) -> io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let mut swapped = self.swapped.lock().unwrap();
+        if stage == ReplacementStage::TemporaryFileSynced && !*swapped {
+            fs::rename(&self.source, &self.moved)?;
+            symlink(&self.attacker, &self.source)?;
+            *swapped = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preset_replacement_retains_open_directory_across_path_swap() {
+    let temp = TempDir::new().unwrap();
+    let paths = paths(&temp);
+    let initial = StateStore::open(paths.clone(), defaults()).unwrap();
+    let id = "5268c988-5c83-4921-a592-2c3342e59d61";
+    initial
+        .create_user_preset(user_preset(id, "Before swap"))
+        .unwrap();
+    let source = paths.presets_path().parent().unwrap().to_owned();
+    let moved = temp.path().join("state-sleepy-opened");
+    let attacker = temp.path().join("attacker-state");
+    fs::create_dir(&attacker).unwrap();
+    fs::write(attacker.join("presets.json"), b"attacker-bytes").unwrap();
+    let store = initial.with_replacement_observer(Arc::new(SwapDirectoryObserver {
+        source,
+        moved: moved.clone(),
+        attacker: attacker.clone(),
+        swapped: Mutex::new(false),
+    }));
+
+    store
+        .update_user_preset(id, updated_user_preset(id, "After swap"))
+        .unwrap();
+
+    let records: Value =
+        serde_json::from_slice(&fs::read(moved.join("presets.json")).unwrap()).unwrap();
+    assert_eq!(records[0]["name"], "After swap");
+    assert_eq!(
+        fs::read(attacker.join("presets.json")).unwrap(),
+        b"attacker-bytes"
+    );
+}
+
 impl ReplacementObserver for FailingObserver {
     fn reached(&self, stage: ReplacementStage) -> io::Result<()> {
         self.seen.lock().unwrap().push(stage);

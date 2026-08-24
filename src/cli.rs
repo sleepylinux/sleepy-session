@@ -23,8 +23,8 @@ use sleepy_sdk::{
 
 use crate::{
     bindings::{
-        activate_and_apply, apply_active_bindings, compile_bindings,
-        import_replace_active_and_apply, mutate_keybinding_and_apply, reconcile_bindings,
+        activate_and_apply, compile_bindings, import_replace_active_and_apply, initialize_bindings,
+        mutate_keybinding_and_apply, reconcile_bindings, reconcile_bindings_online_required,
         repair_state, update_active_bindings_and_apply, BindingPaths, NiriReloader, NiriValidator,
         RepairBundle,
     },
@@ -89,6 +89,7 @@ enum CliCommand {
     BindingsRender,
     BindingsInitialize,
     BindingsReconcile,
+    BindingsReconcileOnlineRequired,
 }
 
 pub fn run(arguments: Vec<String>) -> Result<Value, StoreError> {
@@ -254,6 +255,13 @@ fn parse(arguments: Vec<String>) -> Result<CliCommand, StoreError> {
         [command, action] if command == "bindings" && action == "reconcile" => {
             CliCommand::BindingsReconcile
         }
+        [command, action, required]
+            if command == "bindings"
+                && action == "reconcile"
+                && required == "--online-required" =>
+        {
+            CliCommand::BindingsReconcileOnlineRequired
+        }
         _ => return Err(StoreError::invalid_command()),
     };
     Ok(command)
@@ -366,13 +374,20 @@ fn execute(command: CliCommand) -> Result<Value, StoreError> {
         CliCommand::BindingsInitialize => {
             let binding_paths = BindingPaths::from_environment();
             let (validator, reloader) = niri_services();
-            binding_value(apply_active_bindings(&binding_paths, &validator, &reloader))
+            binding_value(initialize_bindings(&binding_paths, &validator, &reloader))
         }
         CliCommand::BindingsReconcile => {
             let binding_paths = BindingPaths::from_environment();
             let (_, reloader) = niri_services();
             let report =
                 reconcile_bindings(&binding_paths, &reloader).map_err(binding_store_error)?;
+            serde_json::to_value(report).map_err(StoreError::io)
+        }
+        CliCommand::BindingsReconcileOnlineRequired => {
+            let binding_paths = BindingPaths::from_environment();
+            let (_, reloader) = niri_services();
+            let report = reconcile_bindings_online_required(&binding_paths, &reloader)
+                .map_err(binding_store_error)?;
             serde_json::to_value(report).map_err(StoreError::io)
         }
         CliCommand::BindingsRender => {
@@ -419,6 +434,9 @@ fn execute(command: CliCommand) -> Result<Value, StoreError> {
                 | CliCommand::BindingsRender
                 | CliCommand::BindingsInitialize
                 | CliCommand::BindingsReconcile => unreachable!("handled before store open"),
+                CliCommand::BindingsReconcileOnlineRequired => {
+                    unreachable!("handled before store open")
+                }
             }
         }
     }

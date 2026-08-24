@@ -2,6 +2,7 @@ mod actions;
 mod apply;
 mod compiler;
 mod journal;
+mod secure_fs;
 
 use std::{error::Error, fmt};
 
@@ -10,10 +11,10 @@ use sleepy_sdk::KeybindingConflict;
 
 pub use apply::{
     activate_and_apply, apply_active_bindings, import_replace_active_and_apply,
-    mutate_keybinding_and_apply, reconcile_bindings, repair_state,
-    update_active_bindings_and_apply, ApplyObserver, ApplyReport, ApplyStage, ApplyStatus,
-    BindingPaths, BindingReloader, BindingValidator, ConfigEventStream, ConfigLoaded, NiriReloader,
-    NiriValidator, RepairBundle,
+    initialize_bindings, mutate_keybinding_and_apply, reconcile_bindings,
+    reconcile_bindings_online_required, repair_state, update_active_bindings_and_apply,
+    ApplyObserver, ApplyReport, ApplyStage, ApplyStatus, BindingPaths, BindingReloader,
+    BindingValidator, ConfigEventStream, ConfigLoaded, NiriReloader, NiriValidator, RepairBundle,
 };
 pub use compiler::compile_bindings;
 

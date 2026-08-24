@@ -10,10 +10,10 @@ use sleepy_sdk::{PresetDocument, PresetOrigin};
 use sleepy_session::{
     bindings::{
         activate_and_apply, apply_active_bindings, compile_bindings,
-        import_replace_active_and_apply, mutate_keybinding_and_apply, reconcile_bindings,
-        repair_state, update_active_bindings_and_apply, ApplyObserver, ApplyStage, ApplyStatus,
-        BindingPaths, BindingReloader, BindingValidator, ConfigEventStream, ConfigLoaded,
-        RepairBundle,
+        import_replace_active_and_apply, initialize_bindings, mutate_keybinding_and_apply,
+        reconcile_bindings, reconcile_bindings_online_required, repair_state,
+        update_active_bindings_and_apply, ApplyObserver, ApplyStage, ApplyStatus, BindingPaths,
+        BindingReloader, BindingValidator, ConfigEventStream, ConfigLoaded, RepairBundle,
     },
     Defaults, StateStore, StorePaths,
 };
@@ -400,6 +400,38 @@ fn apply_offline_initializer_journals_missing_settings_presets_and_include_toget
 }
 
 #[test]
+fn offline_initializer_reconciles_an_existing_pending_journal_idempotently() {
+    let (_temp, paths) = apply_fixture();
+    let reloader = ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new())));
+    let first = initialize_bindings(&paths, &InitializingValidator, &reloader).unwrap();
+    assert_eq!(first.status, ApplyStatus::ReloadPending);
+    let settings = fs::read(paths.store().settings_path()).unwrap();
+    let presets = fs::read(paths.store().presets_path()).unwrap();
+    let include = fs::read(paths.generated_include()).unwrap();
+
+    let second = initialize_bindings(&paths, &InitializingValidator, &reloader).unwrap();
+
+    assert_eq!(second, first);
+    assert_eq!(fs::read(paths.store().settings_path()).unwrap(), settings);
+    assert_eq!(fs::read(paths.store().presets_path()).unwrap(), presets);
+    assert_eq!(fs::read(paths.generated_include()).unwrap(), include);
+    assert!(paths.journal().exists());
+}
+
+#[test]
+fn online_required_reconciliation_rejects_an_offline_stream_distinctly() {
+    let (_temp, paths) = apply_fixture();
+    let offline = ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new())));
+    let pending = apply_active_bindings(&paths, &InitializingValidator, &offline).unwrap();
+    assert_eq!(pending.status, ApplyStatus::ReloadPending);
+
+    let error = reconcile_bindings_online_required(&paths, &offline).unwrap_err();
+
+    assert_eq!(error.code(), "niri_unavailable");
+    assert!(paths.journal().exists());
+}
+
+#[test]
 fn apply_reconciliation_finishes_pending_candidate_once_and_is_idempotent() {
     let (_temp, paths) = apply_fixture();
     let initial_events = Arc::new(Mutex::new(Vec::new()));
@@ -458,6 +490,134 @@ impl ApplyObserver for StageRecorder {
         self.0.lock().unwrap().push(stage);
         Ok(())
     }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct SwapWritableDirectoryObserver {
+    source: std::path::PathBuf,
+    moved: std::path::PathBuf,
+    attacker: std::path::PathBuf,
+    swapped: Mutex<bool>,
+}
+
+#[cfg(unix)]
+impl ApplyObserver for SwapWritableDirectoryObserver {
+    fn reached(&self, stage: ApplyStage) -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+
+        let mut swapped = self.swapped.lock().unwrap();
+        if stage == ApplyStage::WritableDirectoriesOpened && !*swapped {
+            fs::rename(&self.source, &self.moved).map_err(|error| error.to_string())?;
+            symlink(&self.attacker, &self.source).map_err(|error| error.to_string())?;
+            *swapped = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_include_replacement_retains_open_niri_directory_across_path_swap() {
+    let (_temp, base_paths) = apply_fixture();
+    let source = base_paths.niri_root().to_owned();
+    let parent = source.parent().unwrap();
+    let moved = parent.join("niri-opened");
+    let attacker = parent.join("attacker-niri");
+    fs::create_dir(&attacker).unwrap();
+    fs::write(
+        attacker.join("config.kdl"),
+        "include optional=true \"sleepy-user-bindings.kdl\"\n",
+    )
+    .unwrap();
+    fs::write(
+        attacker.join("sleepy-user-bindings.kdl"),
+        "attacker-bytes\n",
+    )
+    .unwrap();
+    let paths = base_paths.with_observer(Arc::new(SwapWritableDirectoryObserver {
+        source,
+        moved: moved.clone(),
+        attacker: attacker.clone(),
+        swapped: Mutex::new(false),
+    }));
+
+    let report = apply_active_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::ReloadPending);
+    assert!(fs::read_to_string(moved.join("sleepy-user-bindings.kdl"))
+        .unwrap()
+        .contains("spawn \"ghostty\""));
+    assert_eq!(
+        fs::read_to_string(attacker.join("sleepy-user-bindings.kdl")).unwrap(),
+        "attacker-bytes\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_and_sidecars_retain_open_state_directory_across_path_swap() {
+    let (_temp, base_paths) = apply_fixture();
+    let source = base_paths.store().state_root().join("sleepy");
+    let moved = base_paths.store().state_root().join("sleepy-opened");
+    let attacker = base_paths.store().state_root().join("attacker-sleepy");
+    fs::create_dir(&attacker).unwrap();
+    fs::write(attacker.join("presets.json"), b"attacker-bytes\n").unwrap();
+    let paths = base_paths.with_observer(Arc::new(SwapWritableDirectoryObserver {
+        source,
+        moved: moved.clone(),
+        attacker: attacker.clone(),
+        swapped: Mutex::new(false),
+    }));
+
+    let report = apply_active_bindings(
+        &paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap();
+
+    assert_eq!(report.status, ApplyStatus::ReloadPending);
+    assert!(moved.join("bindings-transaction.json").is_file());
+    assert_eq!(
+        fs::read(attacker.join("presets.json")).unwrap(),
+        b"attacker-bytes\n"
+    );
+    assert!(!attacker.join("bindings-transaction.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn binding_roots_reject_ancestor_symlinks_and_relative_xdg_paths() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let linked = temp.path().join("linked");
+    symlink(&real, &linked).unwrap();
+    let linked_paths = BindingPaths::from_xdg_roots(linked.join("config"), real.join("state"));
+    let linked_error = apply_active_bindings(
+        &linked_paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap_err();
+    assert_eq!(linked_error.code(), "unsafe_path");
+
+    let relative_paths = BindingPaths::from_xdg_roots("relative-config", "relative-state");
+    let relative_error = apply_active_bindings(
+        &relative_paths,
+        &InitializingValidator,
+        &ScriptedReloader::offline(Arc::new(Mutex::new(Vec::new()))),
+    )
+    .unwrap_err();
+    assert_eq!(relative_error.code(), "unsafe_path");
 }
 
 #[test]
