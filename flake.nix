@@ -27,6 +27,8 @@
             # Cargo.lock fixes the SDK revision; this avoids an invented vendor hash.
             allowBuiltinFetchGit = true;
           };
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [ pkgs.dbus ];
           passthru.sleepy-sdk-source = sleepy-sdk;
           meta.license = pkgs.lib.licenses.gpl3Only;
         } // pkgs.lib.optionalAttrs withNiriContract {

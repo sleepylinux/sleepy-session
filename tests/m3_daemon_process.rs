@@ -1,7 +1,7 @@
 use std::{
     io::{BufRead, BufReader},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -13,6 +13,7 @@ use sleepy_sdk::{
 
 #[test]
 fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
+    let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("runtime");
     let state = temp.path().join("state");
@@ -20,6 +21,7 @@ fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
     std::fs::create_dir_all(&state).unwrap();
 
     let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
         .stdin(Stdio::null())
@@ -62,6 +64,7 @@ fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
 
 #[test]
 fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
+    let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("runtime");
     let state = temp.path().join("state");
@@ -69,6 +72,7 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     std::fs::create_dir_all(&state).unwrap();
 
     let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
         .stdin(Stdio::null())
@@ -119,6 +123,35 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
 }
 
 struct ChildGuard(Option<std::process::Child>);
+
+struct IsolatedBus {
+    address: String,
+    child: Child,
+}
+
+impl IsolatedBus {
+    fn start() -> Self {
+        let mut child = Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let address = BufReader::new(child.stdout.take().unwrap())
+            .lines()
+            .next()
+            .unwrap()
+            .unwrap();
+        Self { address, child }
+    }
+}
+
+impl Drop for IsolatedBus {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
 
 impl ChildGuard {
     fn kill_and_wait(&mut self) {

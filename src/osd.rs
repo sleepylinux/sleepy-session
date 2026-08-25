@@ -1,9 +1,15 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
-use sleepy_sdk::{validate_osd_event, NiriEvent, OsdEvent, OsdKind, WIRE_SCHEMA_VERSION};
+use sleepy_sdk::{
+    validate_osd_event, EventEnvelope, NiriEvent, OsdEvent, OsdKind, SessionEvent,
+    WIRE_SCHEMA_VERSION,
+};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::sessiond::EventSubscriber;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FocusedOsdRequest {
@@ -18,6 +24,25 @@ pub enum OsdRouteError {
     MissingFocus,
     StaleFocus,
     InvalidEvent,
+    RuntimeStopped,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OsdPublication {
+    pub sequence: u64,
+    pub visible: Vec<OsdEvent>,
+    pub overflow_by_output: BTreeMap<String, u64>,
+}
+
+#[derive(Clone)]
+pub struct OsdRuntimeHandle {
+    requests: mpsc::Sender<RouteRequest>,
+    publications: broadcast::Sender<OsdPublication>,
+}
+
+struct RouteRequest {
+    request: FocusedOsdRequest,
+    response: oneshot::Sender<Result<bool, OsdRouteError>>,
 }
 
 struct FocusedOutput {
@@ -64,11 +89,7 @@ impl OsdRouter {
         }
     }
 
-    pub fn push(&mut self, event: OsdEvent) -> bool {
-        self.push_at(event, Instant::now())
-    }
-
-    pub fn push_at(&mut self, event: OsdEvent, now: Instant) -> bool {
+    fn push_at(&mut self, event: OsdEvent, now: Instant) -> bool {
         let queue = self.outputs.entry(event.output_id.clone()).or_default();
         match &mut queue.current {
             None => {
@@ -129,7 +150,8 @@ impl OsdRouter {
         Ok(self.push_at(event, now))
     }
 
-    pub fn advance_time(&mut self, now: Instant) {
+    pub fn advance_time(&mut self, now: Instant) -> bool {
+        let mut changed = false;
         for queue in self.outputs.values_mut() {
             while let Some(since) = queue.current_since {
                 let Some(elapsed) = now.checked_duration_since(since) else {
@@ -141,11 +163,13 @@ impl OsdRouter {
                 let next_since = since + self.display_timeout;
                 queue.current = queue.pending.pop_front();
                 queue.current_since = queue.current.as_ref().map(|_| next_since);
+                changed = true;
                 if queue.current.is_none() {
                     break;
                 }
             }
         }
+        changed
     }
 
     pub fn current(&self, output_id: &str) -> Option<&OsdEvent> {
@@ -169,5 +193,93 @@ impl OsdRouter {
         queue.current = queue.pending.pop_front();
         queue.current_since = queue.current.as_ref().map(|_| Instant::now());
         queue.current.as_ref()
+    }
+
+    fn publication(&self, sequence: u64) -> OsdPublication {
+        let mut visible = self
+            .outputs
+            .values()
+            .filter_map(|queue| queue.current.clone())
+            .collect::<Vec<_>>();
+        visible.sort_by(|left, right| left.output_id.cmp(&right.output_id));
+        let overflow_by_output = self
+            .outputs
+            .iter()
+            .filter_map(|(output, queue)| {
+                (queue.overflow_count > 0).then_some((output.clone(), queue.overflow_count))
+            })
+            .collect();
+        OsdPublication {
+            sequence,
+            visible,
+            overflow_by_output,
+        }
+    }
+}
+
+pub fn spawn_osd_runtime(
+    mut events: EventSubscriber,
+    pending_capacity: usize,
+) -> (OsdRuntimeHandle, tokio::task::JoinHandle<()>) {
+    let (requests, mut request_receiver) = mpsc::channel::<RouteRequest>(32);
+    let (publications, _) = broadcast::channel(32);
+    let handle = OsdRuntimeHandle {
+        requests,
+        publications: publications.clone(),
+    };
+    let task = tokio::spawn(async move {
+        let mut router = OsdRouter::new(pending_capacity);
+        let mut sequence = 0_u64;
+        let mut timer = tokio::time::interval(Duration::from_millis(25));
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    match event {
+                        Ok(event) => observe_focus_event(&mut router, &event, Instant::now()),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            router.focused_output = None;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                request = request_receiver.recv() => {
+                    let Some(request) = request else { break };
+                    let result = router.push_focused(request.request, Instant::now());
+                    if result.is_ok() {
+                        sequence = sequence.saturating_add(1);
+                        let _ = publications.send(router.publication(sequence));
+                    }
+                    let _ = request.response.send(result);
+                }
+                _ = timer.tick() => {
+                    if router.advance_time(Instant::now()) {
+                        sequence = sequence.saturating_add(1);
+                        let _ = publications.send(router.publication(sequence));
+                    }
+                }
+            }
+        }
+    });
+    (handle, task)
+}
+
+fn observe_focus_event(router: &mut OsdRouter, event: &EventEnvelope, now: Instant) {
+    if let SessionEvent::Niri(focus) = &event.payload {
+        router.observe_niri_focus(focus.clone(), now);
+    }
+}
+
+impl OsdRuntimeHandle {
+    pub async fn route(&self, request: FocusedOsdRequest) -> Result<bool, OsdRouteError> {
+        let (response, receiver) = oneshot::channel();
+        self.requests
+            .send(RouteRequest { request, response })
+            .await
+            .map_err(|_| OsdRouteError::RuntimeStopped)?;
+        receiver.await.map_err(|_| OsdRouteError::RuntimeStopped)?
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<OsdPublication> {
+        self.publications.subscribe()
     }
 }

@@ -1,5 +1,10 @@
-use std::{env, io, path::PathBuf, process::ExitCode};
+use std::{env, io, path::PathBuf, process::ExitCode, sync::Arc};
 
+use sleepy_session::notifications::{
+    FreedesktopNotificationProvider, NotificationDbusServer, NotificationEventService,
+    NotificationStore,
+};
+use sleepy_session::osd::spawn_osd_runtime;
 use sleepy_session::sessiond::{
     full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority, SessionSocket,
     ShutdownCoordinator,
@@ -26,9 +31,22 @@ async fn run() -> io::Result<()> {
     let generation = allocator.next_generation()?;
     let hub = EventHub::new(full_snapshot_event(generation)?, 256);
     let authority = GenerationAuthority::new(allocator, generation, hub.clone());
+    let osd_events = hub.subscribe().await;
+    let (_osd_runtime, osd_task) = spawn_osd_runtime(osd_events, 16);
+    let notification_store =
+        NotificationStore::open_default(state_dir.join("sleepy/notifications"))?;
+    let notification_provider = FreedesktopNotificationProvider::new(notification_store)?;
+    let notification_service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        notification_provider,
+        authority.clone(),
+    )));
+    let _notification_bus = NotificationDbusServer::start_session(
+        Arc::clone(&notification_service),
+        tokio::runtime::Handle::current(),
+    )?;
     let socket = SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub.clone()).await?;
     let shutdown = ShutdownCoordinator::new(authority, std::time::Duration::from_secs(2));
-    tokio::select! {
+    let result = tokio::select! {
         result = socket.serve() => result,
         signal = tokio::signal::ctrl_c() => {
             signal?;
@@ -36,7 +54,9 @@ async fn run() -> io::Result<()> {
             socket.shutdown_and_drain(std::time::Duration::from_secs(2)).await?;
             Ok(())
         }
-    }
+    };
+    osd_task.abort();
+    result
 }
 
 fn required_path(name: &str) -> io::Result<PathBuf> {

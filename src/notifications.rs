@@ -15,15 +15,20 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sleepy_sdk::{
     validate_notification_document, EventCause, EventCauseKind, NotificationActionState,
-    NotificationChange, NotificationDocument, NotificationEvent, NotificationUrgency, SessionEvent,
-    DURABLE_SCHEMA_VERSION,
+    NotificationChange, NotificationDocument, NotificationEvent, NotificationUrgency,
+    ProviderEvent, SessionEvent, DURABLE_SCHEMA_VERSION,
 };
 
 use crate::sessiond::GenerationAuthority;
 
+mod dbus_server;
+pub use dbus_server::NotificationDbusServer;
+
 pub const DBUS_NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
 pub const MAX_NOTIFICATION_BYTES: usize = 64 * 1024;
 pub const DEFAULT_ACTIVE_NOTIFICATION_CAPACITY: usize = 500;
+pub const DEFAULT_NOTIFICATION_STATE_BYTES: usize = 48 * 1024 * 1024;
+const MAX_DURABLE_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct NotifyRequest {
@@ -35,6 +40,12 @@ pub struct NotifyRequest {
 pub struct NotifyOutcome {
     pub id: u64,
     pub popup: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PushResult {
+    id: u64,
+    archived_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,24 +74,16 @@ pub struct FreedesktopNotificationProvider {
     store: NotificationStore,
     origins: HashMap<u64, String>,
     popups: HashMap<u64, Option<Instant>>,
-    next_id: Option<u64>,
 }
 
 impl FreedesktopNotificationProvider {
-    pub fn new(store: NotificationStore) -> Self {
-        let greatest_id = store
-            .active()
-            .iter()
-            .chain(store.archive())
-            .map(|notification| notification.id)
-            .max()
-            .unwrap_or(0);
-        Self {
+    pub fn new(mut store: NotificationStore) -> io::Result<Self> {
+        store.expire_all_actions()?;
+        Ok(Self {
             store,
             origins: HashMap::new(),
             popups: HashMap::new(),
-            next_id: greatest_id.checked_add(1),
-        }
+        })
     }
 
     pub fn bus_name(&self) -> &'static str {
@@ -95,35 +98,42 @@ impl FreedesktopNotificationProvider {
         &self.store
     }
 
+    pub fn with_commit_observer(mut self, observer: Arc<dyn NotificationCommitObserver>) -> Self {
+        self.store.commit_observer = Some(observer);
+        self
+    }
+
     pub fn notify(&mut self, request: NotifyRequest) -> io::Result<NotifyOutcome> {
         self.notify_at(request, Instant::now())
     }
 
-    pub fn notify_at(
-        &mut self,
-        mut request: NotifyRequest,
-        now: Instant,
-    ) -> io::Result<NotifyOutcome> {
+    pub fn notify_at(&mut self, request: NotifyRequest, now: Instant) -> io::Result<NotifyOutcome> {
         if request.origin.trim().is_empty() || request.origin.len() > 255 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid notification D-Bus origin",
             ));
         }
-        if request.notification.id == 0 {
-            request.notification.id = self.next_id.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "notification identifiers exhausted",
-                )
-            })?;
+        let replacement_id = request.notification.id;
+        if replacement_id != 0 {
+            let active = self
+                .store
+                .active()
+                .iter()
+                .any(|notification| notification.id == replacement_id);
+            if !active || self.origins.get(&replacement_id) != Some(&request.origin) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "replaces_id is not an active notification owned by this D-Bus source",
+                ));
+            }
         }
-        let id = request.notification.id;
         let popup = self.store.popup_allowed(&request.notification);
         let timeout_ms = request.notification.timeout_ms;
-        self.store.push(request.notification)?;
-        if self.next_id.is_some_and(|next_id| id >= next_id) {
-            self.next_id = id.checked_add(1);
+        let result = self.store.push(request.notification)?;
+        let id = result.id;
+        for archived_id in result.archived_ids {
+            self.popups.remove(&archived_id);
         }
         self.origins.insert(id, request.origin);
         if popup {
@@ -182,7 +192,7 @@ impl FreedesktopNotificationProvider {
         self.popups.contains_key(&id)
     }
 
-    pub fn advance_popup_time(&mut self, now: Instant) -> Vec<u64> {
+    fn advance_popup_time(&mut self, now: Instant) -> Vec<u64> {
         let mut expired = self
             .popups
             .iter()
@@ -193,6 +203,10 @@ impl FreedesktopNotificationProvider {
             self.popups.remove(id);
         }
         expired
+    }
+
+    fn expire_popups(&mut self, now: Instant) -> Vec<u64> {
+        self.advance_popup_time(now)
     }
 
     pub fn invoke_action(
@@ -294,9 +308,24 @@ impl NotificationEventService {
             NotificationCommand::Dismiss { id } | NotificationCommand::Archive { id } => {
                 self.publish(id, NotificationChange::Archived).await?;
             }
-            NotificationCommand::SetDnd { .. } | NotificationCommand::PurgeArchive => {}
+            NotificationCommand::SetDnd { enabled } => {
+                self.publish_provider("org.freedesktop.Notifications.dnd", !enabled)
+                    .await?;
+            }
+            NotificationCommand::PurgeArchive => {
+                self.publish_provider("org.freedesktop.Notifications.archive", true)
+                    .await?;
+            }
         }
         Ok(())
+    }
+
+    pub async fn advance_popup_time(&mut self, now: Instant) -> io::Result<Vec<u64>> {
+        let expired = self.provider.expire_popups(now);
+        for id in &expired {
+            self.publish(*id, NotificationChange::Updated).await?;
+        }
+        Ok(expired)
     }
 
     pub async fn origin_lost(&mut self, origin: &str) -> io::Result<()> {
@@ -320,6 +349,24 @@ impl NotificationEventService {
                 SessionEvent::Notification(NotificationEvent {
                     notification_id: id,
                     change,
+                }),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn publish_provider(&self, provider_id: &str, online: bool) -> io::Result<()> {
+        self.authority
+            .lock()
+            .await
+            .publish(
+                EventCause {
+                    kind: EventCauseKind::External,
+                    request_id: None,
+                },
+                SessionEvent::Provider(ProviderEvent {
+                    provider_id: provider_id.to_owned(),
+                    online,
                 }),
             )
             .await
@@ -373,6 +420,8 @@ struct DurableNotifications {
 struct Preferences {
     schema_version: u32,
     dnd: bool,
+    #[serde(default = "first_notification_id")]
+    next_notification_id: u64,
 }
 
 impl Default for Preferences {
@@ -380,13 +429,19 @@ impl Default for Preferences {
         Self {
             schema_version: DURABLE_SCHEMA_VERSION,
             dnd: false,
+            next_notification_id: first_notification_id(),
         }
     }
+}
+
+const fn first_notification_id() -> u64 {
+    1
 }
 
 pub struct NotificationStore {
     directory: SecureDirectory,
     capacity: usize,
+    aggregate_limit: usize,
     active: Vec<NotificationDocument>,
     archive: Vec<NotificationDocument>,
     preferences: Preferences,
@@ -399,10 +454,24 @@ impl NotificationStore {
     }
 
     pub fn open(directory: impl AsRef<Path>, capacity: usize) -> io::Result<Self> {
+        Self::open_with_limits(directory, capacity, DEFAULT_NOTIFICATION_STATE_BYTES)
+    }
+
+    pub fn open_with_limits(
+        directory: impl AsRef<Path>,
+        capacity: usize,
+        aggregate_limit: usize,
+    ) -> io::Result<Self> {
         if capacity == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "notification capacity must be positive",
+            ));
+        }
+        if aggregate_limit == 0 || aggregate_limit >= MAX_DURABLE_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "notification aggregate limit must fit in one durable document",
             ));
         }
         let directory = SecureDirectory::open(directory.as_ref(), true)?;
@@ -410,10 +479,22 @@ impl NotificationStore {
         reconcile(&directory)?;
         let active = read_documents(&directory, "active.json")?;
         let archive = read_documents(&directory, "archive.json")?;
-        let preferences = read_preferences(&directory)?;
+        let mut preferences = read_preferences(&directory)?;
+        let greatest_id = active
+            .iter()
+            .chain(&archive)
+            .map(|notification| notification.id)
+            .max()
+            .unwrap_or(0);
+        preferences.next_notification_id = preferences
+            .next_notification_id
+            .max(greatest_id.saturating_add(1));
+        validate_unique_ids(&active, &archive)?;
+        validate_aggregate(&active, &archive, &preferences, aggregate_limit)?;
         Ok(Self {
             directory,
             capacity,
+            aggregate_limit,
             active,
             archive,
             preferences,
@@ -463,14 +544,48 @@ impl NotificationStore {
         !self.preferences.dnd || notification.urgency == NotificationUrgency::Critical
     }
 
-    pub fn set_dnd(&mut self, enabled: bool) -> io::Result<()> {
+    fn set_dnd(&mut self, enabled: bool) -> io::Result<()> {
         let mut preferences = self.preferences.clone();
         preferences.dnd = enabled;
         self.commit_candidate(self.active.clone(), self.archive.clone(), preferences)
     }
 
-    pub fn push(&mut self, mut notification: NotificationDocument) -> io::Result<()> {
+    fn push(&mut self, mut notification: NotificationDocument) -> io::Result<PushResult> {
+        let mut preferences = self.preferences.clone();
+        if notification.id == 0 {
+            if preferences.next_notification_id > u64::from(u32::MAX) {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "D-Bus notification identifiers exhausted",
+                ));
+            }
+            notification.id = preferences.next_notification_id;
+            preferences.next_notification_id = notification.id.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "notification identifiers exhausted",
+                )
+            })?;
+        } else if notification.id >= preferences.next_notification_id {
+            preferences.next_notification_id = notification.id.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "notification identifiers exhausted",
+                )
+            })?;
+        }
         validate_document(&notification)?;
+        if self
+            .archive
+            .iter()
+            .any(|archived| archived.id == notification.id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "archived notification identifiers cannot be reused",
+            ));
+        }
+        let id = notification.id;
         notification.archived = false;
         let mut active = self.active.clone();
         let mut archive = self.archive.clone();
@@ -478,18 +593,21 @@ impl NotificationStore {
             active.remove(index);
         }
         active.push(notification);
+        let mut archived_ids = Vec::new();
         if active.len() > self.capacity {
             let overflow = active.len() - self.capacity;
             let mut archived: Vec<_> = active.drain(..overflow).collect();
             for item in &mut archived {
                 item.archived = true;
             }
+            archived_ids.extend(archived.iter().map(|item| item.id));
             archive.extend(archived);
         }
-        self.commit_candidate(active, archive, self.preferences.clone())
+        self.commit_candidate(active, archive, preferences)?;
+        Ok(PushResult { id, archived_ids })
     }
 
-    pub fn dismiss(&mut self, id: u64) -> io::Result<()> {
+    fn dismiss(&mut self, id: u64) -> io::Result<()> {
         let mut active = self.active.clone();
         let mut archive = self.archive.clone();
         let index = active
@@ -502,7 +620,7 @@ impl NotificationStore {
         self.commit_candidate(active, archive, self.preferences.clone())
     }
 
-    pub fn mark_read(&mut self, id: u64) -> io::Result<()> {
+    fn mark_read(&mut self, id: u64) -> io::Result<()> {
         let mut active = self.active.clone();
         let notification = active
             .iter_mut()
@@ -512,7 +630,7 @@ impl NotificationStore {
         self.commit_candidate(active, self.archive.clone(), self.preferences.clone())
     }
 
-    pub fn expire_actions(&mut self, id: u64) -> io::Result<()> {
+    fn expire_actions(&mut self, id: u64) -> io::Result<()> {
         let mut active = self.active.clone();
         let mut archive = self.archive.clone();
         let notification = active
@@ -526,8 +644,26 @@ impl NotificationStore {
         self.commit_candidate(active, archive, self.preferences.clone())
     }
 
-    pub fn purge_archive(&mut self) -> io::Result<()> {
+    fn purge_archive(&mut self) -> io::Result<()> {
         self.commit_candidate(self.active.clone(), Vec::new(), self.preferences.clone())
+    }
+
+    fn expire_all_actions(&mut self) -> io::Result<()> {
+        let mut active = self.active.clone();
+        let mut archive = self.archive.clone();
+        let mut changed = false;
+        for notification in active.iter_mut().chain(archive.iter_mut()) {
+            for action in &mut notification.actions {
+                if action.state == NotificationActionState::Available {
+                    action.state = NotificationActionState::Expired;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.commit_candidate(active, archive, self.preferences.clone())?;
+        }
+        Ok(())
     }
 
     fn commit_candidate(
@@ -536,6 +672,8 @@ impl NotificationStore {
         archive: Vec<NotificationDocument>,
         preferences: Preferences,
     ) -> io::Result<()> {
+        validate_unique_ids(&active, &archive)?;
+        validate_aggregate(&active, &archive, &preferences, self.aggregate_limit)?;
         let transaction = Transaction {
             schema_version: DURABLE_SCHEMA_VERSION,
             active: active.clone(),
@@ -629,6 +767,45 @@ fn require_durable_version(version: u32) -> io::Result<()> {
 fn validate_documents(documents: &[NotificationDocument]) -> io::Result<()> {
     for document in documents {
         validate_document(document)?;
+    }
+    Ok(())
+}
+
+fn validate_unique_ids(
+    active: &[NotificationDocument],
+    archive: &[NotificationDocument],
+) -> io::Result<()> {
+    let mut ids = HashSet::with_capacity(active.len().saturating_add(archive.len()));
+    if active.iter().chain(archive).any(|notification| {
+        notification.id == 0
+            || notification.id > u64::from(u32::MAX)
+            || !ids.insert(notification.id)
+    }) {
+        return Err(invalid_data(
+            "notification identifiers must be nonzero and unique across active and archive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_aggregate(
+    active: &[NotificationDocument],
+    archive: &[NotificationDocument],
+    preferences: &Preferences,
+    limit: usize,
+) -> io::Result<()> {
+    let transaction = Transaction {
+        schema_version: DURABLE_SCHEMA_VERSION,
+        active: active.to_vec(),
+        archive: archive.to_vec(),
+        preferences: preferences.clone(),
+    };
+    let bytes = serde_json::to_vec(&transaction).map_err(invalid_data)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "notification state exceeds the configured aggregate limit",
+        ));
     }
     Ok(())
 }
@@ -745,10 +922,10 @@ impl SecureDirectory {
         let mut file = File::from(descriptor);
         let mut bytes = Vec::new();
         Read::by_ref(&mut file)
-            .take(16 * 1024 * 1024 + 1)
+            .take(MAX_DURABLE_FILE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            return Err(invalid_data("notification state exceeds 16 MiB"));
+        if bytes.len() > MAX_DURABLE_FILE_BYTES {
+            return Err(invalid_data("notification state exceeds 64 MiB"));
         }
         Ok(Some(bytes))
     }
