@@ -38,3 +38,11 @@ fn flake_exposes_a_mandatory_niri_26_04_bindings_check() {
     assert!(flake.contains("assert pkgs.niri.version == \"26.04\""));
     assert!(flake.contains("compiler_registry_validates_with_niri_26_04 -- --exact --ignored"));
 }
+
+#[test]
+fn flake_puts_the_dbus_daemon_on_the_native_check_path() {
+    let flake = read_repository_file("flake.nix");
+
+    assert!(flake.contains("nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ]"));
+    assert!(flake.contains("buildInputs = [ pkgs.dbus ]"));
+}

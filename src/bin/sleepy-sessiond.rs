@@ -1,5 +1,6 @@
 use std::{env, io, path::PathBuf, process::ExitCode, sync::Arc};
 
+use sleepy_sdk::{EventCause, EventCauseKind, ProviderEvent, SessionEvent};
 use sleepy_session::notifications::{
     FreedesktopNotificationProvider, NotificationDbusServer, NotificationEventService,
     NotificationStore,
@@ -32,7 +33,8 @@ async fn run() -> io::Result<()> {
     let hub = EventHub::new(full_snapshot_event(generation)?, 256);
     let authority = GenerationAuthority::new(allocator, generation, hub.clone());
     let osd_events = hub.subscribe().await;
-    let (_osd_runtime, osd_task) = spawn_osd_runtime(osd_events, 16);
+    let (osd_runtime, osd_task) = spawn_osd_runtime(osd_events, 16);
+    let _osd_publications = osd_runtime.subscribe();
     let notification_store =
         NotificationStore::open_default(state_dir.join("sleepy/notifications"))?;
     let notification_provider = FreedesktopNotificationProvider::new(notification_store)?;
@@ -40,14 +42,35 @@ async fn run() -> io::Result<()> {
         notification_provider,
         authority.clone(),
     )));
-    let _notification_bus = NotificationDbusServer::start_session(
+    let mut notification_bus = NotificationDbusServer::start_session(
         Arc::clone(&notification_service),
         tokio::runtime::Handle::current(),
     )?;
     let socket = SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub.clone()).await?;
-    let shutdown = ShutdownCoordinator::new(authority, std::time::Duration::from_secs(2));
+    let shutdown = ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
     let result = tokio::select! {
         result = socket.serve() => result,
+        error = notification_bus.wait_for_failure() => {
+            let _ = authority
+                .lock()
+                .await
+                .publish(
+                    EventCause {
+                        kind: EventCauseKind::External,
+                        request_id: None,
+                    },
+                    SessionEvent::Provider(ProviderEvent {
+                        provider_id: "org.freedesktop.Notifications".into(),
+                        online: false,
+                    }),
+                )
+                .await;
+            let _ = shutdown.reconcile(&[]).await;
+            let _ = socket
+                .shutdown_and_drain(std::time::Duration::from_secs(2))
+                .await;
+            Err(error)
+        }
         signal = tokio::signal::ctrl_c() => {
             signal?;
             shutdown.reconcile(&[]).await?;

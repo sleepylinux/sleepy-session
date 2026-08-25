@@ -38,6 +38,7 @@ pub struct NotificationDbusServer {
     control: mpsc::Sender<Control>,
     thread: Option<thread::JoinHandle<()>>,
     service: Arc<tokio::sync::Mutex<NotificationEventService>>,
+    failure: tokio::sync::watch::Receiver<Option<String>>,
 }
 
 impl NotificationDbusServer {
@@ -82,12 +83,17 @@ impl NotificationDbusServer {
             }
         }
 
-        register_methods(&connection, Arc::clone(&service), runtime.clone());
-        register_owner_loss(&connection, Arc::clone(&service), runtime.clone())?;
-
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let (control, controls) = mpsc::channel();
+        let (failure_sender, failure) = tokio::sync::watch::channel(None::<String>);
+        register_methods(&connection, Arc::clone(&service), runtime.clone());
+        register_owner_loss(
+            &connection,
+            Arc::clone(&service),
+            runtime.clone(),
+            failure_sender.clone(),
+        )?;
         let timer_service = Arc::clone(&service);
         let thread = thread::Builder::new()
             .name("sleepy-notifications-dbus".into())
@@ -96,12 +102,19 @@ impl NotificationDbusServer {
                     while let Ok(control) = controls.try_recv() {
                         match control {
                             Control::ActionInvoked(id, action) => {
-                                let _ = send_action_invoked(&connection, id, &action);
+                                if let Err(error) = send_action_invoked(&connection, id, &action) {
+                                    report_failure(&failure_sender, error);
+                                    return;
+                                }
                             }
                         }
                     }
-                    if connection.process(Duration::from_millis(25)).is_err() {
-                        break;
+                    if let Err(error) = connection.process(Duration::from_millis(25)) {
+                        report_failure(&failure_sender, dbus_error(error));
+                        return;
+                    }
+                    if failure_sender.borrow().is_some() {
+                        return;
                     }
                     let expired = runtime.block_on(async {
                         timer_service
@@ -110,11 +123,21 @@ impl NotificationDbusServer {
                             .advance_popup_time(std::time::Instant::now())
                             .await
                     });
-                    if let Ok(expired) = expired {
-                        for id in expired {
-                            if let Ok(id) = u32::try_from(id) {
-                                let _ = send_notification_closed(&connection, id, 1);
+                    match expired {
+                        Ok(expired) => {
+                            for id in expired {
+                                if let Ok(id) = u32::try_from(id) {
+                                    if let Err(error) = send_notification_closed(&connection, id, 1)
+                                    {
+                                        report_failure(&failure_sender, error);
+                                        return;
+                                    }
+                                }
                             }
+                        }
+                        Err(error) => {
+                            report_failure(&failure_sender, error);
+                            return;
                         }
                     }
                 }
@@ -124,6 +147,7 @@ impl NotificationDbusServer {
             control,
             thread: Some(thread),
             service,
+            failure,
         })
     }
 
@@ -136,6 +160,20 @@ impl NotificationDbusServer {
         self.control
             .send(Control::ActionInvoked(id, action.to_owned()))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "D-Bus server stopped"))
+    }
+
+    pub async fn wait_for_failure(&mut self) -> io::Error {
+        loop {
+            if let Some(message) = self.failure.borrow().clone() {
+                return io::Error::new(io::ErrorKind::BrokenPipe, message);
+            }
+            if self.failure.changed().await.is_err() {
+                return io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "notification D-Bus server stopped unexpectedly",
+                );
+            }
+        }
     }
 }
 
@@ -291,6 +329,7 @@ fn register_owner_loss(
     connection: &Connection,
     service: Arc<tokio::sync::Mutex<NotificationEventService>>,
     runtime: tokio::runtime::Handle,
+    failure: tokio::sync::watch::Sender<Option<String>>,
 ) -> io::Result<()> {
     let rule = MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged");
     connection
@@ -298,14 +337,21 @@ fn register_owner_loss(
             rule,
             move |(name, old_owner, new_owner): (String, String, String), _, _| {
                 if !old_owner.is_empty() && new_owner.is_empty() && name.starts_with(':') {
-                    let _ =
-                        runtime.block_on(async { service.lock().await.origin_lost(&name).await });
+                    if let Err(error) =
+                        runtime.block_on(async { service.lock().await.origin_lost(&name).await })
+                    {
+                        report_failure(&failure, error);
+                    }
                 }
                 true
             },
         )
         .map(|_| ())
         .map_err(dbus_error)
+}
+
+fn report_failure(failure: &tokio::sync::watch::Sender<Option<String>>, error: io::Error) {
+    let _ = failure.send(Some(error.to_string()));
 }
 
 fn send_action_invoked(connection: &Connection, id: u32, action: &str) -> io::Result<()> {

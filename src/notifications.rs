@@ -36,10 +36,11 @@ pub struct NotifyRequest {
     pub notification: NotificationDocument,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyOutcome {
     pub id: u64,
     pub popup: bool,
+    archived_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,16 +99,15 @@ impl FreedesktopNotificationProvider {
         &self.store
     }
 
-    pub fn with_commit_observer(mut self, observer: Arc<dyn NotificationCommitObserver>) -> Self {
-        self.store.commit_observer = Some(observer);
-        self
-    }
-
-    pub fn notify(&mut self, request: NotifyRequest) -> io::Result<NotifyOutcome> {
+    pub(crate) fn notify(&mut self, request: NotifyRequest) -> io::Result<NotifyOutcome> {
         self.notify_at(request, Instant::now())
     }
 
-    pub fn notify_at(&mut self, request: NotifyRequest, now: Instant) -> io::Result<NotifyOutcome> {
+    pub(crate) fn notify_at(
+        &mut self,
+        request: NotifyRequest,
+        now: Instant,
+    ) -> io::Result<NotifyOutcome> {
         if request.origin.trim().is_empty() || request.origin.len() > 255 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -132,8 +132,8 @@ impl FreedesktopNotificationProvider {
         let timeout_ms = request.notification.timeout_ms;
         let result = self.store.push(request.notification)?;
         let id = result.id;
-        for archived_id in result.archived_ids {
-            self.popups.remove(&archived_id);
+        for archived_id in &result.archived_ids {
+            self.popups.remove(archived_id);
         }
         self.origins.insert(id, request.origin);
         if popup {
@@ -144,10 +144,14 @@ impl FreedesktopNotificationProvider {
         } else {
             self.popups.remove(&id);
         }
-        Ok(NotifyOutcome { id, popup })
+        Ok(NotifyOutcome {
+            id,
+            popup,
+            archived_ids: result.archived_ids,
+        })
     }
 
-    pub fn execute(&mut self, command: NotificationCommand) -> io::Result<()> {
+    pub(crate) fn execute(&mut self, command: NotificationCommand) -> io::Result<()> {
         match command {
             NotificationCommand::MarkRead { id } => self.store.mark_read(id),
             NotificationCommand::Dismiss { id } | NotificationCommand::Archive { id } => {
@@ -246,10 +250,11 @@ impl FreedesktopNotificationProvider {
         })
     }
 
-    pub fn origin_lost(&mut self, origin: &str) -> io::Result<()> {
-        let ids = self.ids_for_origin(origin);
+    pub(crate) fn origin_lost(&mut self, origin: &str) -> io::Result<()> {
+        let mut ids = self.ids_for_origin(origin);
+        ids.sort_unstable();
+        self.store.expire_actions(&ids)?;
         for id in ids {
-            self.store.expire_actions(id)?;
             self.origins.remove(&id);
         }
         Ok(())
@@ -280,6 +285,11 @@ impl NotificationEventService {
         &self.provider
     }
 
+    pub fn with_commit_observer(mut self, observer: Arc<dyn NotificationCommitObserver>) -> Self {
+        self.provider.store.commit_observer = Some(observer);
+        self
+    }
+
     pub async fn notify(&mut self, request: NotifyRequest) -> io::Result<NotifyOutcome> {
         let requested_id = request.notification.id;
         let change = if requested_id != 0
@@ -295,6 +305,9 @@ impl NotificationEventService {
             NotificationChange::Added
         };
         let outcome = self.provider.notify(request)?;
+        for id in &outcome.archived_ids {
+            self.publish(*id, NotificationChange::Archived).await?;
+        }
         self.publish(outcome.id, change).await?;
         Ok(outcome)
     }
@@ -329,7 +342,8 @@ impl NotificationEventService {
     }
 
     pub async fn origin_lost(&mut self, origin: &str) -> io::Result<()> {
-        let ids = self.provider.ids_for_origin(origin);
+        let mut ids = self.provider.ids_for_origin(origin);
+        ids.sort_unstable();
         self.provider.origin_lost(origin)?;
         for id in ids {
             self.publish(id, NotificationChange::ActionExpired).await?;
@@ -630,16 +644,27 @@ impl NotificationStore {
         self.commit_candidate(active, self.archive.clone(), self.preferences.clone())
     }
 
-    fn expire_actions(&mut self, id: u64) -> io::Result<()> {
+    fn expire_actions(&mut self, ids: &[u64]) -> io::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let mut active = self.active.clone();
         let mut archive = self.archive.clone();
-        let notification = active
-            .iter_mut()
-            .find(|item| item.id == id)
-            .or_else(|| archive.iter_mut().find(|item| item.id == id))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "notification not found"))?;
-        for action in &mut notification.actions {
-            action.state = NotificationActionState::Expired;
+        let ids = ids.iter().copied().collect::<HashSet<_>>();
+        let mut found = HashSet::with_capacity(ids.len());
+        for notification in active.iter_mut().chain(archive.iter_mut()) {
+            if ids.contains(&notification.id) {
+                found.insert(notification.id);
+                for action in &mut notification.actions {
+                    action.state = NotificationActionState::Expired;
+                }
+            }
+        }
+        if found != ids {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "notification not found",
+            ));
         }
         self.commit_candidate(active, archive, self.preferences.clone())
     }

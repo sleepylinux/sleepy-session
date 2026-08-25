@@ -4,8 +4,9 @@ use std::{
 };
 
 use sleepy_sdk::{
-    validate_osd_event, EventEnvelope, NiriEvent, OsdEvent, OsdKind, SessionEvent,
-    WIRE_SCHEMA_VERSION,
+    validate_osd_event, AudioRuntimeState, BrightnessRuntimeState, CapabilityAvailability,
+    CapabilityValue, EventEnvelope, MediaRuntimeState, NiriEvent, OsdEvent, OsdKind,
+    PowerProfileRuntimeState, RuntimeCapabilityId, SessionEvent, WIRE_SCHEMA_VERSION,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -43,6 +44,14 @@ pub struct OsdRuntimeHandle {
 struct RouteRequest {
     request: FocusedOsdRequest,
     response: oneshot::Sender<Result<bool, OsdRouteError>>,
+}
+
+#[derive(Default)]
+struct CapabilityOsdState {
+    audio: Option<AudioRuntimeState>,
+    brightness: Option<BrightnessRuntimeState>,
+    media: Option<MediaRuntimeState>,
+    power_profile: Option<PowerProfileRuntimeState>,
 }
 
 struct FocusedOutput {
@@ -218,8 +227,22 @@ impl OsdRouter {
 }
 
 pub fn spawn_osd_runtime(
+    events: EventSubscriber,
+    pending_capacity: usize,
+) -> (OsdRuntimeHandle, tokio::task::JoinHandle<()>) {
+    spawn_osd_runtime_with_timing(
+        events,
+        pending_capacity,
+        Duration::from_secs(2),
+        Duration::from_millis(250),
+    )
+}
+
+pub fn spawn_osd_runtime_with_timing(
     mut events: EventSubscriber,
     pending_capacity: usize,
+    display_timeout: Duration,
+    focus_ttl: Duration,
 ) -> (OsdRuntimeHandle, tokio::task::JoinHandle<()>) {
     let (requests, mut request_receiver) = mpsc::channel::<RouteRequest>(32);
     let (publications, _) = broadcast::channel(32);
@@ -228,14 +251,29 @@ pub fn spawn_osd_runtime(
         publications: publications.clone(),
     };
     let task = tokio::spawn(async move {
-        let mut router = OsdRouter::new(pending_capacity);
+        let mut router = OsdRouter::with_timing(pending_capacity, display_timeout, focus_ttl);
+        let mut capabilities = CapabilityOsdState::default();
         let mut sequence = 0_u64;
         let mut timer = tokio::time::interval(Duration::from_millis(25));
         loop {
             tokio::select! {
                 event = events.recv() => {
                     match event {
-                        Ok(event) => observe_focus_event(&mut router, &event, Instant::now()),
+                        Ok(event) => {
+                            let now = Instant::now();
+                            if let SessionEvent::Niri(focus) = &event.payload {
+                                router.observe_niri_focus(focus.clone(), now);
+                            } else {
+                                let mut routed = false;
+                                for request in capabilities.requests(&event) {
+                                    routed |= router.push_focused(request, now).is_ok();
+                                }
+                                if routed {
+                                    sequence = sequence.saturating_add(1);
+                                    let _ = publications.send(router.publication(sequence));
+                                }
+                            }
+                        }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             router.focused_output = None;
                         }
@@ -263,9 +301,108 @@ pub fn spawn_osd_runtime(
     (handle, task)
 }
 
-fn observe_focus_event(router: &mut OsdRouter, event: &EventEnvelope, now: Instant) {
-    if let SessionEvent::Niri(focus) = &event.payload {
-        router.observe_niri_focus(focus.clone(), now);
+impl CapabilityOsdState {
+    fn requests(&mut self, event: &EventEnvelope) -> Vec<FocusedOsdRequest> {
+        let SessionEvent::CapabilityUpdate(record) = &event.payload else {
+            return Vec::new();
+        };
+        if record.status != CapabilityAvailability::Available {
+            self.clear(record.id);
+            return Vec::new();
+        }
+        match (record.id, &record.value) {
+            (RuntimeCapabilityId::Audio, Some(CapabilityValue::Audio(state))) => {
+                let output_changed = self.audio.as_ref().is_none_or(|previous| {
+                    previous.output_level != state.output_level
+                        || previous.output_muted != state.output_muted
+                });
+                let input_changed = self.audio.as_ref().is_none_or(|previous| {
+                    previous.input_level != state.input_level
+                        || previous.input_muted != state.input_muted
+                });
+                self.audio = Some(state.clone());
+                let mut requests = Vec::with_capacity(2);
+                if output_changed {
+                    requests.push(FocusedOsdRequest {
+                        kind: OsdKind::Volume,
+                        level: Some(state.output_level),
+                        muted: Some(state.output_muted),
+                        label: level_label(state.output_level, state.output_muted),
+                    });
+                }
+                if input_changed {
+                    requests.push(FocusedOsdRequest {
+                        kind: OsdKind::Microphone,
+                        level: Some(state.input_level),
+                        muted: Some(state.input_muted),
+                        label: level_label(state.input_level, state.input_muted),
+                    });
+                }
+                requests
+            }
+            (RuntimeCapabilityId::Brightness, Some(CapabilityValue::Brightness(state))) => {
+                let changed = self.brightness.as_ref() != Some(state);
+                self.brightness = Some(state.clone());
+                changed
+                    .then(|| FocusedOsdRequest {
+                        kind: OsdKind::Brightness,
+                        level: Some(state.level),
+                        muted: None,
+                        label: format!("{:.0}%", state.level * 100.0),
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            (RuntimeCapabilityId::Media, Some(CapabilityValue::Media(state))) => {
+                let changed = self.media.as_ref() != Some(state);
+                self.media = Some(state.clone());
+                changed
+                    .then(|| FocusedOsdRequest {
+                        kind: OsdKind::Media,
+                        level: None,
+                        muted: None,
+                        label: if state.artist.trim().is_empty() {
+                            state.title.clone()
+                        } else {
+                            format!("{} — {}", state.title, state.artist)
+                        },
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            (RuntimeCapabilityId::PowerProfile, Some(CapabilityValue::PowerProfile(state))) => {
+                let changed = self.power_profile.as_ref() != Some(state);
+                self.power_profile = Some(state.clone());
+                changed
+                    .then(|| FocusedOsdRequest {
+                        kind: OsdKind::PowerProfile,
+                        level: None,
+                        muted: None,
+                        label: state.active.clone(),
+                    })
+                    .into_iter()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn clear(&mut self, id: RuntimeCapabilityId) {
+        match id {
+            RuntimeCapabilityId::Audio => self.audio = None,
+            RuntimeCapabilityId::Brightness => self.brightness = None,
+            RuntimeCapabilityId::Media => self.media = None,
+            RuntimeCapabilityId::PowerProfile => self.power_profile = None,
+            _ => {}
+        }
+    }
+}
+
+fn level_label(level: f64, muted: bool) -> String {
+    if muted {
+        "Muted".into()
+    } else {
+        format!("{:.0}%", level * 100.0)
     }
 }
 

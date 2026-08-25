@@ -1,6 +1,9 @@
 use sleepy_sdk::{NiriEvent, OsdEvent, OsdKind, WIRE_SCHEMA_VERSION};
 use sleepy_session::{
-    osd::{spawn_osd_runtime, FocusedOsdRequest, OsdRouteError, OsdRouter},
+    osd::{
+        spawn_osd_runtime, spawn_osd_runtime_with_timing, FocusedOsdRequest, OsdRouteError,
+        OsdRouter,
+    },
     sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
 };
 use std::time::{Duration, Instant};
@@ -250,4 +253,335 @@ async fn daemon_osd_runtime_consumes_live_niri_focus_and_publishes_visible_state
         OsdRouteError::StaleFocus
     );
     task.abort();
+}
+
+#[tokio::test]
+async fn production_runtime_routes_capability_updates_without_manual_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let events = hub.subscribe().await;
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation-auto"), 16).unwrap(),
+        0,
+        hub,
+    );
+    let (runtime, task) = spawn_osd_runtime(events, 4);
+    let mut publications = runtime.subscribe();
+
+    authority
+        .lock()
+        .await
+        .publish(
+            sleepy_sdk::EventCause {
+                kind: sleepy_sdk::EventCauseKind::External,
+                request_id: None,
+            },
+            sleepy_sdk::SessionEvent::Niri(NiriEvent {
+                focused_output_id: Some("DP-2".into()),
+            }),
+        )
+        .await
+        .unwrap();
+    authority
+        .lock()
+        .await
+        .publish(
+            sleepy_sdk::EventCause {
+                kind: sleepy_sdk::EventCauseKind::External,
+                request_id: None,
+            },
+            sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+                id: sleepy_sdk::RuntimeCapabilityId::Brightness,
+                status: sleepy_sdk::CapabilityAvailability::Available,
+                value: Some(sleepy_sdk::CapabilityValue::Brightness(
+                    sleepy_sdk::BrightnessRuntimeState { level: 0.72 },
+                )),
+                diagnostic: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let publication = tokio::time::timeout(Duration::from_millis(100), publications.recv())
+        .await
+        .expect("capability update was not routed into the production OSD stream")
+        .unwrap();
+    assert_eq!(publication.sequence, 1);
+    assert_eq!(publication.visible.len(), 1);
+    assert_eq!(publication.visible[0].output_id, "DP-2");
+    assert_eq!(publication.visible[0].kind, OsdKind::Brightness);
+    assert_eq!(publication.visible[0].level, Some(0.72));
+    task.abort();
+}
+
+#[tokio::test]
+async fn production_stream_routes_volume_mute_mic_brightness_media_and_profile_in_fifo_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 32);
+    let events = hub.subscribe().await;
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation-all"), 32).unwrap(),
+        0,
+        hub,
+    );
+    let (runtime, task) = spawn_osd_runtime_with_timing(
+        events,
+        8,
+        Duration::from_millis(200),
+        Duration::from_secs(2),
+    );
+    let mut publications = runtime.subscribe();
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::Niri(NiriEvent {
+            focused_output_id: Some("DP-3".into()),
+        }),
+    )
+    .await;
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Audio,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Audio(
+                sleepy_sdk::AudioRuntimeState {
+                    output_level: 0.4,
+                    output_muted: false,
+                    input_level: 0.6,
+                    input_muted: false,
+                    default_output_id: Some("sink-1".into()),
+                },
+            )),
+            diagnostic: None,
+        }),
+    )
+    .await;
+    let volume = publications.recv().await.unwrap();
+    assert_eq!(volume.visible[0].kind, OsdKind::Volume);
+    assert_eq!(volume.visible[0].level, Some(0.4));
+    assert_eq!(volume.visible[0].muted, Some(false));
+
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Audio,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Audio(
+                sleepy_sdk::AudioRuntimeState {
+                    output_level: 0.4,
+                    output_muted: true,
+                    input_level: 0.6,
+                    input_muted: false,
+                    default_output_id: Some("sink-1".into()),
+                },
+            )),
+            diagnostic: None,
+        }),
+    )
+    .await;
+    let muted = publications.recv().await.unwrap();
+    assert_eq!(muted.visible[0].kind, OsdKind::Volume);
+    assert_eq!(muted.visible[0].muted, Some(true));
+
+    for event in [
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Brightness,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Brightness(
+                sleepy_sdk::BrightnessRuntimeState { level: 0.7 },
+            )),
+            diagnostic: None,
+        }),
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Media,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Media(
+                sleepy_sdk::MediaRuntimeState {
+                    player_id: "player".into(),
+                    title: "Track".into(),
+                    artist: "Artist".into(),
+                    playing: true,
+                },
+            )),
+            diagnostic: None,
+        }),
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::PowerProfile,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::PowerProfile(
+                sleepy_sdk::PowerProfileRuntimeState {
+                    active: "balanced".into(),
+                    available: vec!["balanced".into(), "performance".into()],
+                },
+            )),
+            diagnostic: None,
+        }),
+    ] {
+        publish_osd_input(&authority, event).await;
+        publications.recv().await.unwrap();
+    }
+
+    for expected in [
+        OsdKind::Microphone,
+        OsdKind::Brightness,
+        OsdKind::Media,
+        OsdKind::PowerProfile,
+    ] {
+        let publication = tokio::time::timeout(Duration::from_millis(300), publications.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publication.visible[0].kind, expected);
+        assert_eq!(publication.visible[0].output_id, "DP-3");
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn automatic_capability_routing_fails_closed_for_missing_and_stale_focus() {
+    let temp = tempfile::tempdir().unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let events = hub.subscribe().await;
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation-focus"), 16).unwrap(),
+        0,
+        hub,
+    );
+    let (runtime, task) =
+        spawn_osd_runtime_with_timing(events, 4, Duration::from_secs(1), Duration::from_millis(50));
+    let mut publications = runtime.subscribe();
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Brightness,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Brightness(
+                sleepy_sdk::BrightnessRuntimeState { level: 0.5 },
+            )),
+            diagnostic: None,
+        }),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), publications.recv())
+            .await
+            .is_err()
+    );
+
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::Niri(NiriEvent {
+            focused_output_id: Some("DP-4".into()),
+        }),
+    )
+    .await;
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Brightness,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Brightness(
+                sleepy_sdk::BrightnessRuntimeState { level: 0.6 },
+            )),
+            diagnostic: None,
+        }),
+    )
+    .await;
+    let routed = publications.recv().await.unwrap();
+    assert_eq!(routed.visible[0].output_id, "DP-4");
+    assert_eq!(routed.visible[0].level, Some(0.6));
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Brightness,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Brightness(
+                sleepy_sdk::BrightnessRuntimeState { level: 0.7 },
+            )),
+            diagnostic: None,
+        }),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), publications.recv())
+            .await
+            .is_err()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn automatic_stream_publishes_bounded_queue_overflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let events = hub.subscribe().await;
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation-overflow"), 16).unwrap(),
+        0,
+        hub,
+    );
+    let (runtime, task) = spawn_osd_runtime(events, 0);
+    let mut publications = runtime.subscribe();
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::Niri(NiriEvent {
+            focused_output_id: Some("DP-5".into()),
+        }),
+    )
+    .await;
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Brightness,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Brightness(
+                sleepy_sdk::BrightnessRuntimeState { level: 0.8 },
+            )),
+            diagnostic: None,
+        }),
+    )
+    .await;
+    publications.recv().await.unwrap();
+    publish_osd_input(
+        &authority,
+        sleepy_sdk::SessionEvent::CapabilityUpdate(sleepy_sdk::CapabilityRecord {
+            id: sleepy_sdk::RuntimeCapabilityId::Media,
+            status: sleepy_sdk::CapabilityAvailability::Available,
+            value: Some(sleepy_sdk::CapabilityValue::Media(
+                sleepy_sdk::MediaRuntimeState {
+                    player_id: "player".into(),
+                    title: "Track".into(),
+                    artist: "Artist".into(),
+                    playing: true,
+                },
+            )),
+            diagnostic: None,
+        }),
+    )
+    .await;
+
+    let overflow = tokio::time::timeout(Duration::from_millis(100), publications.recv())
+        .await
+        .expect("automatic queue overflow was not published")
+        .unwrap();
+    assert_eq!(overflow.overflow_by_output.get("DP-5"), Some(&1));
+    assert_eq!(overflow.visible[0].kind, OsdKind::Brightness);
+    task.abort();
+}
+
+async fn publish_osd_input(authority: &GenerationAuthority, payload: sleepy_sdk::SessionEvent) {
+    authority
+        .lock()
+        .await
+        .publish(
+            sleepy_sdk::EventCause {
+                kind: sleepy_sdk::EventCauseKind::External,
+                request_id: None,
+            },
+            payload,
+        )
+        .await
+        .unwrap();
 }

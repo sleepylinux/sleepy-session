@@ -3,10 +3,72 @@ use sleepy_sdk::{
     WIRE_SCHEMA_VERSION,
 };
 use sleepy_session::notifications::{
-    FreedesktopNotificationProvider, NotificationCommand, NotificationCommitObserver,
-    NotificationCommitStage, NotificationEventService, NotificationStore, NotifyRequest,
+    ActionInvocation, FreedesktopNotificationProvider as RealNotificationProvider,
+    NotificationCommand, NotificationCommitObserver, NotificationCommitStage,
+    NotificationEventService, NotificationStore, NotifyOutcome, NotifyRequest,
     DBUS_NOTIFICATIONS_NAME, DEFAULT_ACTIVE_NOTIFICATION_CAPACITY,
 };
+
+struct FreedesktopNotificationProvider {
+    runtime: tokio::runtime::Runtime,
+    service: NotificationEventService,
+    _generation: tempfile::TempDir,
+}
+
+impl FreedesktopNotificationProvider {
+    fn new(store: NotificationStore) -> io::Result<Self> {
+        let provider = RealNotificationProvider::new(store)?;
+        let generation = tempfile::tempdir()?;
+        let hub = EventHub::new(full_snapshot_event(0)?, 1024);
+        let authority = GenerationAuthority::new(
+            GenerationAllocator::open(generation.path().join("generation"), 1024)?,
+            0,
+            hub,
+        );
+        Ok(Self {
+            runtime: tokio::runtime::Runtime::new()?,
+            service: NotificationEventService::new(provider, authority),
+            _generation: generation,
+        })
+    }
+
+    fn with_commit_observer(mut self, observer: Arc<dyn NotificationCommitObserver>) -> Self {
+        self.service = self.service.with_commit_observer(observer);
+        self
+    }
+
+    fn notify(&mut self, request: NotifyRequest) -> io::Result<NotifyOutcome> {
+        self.runtime.block_on(self.service.notify(request))
+    }
+
+    fn execute(&mut self, command: NotificationCommand) -> io::Result<()> {
+        self.runtime.block_on(self.service.execute(command))
+    }
+
+    fn origin_lost(&mut self, origin: &str) -> io::Result<()> {
+        self.runtime.block_on(self.service.origin_lost(origin))
+    }
+
+    fn store(&self) -> &NotificationStore {
+        self.service.provider().store()
+    }
+
+    fn bus_name(&self) -> &'static str {
+        self.service.provider().bus_name()
+    }
+
+    fn capabilities(&self) -> &'static [&'static str] {
+        self.service.provider().capabilities()
+    }
+
+    fn popup_visible(&self, id: u64) -> bool {
+        self.service.provider().popup_visible(id)
+    }
+
+    fn invoke_action(&self, id: u64, action: &str) -> io::Result<ActionInvocation> {
+        self.service.provider().invoke_action(id, action)
+    }
+}
 use sleepy_session::sessiond::{
     full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority,
 };
@@ -255,6 +317,27 @@ impl NotificationCommitObserver for FailOnceAt {
     }
 }
 
+struct FailAtOccurrence {
+    target: NotificationCommitStage,
+    occurrence: usize,
+    seen: Mutex<usize>,
+}
+
+impl NotificationCommitObserver for FailAtOccurrence {
+    fn reached(&self, stage: NotificationCommitStage) -> io::Result<()> {
+        if stage != self.target {
+            return Ok(());
+        }
+        let mut seen = self.seen.lock().unwrap();
+        *seen += 1;
+        if *seen == self.occurrence {
+            Err(io::Error::other("injected commit fault"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[test]
 fn every_notification_commit_fault_reconciles_to_one_complete_transaction() {
     for stage in NotificationCommitStage::ALL {
@@ -370,7 +453,7 @@ fn oversized_untrusted_notification_text_is_rejected_without_changing_history() 
 async fn notification_mutations_publish_through_the_generation_authority() {
     let temp = tempfile::tempdir().unwrap();
     let store = NotificationStore::open(temp.path().join("notifications"), 500).unwrap();
-    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let provider = RealNotificationProvider::new(store).unwrap();
     let hub = EventHub::new(full_snapshot_event(0).unwrap(), 8);
     let mut subscriber = hub.subscribe().await;
     let _replay = subscriber.recv().await.unwrap();
@@ -415,7 +498,7 @@ async fn notification_mutations_publish_through_the_generation_authority() {
 async fn popup_timeout_expires_presentation_without_deleting_history_or_unread_state() {
     let temp = tempfile::tempdir().unwrap();
     let store = NotificationStore::open(temp.path(), 500).unwrap();
-    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let provider = RealNotificationProvider::new(store).unwrap();
     let hub = EventHub::new(full_snapshot_event(0).unwrap(), 8);
     let allocator = GenerationAllocator::open(temp.path().join("popup-generation"), 8).unwrap();
     let authority = GenerationAuthority::new(allocator, 0, hub);
@@ -763,7 +846,7 @@ fn aggregate_admission_never_commits_state_that_cannot_be_reopened() {
 async fn dnd_purge_and_popup_expiry_each_publish_one_ordered_generation_event() {
     let temp = tempfile::tempdir().unwrap();
     let store = NotificationStore::open(temp.path().join("notifications"), 500).unwrap();
-    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let provider = RealNotificationProvider::new(store).unwrap();
     let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
     let mut subscriber = hub.subscribe().await;
     subscriber.recv().await.unwrap();
@@ -832,4 +915,152 @@ async fn dnd_purge_and_popup_expiry_each_publish_one_ordered_generation_event() 
             online: true,
         }) if provider_id == "org.freedesktop.Notifications.archive"
     ));
+}
+
+#[tokio::test]
+async fn overflow_publishes_archived_ids_before_the_incoming_notification() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = NotificationStore::open(temp.path().join("notifications"), 2).unwrap();
+    let provider = RealNotificationProvider::new(store).unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let mut subscriber = hub.subscribe().await;
+    subscriber.recv().await.unwrap();
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation"), 16).unwrap(),
+        0,
+        hub,
+    );
+    let mut service = NotificationEventService::new(provider, authority);
+
+    for origin in [":1.301", ":1.302"] {
+        service
+            .notify(NotifyRequest {
+                origin: origin.into(),
+                notification: fresh_notification(NotificationUrgency::Normal),
+            })
+            .await
+            .unwrap();
+        subscriber.recv().await.unwrap();
+    }
+    service
+        .notify(NotifyRequest {
+            origin: ":1.303".into(),
+            notification: fresh_notification(NotificationUrgency::Normal),
+        })
+        .await
+        .unwrap();
+
+    let archived = subscriber.recv().await.unwrap();
+    assert_eq!(archived.generation, 3);
+    assert!(matches!(
+        archived.payload,
+        sleepy_sdk::SessionEvent::Notification(sleepy_sdk::NotificationEvent {
+            notification_id: 1,
+            change: sleepy_sdk::NotificationChange::Archived,
+        })
+    ));
+    let added = subscriber.recv().await.unwrap();
+    assert_eq!(added.generation, 4);
+    assert!(matches!(
+        added.payload,
+        sleepy_sdk::SessionEvent::Notification(sleepy_sdk::NotificationEvent {
+            notification_id: 3,
+            change: sleepy_sdk::NotificationChange::Added,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn origin_loss_fault_reconciles_all_matching_actions_without_partial_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("notifications");
+    let store = NotificationStore::open(&state, 500).unwrap();
+    let provider = RealNotificationProvider::new(store).unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let mut subscriber = hub.subscribe().await;
+    subscriber.recv().await.unwrap();
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation"), 16).unwrap(),
+        0,
+        hub,
+    );
+    let mut service = NotificationEventService::new(provider, authority).with_commit_observer(
+        Arc::new(FailAtOccurrence {
+            target: NotificationCommitStage::ActiveCommitted,
+            occurrence: 4,
+            seen: Mutex::new(0),
+        }),
+    );
+    for _ in 0..2 {
+        service
+            .notify(NotifyRequest {
+                origin: ":1.311".into(),
+                notification: fresh_notification(NotificationUrgency::Normal),
+            })
+            .await
+            .unwrap();
+        subscriber.recv().await.unwrap();
+    }
+    service
+        .execute(NotificationCommand::Dismiss { id: 1 })
+        .await
+        .unwrap();
+    subscriber.recv().await.unwrap();
+
+    assert!(service.origin_lost(":1.311").await.is_err());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(25), subscriber.recv())
+            .await
+            .is_err()
+    );
+    drop(service);
+
+    let recovered = NotificationStore::open(&state, 500).unwrap();
+    assert_eq!(recovered.active().len(), 1);
+    assert_eq!(recovered.archive().len(), 1);
+    for notification in recovered.active().iter().chain(recovered.archive()) {
+        assert!(notification
+            .actions
+            .iter()
+            .all(|action| action.state == NotificationActionState::Expired));
+    }
+}
+
+#[tokio::test]
+async fn successful_origin_loss_publishes_every_expiry_in_id_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = NotificationStore::open(temp.path().join("notifications"), 500).unwrap();
+    let provider = RealNotificationProvider::new(store).unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let mut subscriber = hub.subscribe().await;
+    subscriber.recv().await.unwrap();
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation"), 16).unwrap(),
+        0,
+        hub,
+    );
+    let mut service = NotificationEventService::new(provider, authority);
+    for _ in 0..3 {
+        service
+            .notify(NotifyRequest {
+                origin: ":1.321".into(),
+                notification: fresh_notification(NotificationUrgency::Normal),
+            })
+            .await
+            .unwrap();
+        subscriber.recv().await.unwrap();
+    }
+
+    service.origin_lost(":1.321").await.unwrap();
+    for (generation, id) in [(4, 1), (5, 2), (6, 3)] {
+        let event = subscriber.recv().await.unwrap();
+        assert_eq!(event.generation, generation);
+        assert!(matches!(
+            event.payload,
+            sleepy_sdk::SessionEvent::Notification(sleepy_sdk::NotificationEvent {
+                notification_id,
+                change: sleepy_sdk::NotificationChange::ActionExpired,
+            }) if notification_id == id
+        ));
+    }
 }
