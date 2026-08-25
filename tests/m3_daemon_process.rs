@@ -138,6 +138,8 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
     let bin = temp.path().join("bin");
     let marker = temp.path().join("audio-changed");
     let niri_hold = temp.path().join("niri-hold");
+    let pw_hold = temp.path().join("pw-hold");
+    let pw_count = temp.path().join("pw-count");
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::create_dir_all(&state).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
@@ -148,13 +150,20 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
         .write(true)
         .open(&niri_hold)
         .unwrap();
+    let fifo = CString::new(pw_hold.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let _pw_hold = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pw_hold)
+        .unwrap();
     write_executable(
         &bin.join("niri"),
         "#!/bin/sh\n[ \"$1|$2|$3|$#\" = 'msg|--json|event-stream|3' ] || exit 64\nprintf '%s\\n' '{\"WorkspacesChanged\":{\"workspaces\":[{\"id\":9,\"output\":\"DP-9\"}]}}'\nprintf '%s\\n' '{\"WorkspaceActivated\":{\"id\":9,\"focused\":true}}'\nIFS= read -r ignored < \"$SLEEPY_NIRI_HOLD\"\n",
     );
     write_executable(
         &bin.join("pw-mon"),
-        "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 64\nsleep 0.05\n: > \"$SLEEPY_FIXTURE_MARKER\"\nprintf '%s\\n' changed\n",
+        "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 64\ncount=0\nif [ -r \"$SLEEPY_PW_COUNT\" ]; then IFS= read -r count < \"$SLEEPY_PW_COUNT\"; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$SLEEPY_PW_COUNT\"\nif [ \"$count\" -eq 1 ]; then\n  printf '%065537d' 0\nelse\n  : > \"$SLEEPY_FIXTURE_MARKER\"\n  printf '%s\\n' changed\nfi\nIFS= read -r ignored < \"$SLEEPY_PW_HOLD\"\n",
     );
     write_executable(
         &bin.join("wpctl"),
@@ -181,6 +190,8 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
         .env("PATH", path)
         .env("SLEEPY_FIXTURE_MARKER", &marker)
         .env("SLEEPY_NIRI_HOLD", &niri_hold)
+        .env("SLEEPY_PW_HOLD", &pw_hold)
+        .env("SLEEPY_PW_COUNT", &pw_count)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -208,6 +219,14 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
         }
     };
     assert!(publication.sequence > 0);
+    assert!(
+        std::fs::read_to_string(&pw_count)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+            >= 2
+    );
 
     let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);

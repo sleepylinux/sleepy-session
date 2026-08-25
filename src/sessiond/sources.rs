@@ -1,11 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ffi::CString,
-    future::Future,
     io,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
@@ -20,21 +18,17 @@ use sleepy_sdk::{
     EventCauseKind, NiriEvent, NiriRuntimeState, RuntimeCapabilityId, SessionEvent,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
     process::{Child, Command},
     sync::{mpsc, watch},
     task::JoinHandle,
 };
 
 use crate::{
-    sessiond::{AdapterActor, AdapterFailure, CapabilityAdapter, GenerationAuthority},
+    sessiond::GenerationAuthority,
     system::{ProcessCommandRunner, SystemFacade},
 };
 
-// Audio performs three fixed-argv reads and power performs two. Each command
-// owns a 900 ms kill/wait/reader-join deadline in ProcessCommandRunner, so the
-// actor deadline exceeds the proven worst case without leaving detached work.
-const READBACK_TIMEOUT: Duration = Duration::from_secs(4);
 const RESTART_DELAY: Duration = Duration::from_millis(250);
 const MAX_EVENT_LINE: usize = 64 * 1024;
 
@@ -43,37 +37,40 @@ enum Trigger {
     Read,
 }
 
-struct RuntimeAdapter {
-    id: RuntimeCapabilityId,
-    facade: SystemFacade<ProcessCommandRunner>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbusBus {
+    System,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DbusSourceSpec {
+    capability: RuntimeCapabilityId,
+    bus: DbusBus,
+    path_fragment: &'static str,
+}
+
+impl DbusSourceSpec {
+    const fn power_profile() -> Self {
+        Self {
+            capability: RuntimeCapabilityId::PowerProfile,
+            bus: DbusBus::System,
+            path_fragment: "PowerProfiles",
+        }
+    }
+
+    const fn mpris() -> Self {
+        Self {
+            capability: RuntimeCapabilityId::Media,
+            bus: DbusBus::Session,
+            path_fragment: "MediaPlayer2",
+        }
+    }
 }
 
 pub struct ProductionSources {
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<io::Result<()>>>,
-}
-
-impl CapabilityAdapter for RuntimeAdapter {
-    fn id(&self) -> RuntimeCapabilityId {
-        self.id
-    }
-
-    fn observe(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<CapabilityRecord, AdapterFailure>> + Send + '_>> {
-        let facade = self.facade.clone();
-        let id = self.id;
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || facade.runtime_capability(id))
-                .await
-                .map_err(|error| {
-                    AdapterFailure::new(
-                        CapabilityAvailability::Error,
-                        format!("{id:?} readback task failed: {error}"),
-                    )
-                })
-        })
-    }
 }
 
 impl ProductionSources {
@@ -126,8 +123,14 @@ impl ProductionSources {
             authority.clone(),
             shutdown_receiver.clone(),
         )));
-        tasks.push(tokio::spawn(run_dbus_sources(
+        tasks.push(tokio::spawn(run_dbus_source(
+            DbusSourceSpec::power_profile(),
             triggers[&RuntimeCapabilityId::PowerProfile].clone(),
+            authority.clone(),
+            shutdown_receiver.clone(),
+        )));
+        tasks.push(tokio::spawn(run_dbus_source(
+            DbusSourceSpec::mpris(),
             triggers[&RuntimeCapabilityId::Media].clone(),
             authority,
             shutdown_receiver,
@@ -152,14 +155,27 @@ impl ProductionSources {
                     });
                 }
                 Err(_) => {
-                    task.abort();
-                    let _ = task.await;
+                    // Never abort an actor that may currently own a
+                    // spawn_blocking readback: aborting the async wrapper would
+                    // detach the blocking task and let commands outlive daemon
+                    // shutdown. Record the deadline miss, then still join.
                     first_error.get_or_insert_with(|| {
                         io::Error::new(
                             io::ErrorKind::TimedOut,
                             "production source task did not stop",
                         )
                     });
+                    match task.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            first_error.get_or_insert(error);
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert_with(|| {
+                                io::Error::other(format!("source task failed: {error}"))
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -175,11 +191,7 @@ async fn run_capability_actor(
     mut triggers: mpsc::Receiver<Trigger>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let actor = AdapterActor::new(
-        Arc::new(RuntimeAdapter { id, facade }),
-        READBACK_TIMEOUT,
-        RESTART_DELAY,
-    );
+    let mut retry_not_before = None;
     loop {
         tokio::select! {
             biased;
@@ -188,7 +200,20 @@ async fn run_capability_actor(
             }
             trigger = triggers.recv() => {
                 if trigger.is_none() { return Ok(()); }
-                let record = actor.observe_once().await;
+                if let Some(deadline) = retry_not_before.take() {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {}
+                        _ = shutdown.changed() => return Ok(()),
+                    }
+                }
+                let (record, stop_after_join) = joined_readback(
+                    facade.clone(),
+                    id,
+                    &mut shutdown,
+                ).await?;
+                if stop_after_join {
+                    return Ok(());
+                }
                 let focus = focused_output
                     .read()
                     .map_err(|_| io::Error::other("Niri focus cache was poisoned"))?
@@ -202,8 +227,42 @@ async fn run_capability_actor(
                     )
                     .await?;
                 }
+                retry_not_before = (record.status != CapabilityAvailability::Available)
+                    .then(|| tokio::time::Instant::now() + RESTART_DELAY);
                 publish(&authority, SessionEvent::CapabilityUpdate(record)).await?;
             }
+        }
+    }
+}
+
+async fn joined_readback(
+    facade: SystemFacade<ProcessCommandRunner>,
+    id: RuntimeCapabilityId,
+    shutdown: &mut watch::Receiver<bool>,
+) -> io::Result<(CapabilityRecord, bool)> {
+    let task = tokio::task::spawn_blocking(move || facade.runtime_capability(id));
+    await_joined_readback(task, id, shutdown).await
+}
+
+async fn await_joined_readback(
+    mut task: JoinHandle<CapabilityRecord>,
+    id: RuntimeCapabilityId,
+    shutdown: &mut watch::Receiver<bool>,
+) -> io::Result<(CapabilityRecord, bool)> {
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            let stop = changed.is_err() || *shutdown.borrow();
+            let record = task.await.map_err(|error| {
+                io::Error::other(format!("{id:?} readback task failed: {error}"))
+            })?;
+            Ok((record, stop))
+        }
+        result = &mut task => {
+            let record = result.map_err(|error| {
+                io::Error::other(format!("{id:?} readback task failed: {error}"))
+            })?;
+            Ok((record, false))
         }
     }
 }
@@ -216,7 +275,7 @@ async fn run_process_event_source(
     capability: RuntimeCapabilityId,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    loop {
+    'supervisor: loop {
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -234,47 +293,52 @@ async fn run_process_event_source(
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("monitor stdout missing"))?;
-        let mut lines = BufReader::new(stdout);
-        let mut buffer = Vec::new();
+        let mut lines = BufReader::with_capacity(4096, stdout);
         loop {
-            buffer.clear();
-            let ended = tokio::select! {
+            let read = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         stop_child(&mut child).await;
                         return Ok(());
                     }
-                    false
+                    continue;
                 }
-                read = lines.read_until(b'\n', &mut buffer) => {
-                    let count = read?;
-                    if count == 0 { true } else {
-                        if buffer.len() > MAX_EVENT_LINE {
-                            stop_child(&mut child).await;
-                            publish_degraded(&authority, capability, io::ErrorKind::InvalidData, "monitor event exceeded 64 KiB").await?;
-                            true
-                        } else {
-                            let _ = trigger.try_send(Trigger::Read);
-                            false
-                        }
-                    }
-                }
+                read = read_bounded_line(&mut lines) => read,
             };
-            if ended {
-                break;
+            match read {
+                Ok(Some(_)) => {
+                    let _ = trigger.try_send(Trigger::Read);
+                }
+                Ok(None) => {
+                    stop_child(&mut child).await;
+                    publish_degraded(
+                        &authority,
+                        capability,
+                        io::ErrorKind::BrokenPipe,
+                        &format!("{program} event stream reached EOF"),
+                    )
+                    .await?;
+                    if wait_backoff(&mut shutdown).await {
+                        return Ok(());
+                    }
+                    continue 'supervisor;
+                }
+                Err(error) => {
+                    stop_child(&mut child).await;
+                    publish_degraded(
+                        &authority,
+                        capability,
+                        error.kind(),
+                        &format!("{program} event stream read failed: {error}"),
+                    )
+                    .await?;
+                    if wait_backoff(&mut shutdown).await {
+                        return Ok(());
+                    }
+                    continue 'supervisor;
+                }
             }
-        }
-        let status = child.wait().await?;
-        publish_degraded(
-            &authority,
-            capability,
-            io::ErrorKind::BrokenPipe,
-            &format!("{program} event stream exited with {status}"),
-        )
-        .await?;
-        if wait_backoff(&mut shutdown).await {
-            return Ok(());
         }
     }
 }
@@ -284,7 +348,7 @@ async fn run_niri_source(
     focused_output: Arc<RwLock<Option<String>>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    loop {
+    'supervisor: loop {
         if *shutdown.borrow() {
             return Ok(());
         }
@@ -309,63 +373,136 @@ async fn run_niri_source(
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("Niri stdout missing"))?;
-        let mut lines = BufReader::new(stdout);
-        let mut buffer = Vec::new();
+        let mut lines = BufReader::with_capacity(4096, stdout);
         let mut workspaces = HashMap::<u64, String>::new();
         loop {
-            buffer.clear();
-            tokio::select! {
+            let read = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         stop_child(&mut child).await;
                         return Ok(());
                     }
+                    continue;
                 }
-                read = lines.read_until(b'\n', &mut buffer) => {
-                    if read? == 0 { break; }
-                    if buffer.len() > MAX_EVENT_LINE {
+                read = read_bounded_line(&mut lines) => read,
+            };
+            match read {
+                Ok(Some(line)) => match parse_niri_event(&line, &mut workspaces) {
+                    Ok(Some(output)) => {
+                        *focused_output
+                            .write()
+                            .map_err(|_| io::Error::other("Niri focus cache was poisoned"))? =
+                            Some(output.clone());
+                        publish(
+                            &authority,
+                            SessionEvent::Niri(NiriEvent {
+                                focused_output_id: Some(output),
+                            }),
+                        )
+                        .await?;
+                        publish(
+                            &authority,
+                            SessionEvent::CapabilityUpdate(niri_record(&workspaces)),
+                        )
+                        .await?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
                         stop_child(&mut child).await;
-                        publish_degraded(&authority, RuntimeCapabilityId::Niri, io::ErrorKind::InvalidData, "Niri event exceeded 64 KiB").await?;
-                        break;
-                    }
-                    match parse_niri_event(&buffer, &mut workspaces) {
-                        Ok(Some(output)) => {
-                            *focused_output
-                                .write()
-                                .map_err(|_| io::Error::other("Niri focus cache was poisoned"))? =
-                                Some(output.clone());
-                            publish(&authority, SessionEvent::Niri(NiriEvent { focused_output_id: Some(output) })).await?;
-                            publish(&authority, SessionEvent::CapabilityUpdate(niri_record(&workspaces))).await?;
+                        clear_focus(&focused_output)?;
+                        publish(
+                            &authority,
+                            SessionEvent::Niri(NiriEvent {
+                                focused_output_id: None,
+                            }),
+                        )
+                        .await?;
+                        publish_degraded(
+                            &authority,
+                            RuntimeCapabilityId::Niri,
+                            io::ErrorKind::InvalidData,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        if wait_backoff(&mut shutdown).await {
+                            return Ok(());
                         }
-                        Ok(None) => {}
-                        Err(error) => {
-                            clear_focus(&focused_output)?;
-                            publish(&authority, SessionEvent::Niri(NiriEvent { focused_output_id: None })).await?;
-                            publish_degraded(&authority, RuntimeCapabilityId::Niri, io::ErrorKind::InvalidData, &error.to_string()).await?;
-                        }
+                        continue 'supervisor;
                     }
+                },
+                Ok(None) => {
+                    stop_child(&mut child).await;
+                    clear_focus(&focused_output)?;
+                    publish(
+                        &authority,
+                        SessionEvent::Niri(NiriEvent {
+                            focused_output_id: None,
+                        }),
+                    )
+                    .await?;
+                    publish_degraded(
+                        &authority,
+                        RuntimeCapabilityId::Niri,
+                        io::ErrorKind::BrokenPipe,
+                        "Niri event stream reached EOF",
+                    )
+                    .await?;
+                    if wait_backoff(&mut shutdown).await {
+                        return Ok(());
+                    }
+                    continue 'supervisor;
+                }
+                Err(error) => {
+                    stop_child(&mut child).await;
+                    clear_focus(&focused_output)?;
+                    publish(
+                        &authority,
+                        SessionEvent::Niri(NiriEvent {
+                            focused_output_id: None,
+                        }),
+                    )
+                    .await?;
+                    publish_degraded(
+                        &authority,
+                        RuntimeCapabilityId::Niri,
+                        error.kind(),
+                        &format!("Niri event stream read failed: {error}"),
+                    )
+                    .await?;
+                    if wait_backoff(&mut shutdown).await {
+                        return Ok(());
+                    }
+                    continue 'supervisor;
                 }
             }
         }
-        let status = child.wait().await?;
-        clear_focus(&focused_output)?;
-        publish(
-            &authority,
-            SessionEvent::Niri(NiriEvent {
-                focused_output_id: None,
-            }),
-        )
-        .await?;
-        publish_degraded(
-            &authority,
-            RuntimeCapabilityId::Niri,
-            io::ErrorKind::BrokenPipe,
-            &format!("Niri event stream exited with {status}"),
-        )
-        .await?;
-        if wait_backoff(&mut shutdown).await {
-            return Ok(());
+    }
+}
+
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
+    // Reserve the exact hard cap once. Extends are checked before copying, so
+    // Vec never asks the allocator to grow beyond 64 KiB.
+    let mut line = Vec::with_capacity(MAX_EVENT_LINE);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if line.len().saturating_add(take) > MAX_EVENT_LINE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event line exceeded 64 KiB",
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if line.last() == Some(&b'\n') {
+            return Ok(Some(line));
         }
     }
 }
@@ -535,19 +672,18 @@ fn add_inotify_watch(fd: libc::c_int, path: &Path, mask: u32) -> io::Result<()> 
     Ok(())
 }
 
-async fn run_dbus_sources(
-    power: mpsc::Sender<Trigger>,
-    media: mpsc::Sender<Trigger>,
+async fn run_dbus_source(
+    spec: DbusSourceSpec,
+    trigger: mpsc::Sender<Trigger>,
     authority: GenerationAuthority,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     loop {
         let cancelled = Arc::new(AtomicBool::new(false));
         let thread_cancelled = Arc::clone(&cancelled);
-        let power = power.clone();
-        let media = media.clone();
+        let trigger = trigger.clone();
         let mut task =
-            tokio::task::spawn_blocking(move || watch_dbus(&power, &media, &thread_cancelled));
+            tokio::task::spawn_blocking(move || watch_dbus(spec, &trigger, &thread_cancelled));
         let result = tokio::select! {
             result = &mut task => result.map_err(|error| io::Error::other(format!("D-Bus watcher task failed: {error}")))?,
             _ = shutdown.changed() => {
@@ -559,14 +695,7 @@ async fn run_dbus_sources(
         if let Err(error) = result {
             publish_degraded(
                 &authority,
-                RuntimeCapabilityId::PowerProfile,
-                error.kind(),
-                &error.to_string(),
-            )
-            .await?;
-            publish_degraded(
-                &authority,
-                RuntimeCapabilityId::Media,
+                spec.capability,
                 error.kind(),
                 &error.to_string(),
             )
@@ -579,13 +708,16 @@ async fn run_dbus_sources(
 }
 
 fn watch_dbus(
-    power: &mpsc::Sender<Trigger>,
-    media: &mpsc::Sender<Trigger>,
+    spec: DbusSourceSpec,
+    trigger: &mpsc::Sender<Trigger>,
     cancelled: &AtomicBool,
 ) -> io::Result<()> {
-    let connection = Connection::new_session().map_err(dbus_error)?;
-    let power_sender = power.clone();
-    let media_sender = media.clone();
+    let connection = match spec.bus {
+        DbusBus::System => Connection::new_system(),
+        DbusBus::Session => Connection::new_session(),
+    }
+    .map_err(dbus_error)?;
+    let sender = trigger.clone();
     let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
     connection
         .add_match(
@@ -595,15 +727,8 @@ fn watch_dbus(
                     .path()
                     .map(|path| path.to_string())
                     .unwrap_or_default();
-                let sender = message
-                    .sender()
-                    .map(|sender| sender.to_string())
-                    .unwrap_or_default();
-                if path.contains("PowerProfiles") || sender.contains("PowerProfiles") {
-                    let _ = power_sender.try_send(Trigger::Read);
-                }
-                if path.contains("MediaPlayer2") || sender.starts_with("org.mpris.MediaPlayer2") {
-                    let _ = media_sender.try_send(Trigger::Read);
+                if path.contains(spec.path_fragment) {
+                    let _ = sender.try_send(Trigger::Read);
                 }
                 true
             },
@@ -685,4 +810,76 @@ async fn publish_degraded(
 
 fn dbus_error(error: dbus::Error) -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::*;
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    #[test]
+    fn dbus_source_specs_keep_system_power_and_session_mpris_isolated() {
+        assert_eq!(DbusSourceSpec::power_profile().bus, DbusBus::System);
+        assert_eq!(
+            DbusSourceSpec::power_profile().capability,
+            RuntimeCapabilityId::PowerProfile
+        );
+        assert_eq!(DbusSourceSpec::mpris().bus, DbusBus::Session);
+        assert_eq!(
+            DbusSourceSpec::mpris().capability,
+            RuntimeCapabilityId::Media
+        );
+    }
+
+    #[tokio::test]
+    async fn unterminated_hostile_line_is_rejected_before_growth_past_hard_cap() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_EVENT_LINE + 4096);
+        let payload = vec![b'x'; MAX_EVENT_LINE + 1];
+        let write = tokio::spawn(async move {
+            writer.write_all(&payload).await.unwrap();
+        });
+        let mut reader = BufReader::with_capacity(4096, reader);
+
+        let error = read_bounded_line(&mut reader).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "event line exceeded 64 KiB");
+        drop(reader);
+        write.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_owned_readback_task_and_never_detaches_it() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let task_finished = Arc::clone(&finished);
+        let task_launches = Arc::clone(&launches);
+        let task = tokio::task::spawn_blocking(move || {
+            task_launches.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            task_finished.store(true, Ordering::Release);
+            CapabilityRecord {
+                id: RuntimeCapabilityId::Audio,
+                status: CapabilityAvailability::Unsupported,
+                value: None,
+                diagnostic: Some(CapabilityFailure {
+                    message: "fixture".into(),
+                }),
+            }
+        });
+        let (shutdown, mut receiver) = watch::channel(false);
+        shutdown.send(true).unwrap();
+
+        let (_, stop) = await_joined_readback(task, RuntimeCapabilityId::Audio, &mut receiver)
+            .await
+            .unwrap();
+
+        assert!(stop);
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
 }

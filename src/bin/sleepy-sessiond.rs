@@ -115,7 +115,10 @@ async fn run() -> io::Result<()> {
         cleanup_error.get_or_insert(error);
     }
     if let Err(error) = sources
-        .shutdown_and_join(std::time::Duration::from_secs(2))
+        // Audio owns three sequential 900 ms fixed-argv readbacks. The source
+        // shutdown deadline must allow the in-flight blocking task to finish
+        // killing/waiting its child and join instead of detaching it.
+        .shutdown_and_join(std::time::Duration::from_secs(4))
         .await
     {
         cleanup_error.get_or_insert(error);
