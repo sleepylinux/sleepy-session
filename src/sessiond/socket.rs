@@ -1,8 +1,6 @@
 use std::{
-    ffi::OsString,
     io,
-    os::fd::AsRawFd,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -10,22 +8,16 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    io::AsyncWriteExt,
-    net::{UnixListener, UnixStream},
+use tokio::{io::AsyncWriteExt, net::UnixStream};
+
+use super::{
+    private_socket::{peer_uid, NoopBindObserver, PrivateSocketEndpoint},
+    EventHub, SessionSocketBindObserver,
 };
 
-use super::EventHub;
-use crate::store::{SecureDir, StoreError};
-
 pub struct SessionSocket {
-    path: PathBuf,
-    directory: SecureDir,
-    socket_name: OsString,
-    expected_uid: libc::uid_t,
-    listener: UnixListener,
+    endpoint: PrivateSocketEndpoint,
     hub: EventHub,
-    socket_identity: (u64, u64),
     shutdown: tokio::sync::broadcast::Sender<()>,
     connections: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
     serving: AtomicBool,
@@ -36,18 +28,6 @@ pub struct SessionSocket {
 pub struct SocketDrainReport {
     pub completed: usize,
     pub aborted: usize,
-}
-
-pub trait SessionSocketBindObserver: Send + Sync + 'static {
-    fn stale_socket_probed(&self, socket_path: &Path) -> io::Result<()>;
-}
-
-struct NoopBindObserver;
-
-impl SessionSocketBindObserver for NoopBindObserver {
-    fn stale_socket_probed(&self, _socket_path: &Path) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 impl SessionSocket {
@@ -65,97 +45,12 @@ impl SessionSocket {
         hub: EventHub,
         observer: Arc<dyn SessionSocketBindObserver>,
     ) -> io::Result<Self> {
-        if expected_uid != unsafe { libc::geteuid() } {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "session socket owner UID must match the daemon effective UID",
-            ));
-        }
-        let path = path.as_ref().to_path_buf();
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no parent"))?;
-        let socket_name = path
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no name"))?
-            .to_owned();
-        let directory = SecureDir::open_writable(parent, true).map_err(store_error)?;
-        directory.enforce_private_directory().map_err(store_error)?;
-        let descriptor_path = directory
-            .descriptor_path(&socket_name)
-            .map_err(store_error)?;
-        if let Some(metadata) = directory
-            .entry_metadata(&socket_name)
-            .map_err(store_error)?
-        {
-            if metadata.mode & libc::S_IFMT != libc::S_IFSOCK
-                || metadata.uid != expected_uid
-                || metadata.mode & 0o777 != 0o600
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "refusing to replace a socket path that is not owned mode-0600",
-                ));
-            }
-            match UnixStream::connect(&descriptor_path).await {
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "a live session daemon already owns the socket",
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                    observer.stale_socket_probed(&path)?;
-                    match directory
-                        .entry_metadata(&socket_name)
-                        .map_err(store_error)?
-                    {
-                        Some(current)
-                            if (current.device, current.inode)
-                                == (metadata.device, metadata.inode) =>
-                        {
-                            directory.remove_file(&socket_name).map_err(store_error)?;
-                        }
-                        None => {}
-                        Some(_) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::AlreadyExists,
-                                "session socket changed while stale ownership was checked",
-                            ));
-                        }
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        let listener = UnixListener::bind(&descriptor_path)?;
-        directory
-            .chmod_entry(&socket_name, 0o600)
-            .map_err(store_error)?;
-        let metadata = directory
-            .entry_metadata(&socket_name)
-            .map_err(store_error)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "socket disappeared"))?;
-        if metadata.mode & libc::S_IFMT != libc::S_IFSOCK
-            || metadata.uid != expected_uid
-            || metadata.mode & 0o777 != 0o600
-        {
-            let _ = directory.remove_file(&socket_name);
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "private session socket ownership could not be established",
-            ));
-        }
+        let endpoint =
+            PrivateSocketEndpoint::bind_with_observer(path, expected_uid, observer).await?;
         let (shutdown, _) = tokio::sync::broadcast::channel(1);
         Ok(Self {
-            path,
-            directory,
-            socket_name,
-            expected_uid,
-            listener,
+            endpoint,
             hub,
-            socket_identity: (metadata.device, metadata.inode),
             shutdown,
             connections: tokio::sync::Mutex::new(Vec::new()),
             serving: AtomicBool::new(false),
@@ -164,10 +59,10 @@ impl SessionSocket {
     }
 
     pub async fn serve_one(&self) -> io::Result<()> {
-        let (stream, _) = self.listener.accept().await?;
+        let stream = self.endpoint.accept().await?;
         serve_stream(
             stream,
-            self.expected_uid,
+            self.endpoint.expected_uid(),
             self.hub.clone(),
             self.shutdown.subscribe(),
         )
@@ -188,11 +83,11 @@ impl SessionSocket {
         let mut listener_shutdown = self.shutdown.subscribe();
         loop {
             let accepted = tokio::select! {
-                accepted = self.listener.accept() => accepted,
+                accepted = self.endpoint.accept() => accepted,
                 _ = listener_shutdown.recv() => return Ok(()),
             };
-            let (stream, _) = accepted?;
-            let expected_uid = self.expected_uid;
+            let stream = accepted?;
+            let expected_uid = self.endpoint.expected_uid();
             let hub = self.hub.clone();
             let shutdown = self.shutdown.subscribe();
             self.connections.lock().await.push(tokio::spawn(async move {
@@ -243,7 +138,7 @@ impl SessionSocket {
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.endpoint.path()
     }
 }
 
@@ -262,15 +157,6 @@ impl Drop for ServeGuard<'_> {
 impl Drop for SessionSocket {
     fn drop(&mut self) {
         let _ = self.shutdown.send(());
-        let Ok(Some(metadata)) = self.directory.entry_metadata(&self.socket_name) else {
-            return;
-        };
-        if metadata.mode & libc::S_IFMT == libc::S_IFSOCK
-            && metadata.uid == self.expected_uid
-            && (metadata.device, metadata.inode) == self.socket_identity
-        {
-            let _ = self.directory.remove_file(&self.socket_name);
-        }
     }
 }
 
@@ -308,41 +194,4 @@ async fn serve_stream(
         line.push(b'\n');
         stream.write_all(&line).await?;
     }
-}
-
-fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    if length as usize != std::mem::size_of::<libc::ucred>() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid peer credentials length",
-        ));
-    }
-    Ok(credentials.uid)
-}
-
-fn store_error(error: StoreError) -> io::Error {
-    let kind = if error.code() == "unsafe_path" {
-        io::ErrorKind::PermissionDenied
-    } else {
-        io::ErrorKind::Other
-    };
-    io::Error::new(kind, error)
 }

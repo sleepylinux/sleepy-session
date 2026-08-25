@@ -4,14 +4,18 @@ mod generation;
 mod hub;
 mod lifecycle;
 mod mutation;
+pub(crate) mod private_socket;
 mod socket;
+mod sources;
 
 pub use authority::GenerationAuthority;
 pub use generation::GenerationAllocator;
 pub use hub::{EventHub, EventSubscriber, PublishError};
 pub use lifecycle::{LifecycleReconciler, ReconciliationReport, ShutdownCoordinator};
 pub use mutation::{MutationBackend, MutationPipeline, PipelineError};
-pub use socket::{SessionSocket, SessionSocketBindObserver, SocketDrainReport};
+pub use private_socket::PrivateSocketBindObserver as SessionSocketBindObserver;
+pub use socket::{SessionSocket, SocketDrainReport};
+pub use sources::ProductionSources;
 
 use sleepy_sdk::{
     CapabilityAvailability, CapabilityFailure, CapabilityRecord, EventCause, EventCauseKind,

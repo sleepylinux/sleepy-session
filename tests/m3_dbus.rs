@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
@@ -23,17 +23,32 @@ struct IsolatedBus {
 
 impl IsolatedBus {
     fn start() -> Self {
-        let mut child = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+        let mut command = Command::new("dbus-daemon");
+        if let Some(config) = std::env::var_os("SLEEPY_DBUS_SESSION_CONF") {
+            command.arg("--config-file").arg(config);
+        } else {
+            command.arg("--session");
+        }
+        let mut child = command
+            .args(["--nofork", "--nopidfile", "--print-address=1"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let address = BufReader::new(child.stdout.take().unwrap())
-            .lines()
-            .next()
-            .unwrap()
-            .unwrap();
+        let address = match BufReader::new(child.stdout.take().unwrap()).lines().next() {
+            Some(Ok(address)) if !address.is_empty() => address,
+            result => {
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                let status = child.wait().unwrap();
+                panic!("dbus-daemon did not publish an address ({result:?}, {status}): {stderr}");
+            }
+        };
         Self { address, child }
     }
 }

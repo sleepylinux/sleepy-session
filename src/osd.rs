@@ -1,16 +1,30 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    io,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use sleepy_sdk::{
     validate_osd_event, AudioRuntimeState, BrightnessRuntimeState, CapabilityAvailability,
     CapabilityValue, EventEnvelope, MediaRuntimeState, NiriEvent, OsdEvent, OsdKind,
     PowerProfileRuntimeState, RuntimeCapabilityId, SessionEvent, WIRE_SCHEMA_VERSION,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::{
+    io::AsyncWriteExt,
+    net::UnixStream,
+    sync::{broadcast, mpsc, oneshot},
+};
 
-use crate::sessiond::EventSubscriber;
+use crate::sessiond::{
+    private_socket::{peer_uid, PrivateSocketEndpoint},
+    EventSubscriber, SocketDrainReport,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FocusedOsdRequest {
@@ -28,11 +42,33 @@ pub enum OsdRouteError {
     RuntimeStopped,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OsdPublication {
     pub sequence: u64,
     pub visible: Vec<OsdEvent>,
     pub overflow_by_output: BTreeMap<String, u64>,
+}
+
+#[derive(Clone)]
+pub struct OsdPublicationHub {
+    latest: Arc<RwLock<Option<OsdPublication>>>,
+    events: broadcast::Sender<OsdPublication>,
+}
+
+pub struct OsdPublicationSubscriber {
+    replay: Option<OsdPublication>,
+    last_sequence: u64,
+    events: broadcast::Receiver<OsdPublication>,
+}
+
+pub struct OsdSocket {
+    endpoint: PrivateSocketEndpoint,
+    hub: OsdPublicationHub,
+    shutdown: broadcast::Sender<()>,
+    connections: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
+    serving: AtomicBool,
+    serve_stopped: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
@@ -395,6 +431,203 @@ impl CapabilityOsdState {
             RuntimeCapabilityId::PowerProfile => self.power_profile = None,
             _ => {}
         }
+    }
+}
+
+impl OsdPublicationHub {
+    pub fn new(capacity: usize) -> Self {
+        let (events, _) = broadcast::channel(capacity.max(1));
+        Self {
+            latest: Arc::new(RwLock::new(None)),
+            events,
+        }
+    }
+
+    pub fn publish(&self, publication: OsdPublication) -> io::Result<()> {
+        let mut latest = self
+            .latest
+            .write()
+            .map_err(|_| io::Error::other("OSD publication state was poisoned"))?;
+        if latest
+            .as_ref()
+            .is_some_and(|current| publication.sequence <= current.sequence)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OSD publication sequence must be strictly increasing",
+            ));
+        }
+        *latest = Some(publication.clone());
+        let _ = self.events.send(publication);
+        Ok(())
+    }
+
+    pub fn subscribe(&self) -> io::Result<OsdPublicationSubscriber> {
+        let events = self.events.subscribe();
+        let replay = self
+            .latest
+            .read()
+            .map_err(|_| io::Error::other("OSD publication state was poisoned"))?
+            .clone();
+        Ok(OsdPublicationSubscriber {
+            replay,
+            last_sequence: 0,
+            events,
+        })
+    }
+}
+
+impl OsdPublicationSubscriber {
+    pub async fn recv(&mut self) -> io::Result<OsdPublication> {
+        if let Some(replay) = self.replay.take() {
+            self.last_sequence = replay.sequence;
+            return Ok(replay);
+        }
+        loop {
+            let publication = self.events.recv().await.map_err(|error| match error {
+                broadcast::error::RecvError::Closed => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "OSD publication hub closed")
+                }
+                broadcast::error::RecvError::Lagged(count) => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("OSD publication subscriber lagged by {count}"),
+                ),
+            })?;
+            if publication.sequence > self.last_sequence {
+                self.last_sequence = publication.sequence;
+                return Ok(publication);
+            }
+        }
+    }
+}
+
+impl OsdSocket {
+    pub async fn bind(
+        path: impl AsRef<Path>,
+        expected_uid: libc::uid_t,
+        hub: OsdPublicationHub,
+    ) -> io::Result<Self> {
+        let endpoint = PrivateSocketEndpoint::bind(path, expected_uid).await?;
+        let (shutdown, _) = broadcast::channel(1);
+        Ok(Self {
+            endpoint,
+            hub,
+            shutdown,
+            connections: tokio::sync::Mutex::new(Vec::new()),
+            serving: AtomicBool::new(false),
+            serve_stopped: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub async fn serve(&self) -> io::Result<()> {
+        if self.serving.swap(true, Ordering::AcqRel) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "OSD socket is already being served",
+            ));
+        }
+        let _guard = OsdServeGuard {
+            serving: &self.serving,
+            stopped: &self.serve_stopped,
+        };
+        let mut listener_shutdown = self.shutdown.subscribe();
+        loop {
+            let stream = tokio::select! {
+                accepted = self.endpoint.accept() => accepted?,
+                _ = listener_shutdown.recv() => return Ok(()),
+            };
+            let expected_uid = self.endpoint.expected_uid();
+            let subscriber = self.hub.subscribe()?;
+            let shutdown = self.shutdown.subscribe();
+            self.connections.lock().await.push(tokio::spawn(async move {
+                serve_osd_stream(stream, expected_uid, subscriber, shutdown).await
+            }));
+        }
+    }
+
+    pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<SocketDrainReport> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _ = self.shutdown.send(());
+        if self.serving.load(Ordering::Acquire) {
+            tokio::time::timeout_at(deadline, async {
+                while self.serving.load(Ordering::Acquire) {
+                    let stopped = self.serve_stopped.notified();
+                    if !self.serving.load(Ordering::Acquire) {
+                        break;
+                    }
+                    stopped.await;
+                }
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OSD accept loop did not stop"))?;
+        }
+        let mut handles = std::mem::take(&mut *self.connections.lock().await);
+        let mut report = SocketDrainReport::default();
+        while !handles.is_empty() {
+            let mut handle = handles.remove(0);
+            match tokio::time::timeout_at(deadline, &mut handle).await {
+                Ok(_) => report.completed += 1,
+                Err(_) => {
+                    handle.abort();
+                    let _ = handle.await;
+                    report.aborted += 1;
+                    for handle in handles {
+                        handle.abort();
+                        let _ = handle.await;
+                        report.aborted += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    pub fn path(&self) -> &Path {
+        self.endpoint.path()
+    }
+}
+
+impl Drop for OsdSocket {
+    fn drop(&mut self) {
+        let _ = self.shutdown.send(());
+    }
+}
+
+struct OsdServeGuard<'a> {
+    serving: &'a AtomicBool,
+    stopped: &'a tokio::sync::Notify,
+}
+
+impl Drop for OsdServeGuard<'_> {
+    fn drop(&mut self) {
+        self.serving.store(false, Ordering::Release);
+        self.stopped.notify_waiters();
+    }
+}
+
+async fn serve_osd_stream(
+    mut stream: UnixStream,
+    expected_uid: libc::uid_t,
+    mut subscriber: OsdPublicationSubscriber,
+    mut shutdown: broadcast::Receiver<()>,
+) -> io::Result<()> {
+    if peer_uid(&stream)? != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "OSD socket peer UID mismatch",
+        ));
+    }
+    loop {
+        let publication = tokio::select! {
+            biased;
+            publication = subscriber.recv() => publication?,
+            _ = shutdown.recv() => return Ok(()),
+        };
+        let mut line = serde_json::to_vec(&publication)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        line.push(b'\n');
+        stream.write_all(&line).await?;
     }
 }
 

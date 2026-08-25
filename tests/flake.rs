@@ -45,4 +45,5 @@ fn flake_puts_the_dbus_daemon_on_the_native_check_path() {
 
     assert!(flake.contains("nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ]"));
     assert!(flake.contains("buildInputs = [ pkgs.dbus ]"));
+    assert!(flake.contains("SLEEPY_DBUS_SESSION_CONF = \"${pkgs.dbus}/share/dbus-1/session.conf\""));
 }

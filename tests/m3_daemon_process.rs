@@ -1,5 +1,8 @@
 use std::{
-    io::{BufRead, BufReader},
+    ffi::CString,
+    fs::OpenOptions,
+    io::{BufRead, BufReader, Read},
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::Path,
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -8,8 +11,9 @@ use std::{
 };
 
 use sleepy_sdk::{
-    validate_event_envelope, EventCauseKind, LifecycleEvent, LifecycleState, SessionEvent,
+    validate_event_envelope, EventCauseKind, LifecycleEvent, LifecycleState, OsdKind, SessionEvent,
 };
+use sleepy_session::osd::OsdPublication;
 
 #[test]
 fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
@@ -82,7 +86,9 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
         .unwrap();
     let mut daemon = ChildGuard(Some(daemon));
     let socket = runtime.join("sleepy/session.sock");
+    let osd_socket = runtime.join("sleepy/osd.sock");
     wait_for_path(&socket, Duration::from_secs(2));
+    wait_for_path(&osd_socket, Duration::from_secs(2));
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_sleepyctl"))
         .args(["events", "watch", "--format", "ndjson"])
@@ -119,7 +125,93 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let status = daemon.0.take().unwrap().wait().unwrap();
     assert!(status.success());
     assert!(!socket.exists());
+    assert!(!osd_socket.exists());
     assert!(watcher.wait().unwrap().success());
+}
+
+#[test]
+fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    let bin = temp.path().join("bin");
+    let marker = temp.path().join("audio-changed");
+    let niri_hold = temp.path().join("niri-hold");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let fifo = CString::new(niri_hold.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let _niri_hold = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&niri_hold)
+        .unwrap();
+    write_executable(
+        &bin.join("niri"),
+        "#!/bin/sh\n[ \"$1|$2|$3|$#\" = 'msg|--json|event-stream|3' ] || exit 64\nprintf '%s\\n' '{\"WorkspacesChanged\":{\"workspaces\":[{\"id\":9,\"output\":\"DP-9\"}]}}'\nprintf '%s\\n' '{\"WorkspaceActivated\":{\"id\":9,\"focused\":true}}'\nIFS= read -r ignored < \"$SLEEPY_NIRI_HOLD\"\n",
+    );
+    write_executable(
+        &bin.join("pw-mon"),
+        "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 64\nsleep 0.05\n: > \"$SLEEPY_FIXTURE_MARKER\"\nprintf '%s\\n' changed\n",
+    );
+    write_executable(
+        &bin.join("wpctl"),
+        "#!/bin/sh\ncase \"$1|$2|$3|$#\" in\n  'get-volume|@DEFAULT_AUDIO_SINK@||2') if [ -e \"$SLEEPY_FIXTURE_MARKER\" ]; then level=0.80; else level=0.40; fi; printf 'Volume: %s\\n' \"$level\" ;;\n  'get-volume|@DEFAULT_AUDIO_SOURCE@||2') printf 'Volume: 0.60\\n' ;;\n  'status|--name||2') printf 'Sinks:\\n * 42. Fixture Speaker [vol: 0.80]\\n' ;;\n  *) exit 64 ;;\nesac\n",
+    );
+    write_executable(
+        &bin.join("brightnessctl"),
+        "#!/bin/sh\nprintf '%s\\n' 'backlight,intel_backlight,100,50%,50'\n",
+    );
+    write_executable(
+        &bin.join("powerprofilesctl"),
+        "#!/bin/sh\ncase \"$1\" in get) printf 'balanced\\n' ;; list) printf '* balanced:\\n  performance:\\n' ;; *) exit 2 ;; esac\n",
+    );
+    write_executable(
+        &bin.join("playerctl"),
+        "#!/bin/sh\nprintf 'Paused\\tTrack\\tArtist\\n'\n",
+    );
+
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("PATH", path)
+        .env("SLEEPY_FIXTURE_MARKER", &marker)
+        .env("SLEEPY_NIRI_HOLD", &niri_hold)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut daemon = ChildGuard(Some(daemon));
+    let socket = runtime.join("sleepy/osd.sock");
+    wait_for_path(&socket, Duration::from_secs(2));
+
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        // Nix checks run all Rust tests under a heavily loaded sandbox. Keep
+        // the integration deadline bounded but above the adapter's proven
+        // four-second total readback deadline plus one source restart.
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    let publication: OsdPublication = loop {
+        let line = lines.next().unwrap().unwrap();
+        let publication: OsdPublication = serde_json::from_str(&line).unwrap();
+        if publication.visible.iter().any(|event| {
+            event.output_id == "DP-9" && event.kind == OsdKind::Volume && event.level == Some(0.8)
+        }) {
+            break publication;
+        }
+    };
+    assert!(publication.sequence > 0);
+
+    let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);
+    assert!(daemon.0.take().unwrap().wait().unwrap().success());
 }
 
 struct ChildGuard(Option<std::process::Child>);
@@ -131,17 +223,32 @@ struct IsolatedBus {
 
 impl IsolatedBus {
     fn start() -> Self {
-        let mut child = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+        let mut command = Command::new("dbus-daemon");
+        if let Some(config) = std::env::var_os("SLEEPY_DBUS_SESSION_CONF") {
+            command.arg("--config-file").arg(config);
+        } else {
+            command.arg("--session");
+        }
+        let mut child = command
+            .args(["--nofork", "--nopidfile", "--print-address=1"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let address = BufReader::new(child.stdout.take().unwrap())
-            .lines()
-            .next()
-            .unwrap()
-            .unwrap();
+        let address = match BufReader::new(child.stdout.take().unwrap()).lines().next() {
+            Some(Ok(address)) if !address.is_empty() => address,
+            result => {
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                let status = child.wait().unwrap();
+                panic!("dbus-daemon did not publish an address ({result:?}, {status}): {stderr}");
+            }
+        };
         Self { address, child }
     }
 }
@@ -151,6 +258,11 @@ impl Drop for IsolatedBus {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 impl ChildGuard {

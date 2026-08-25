@@ -1,12 +1,14 @@
 use sleepy_sdk::{NiriEvent, OsdEvent, OsdKind, WIRE_SCHEMA_VERSION};
 use sleepy_session::{
     osd::{
-        spawn_osd_runtime, spawn_osd_runtime_with_timing, FocusedOsdRequest, OsdRouteError,
-        OsdRouter,
+        spawn_osd_runtime, spawn_osd_runtime_with_timing, FocusedOsdRequest, OsdPublication,
+        OsdPublicationHub, OsdRouteError, OsdRouter, OsdSocket,
     },
     sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
 };
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::UnixStream;
 
 fn event(output: &str, kind: OsdKind, label: &str) -> OsdEvent {
     OsdEvent {
@@ -584,4 +586,57 @@ async fn publish_osd_input(authority: &GenerationAuthority, payload: sleepy_sdk:
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn osd_socket_replays_latest_then_monotonic_live_publications() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("runtime/sleepy/osd.sock");
+    let hub = OsdPublicationHub::new(8);
+    hub.publish(OsdPublication {
+        sequence: 7,
+        visible: vec![OsdEvent {
+            schema_version: WIRE_SCHEMA_VERSION,
+            output_id: "DP-7".into(),
+            kind: OsdKind::Brightness,
+            level: Some(0.7),
+            muted: None,
+            label: "70%".into(),
+        }],
+        overflow_by_output: Default::default(),
+    })
+    .unwrap();
+    let socket = std::sync::Arc::new(
+        OsdSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub.clone())
+            .await
+            .unwrap(),
+    );
+    let server = tokio::spawn({
+        let socket = std::sync::Arc::clone(&socket);
+        async move { socket.serve().await }
+    });
+
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    let replay: OsdPublication =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(replay.sequence, 7);
+    assert_eq!(replay.visible[0].output_id, "DP-7");
+
+    hub.publish(OsdPublication {
+        sequence: 8,
+        visible: Vec::new(),
+        overflow_by_output: Default::default(),
+    })
+    .unwrap();
+    let live: OsdPublication =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(live.sequence, 8);
+
+    drop(lines);
+    socket
+        .shutdown_and_drain(Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap().unwrap();
 }

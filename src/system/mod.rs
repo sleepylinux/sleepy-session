@@ -24,9 +24,11 @@ pub use runner::{
 };
 use sleepy_sdk::{
     validate_session_action_result, validate_system_mutation_result, validate_system_snapshot,
-    AudioState, BluetoothState, CapabilityDiagnostic, CapabilityErrorKind, CapabilityId,
-    CapabilityState, MediaState, MediaTransport, NetworkState, PowerProfile, PowerState,
-    SessionAction, SessionActionRequest, SessionActionResult, SessionActionStatus, SystemMutation,
+    AudioRuntimeState, AudioState, BluetoothState, BrightnessRuntimeState, CapabilityAvailability,
+    CapabilityDiagnostic, CapabilityErrorKind, CapabilityFailure, CapabilityId, CapabilityRecord,
+    CapabilityState, CapabilityValue, MediaRuntimeState, MediaState, MediaTransport, NetworkState,
+    PowerProfile, PowerProfileRuntimeState, PowerState, RuntimeCapabilityId, SessionAction,
+    SessionActionRequest, SessionActionResult, SessionActionStatus, SystemMutation,
     SystemMutationResult, SystemSnapshot,
 };
 
@@ -173,6 +175,72 @@ impl<R: CommandRunner> SystemFacade<R> {
         Self {
             runner,
             latest_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Bounded, capability-local readback used by the event-driven session
+    /// adapters. Unlike `snapshot`, this never probes unrelated providers.
+    pub(crate) fn runtime_capability(&self, id: RuntimeCapabilityId) -> CapabilityRecord {
+        let value = match id {
+            RuntimeCapabilityId::Audio => (|| {
+                let output = audio::probe_output(&self.runner)?;
+                let input = audio::probe_microphone(&self.runner)?;
+                let devices = audio::probe_devices(&self.runner)?;
+                Ok(CapabilityValue::Audio(AudioRuntimeState {
+                    output_level: output.level,
+                    output_muted: output.muted,
+                    input_level: input.level,
+                    input_muted: input.muted,
+                    default_output_id: devices.selected_id,
+                }))
+            })(),
+            RuntimeCapabilityId::Brightness => display::probe_brightness(&self.runner)
+                .map(|level| CapabilityValue::Brightness(BrightnessRuntimeState { level })),
+            RuntimeCapabilityId::PowerProfile => {
+                power::probe_profiles(&self.runner).map(|(active, available)| {
+                    CapabilityValue::PowerProfile(PowerProfileRuntimeState {
+                        active: active.map(profile_name).unwrap_or_default().to_owned(),
+                        available: available
+                            .into_iter()
+                            .map(|profile| profile_name(profile).to_owned())
+                            .collect(),
+                    })
+                })
+            }
+            RuntimeCapabilityId::Media => media::probe(&self.runner).map(|state| {
+                CapabilityValue::Media(MediaRuntimeState {
+                    player_id: "mpris".to_owned(),
+                    title: state.title,
+                    artist: state.artist.unwrap_or_default(),
+                    playing: state.playing,
+                })
+            }),
+            _ => {
+                return CapabilityRecord {
+                    id,
+                    status: CapabilityAvailability::Unsupported,
+                    value: None,
+                    diagnostic: Some(CapabilityFailure {
+                        message: "no production readback is registered for this capability".into(),
+                    }),
+                }
+            }
+        };
+        match value {
+            Ok(value) => CapabilityRecord {
+                id,
+                status: CapabilityAvailability::Available,
+                value: Some(value),
+                diagnostic: None,
+            },
+            Err(error) => CapabilityRecord {
+                id,
+                status: availability(error.kind),
+                value: None,
+                diagnostic: Some(CapabilityFailure {
+                    message: error.message,
+                }),
+            },
         }
     }
 
@@ -399,6 +467,23 @@ impl<R: CommandRunner> SystemFacade<R> {
             ));
         }
         Ok(())
+    }
+}
+
+fn profile_name(profile: PowerProfile) -> &'static str {
+    match profile {
+        PowerProfile::PowerSaver => "power-saver",
+        PowerProfile::Balanced => "balanced",
+        PowerProfile::Performance => "performance",
+    }
+}
+
+fn availability(kind: CapabilityErrorKind) -> CapabilityAvailability {
+    match kind {
+        CapabilityErrorKind::Unsupported => CapabilityAvailability::Unsupported,
+        CapabilityErrorKind::Timeout => CapabilityAvailability::Timeout,
+        CapabilityErrorKind::Parse => CapabilityAvailability::Parse,
+        CapabilityErrorKind::Busy | CapabilityErrorKind::Command => CapabilityAvailability::Error,
     }
 }
 
