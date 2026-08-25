@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::{
-    private_socket::{peer_uid, PrivateSocketEndpoint},
+    private_socket::{peer_uid, read_bounded_line, PrivateSocketEndpoint},
     MutationBackend, MutationPipeline,
 };
 use std::{
@@ -13,10 +13,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-};
+use tokio::{io::AsyncWriteExt, net::UnixStream};
 
 const MAX_LINE: usize = 256 * 1024;
 
@@ -137,15 +134,13 @@ async fn serve_stream<B: MutationBackend>(
         ));
     }
     let (read, mut write) = stream.into_split();
-    let mut bytes = Vec::new();
-    let count = BufReader::new(read).read_until(b'\n', &mut bytes).await?;
-    if count == 0 || count > MAX_LINE || bytes.last() != Some(&b'\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid bounded control request",
-        ));
-    }
-    bytes.pop();
+    let bytes = read_bounded_line(
+        read,
+        MAX_LINE,
+        Duration::from_secs(3),
+        "invalid bounded control request",
+    )
+    .await?;
     let input = std::str::from_utf8(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let result = pipeline

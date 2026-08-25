@@ -11,7 +11,7 @@ use sleepy_session::sessiond::{
     MutationBackend, MutationPipeline,
 };
 use tempfile::tempdir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 struct Backend;
 impl MutationBackend for Backend {
@@ -113,4 +113,49 @@ async fn control_socket_rejects_unknown_fields_and_versions_without_executing() 
     stream.write_all(b"{\"schemaVersion\":3,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"expectedGeneration\":1,\"command\":{\"type\":\"setDnd\",\"data\":{\"enabled\":true}},\"extra\":true}\n").await.unwrap();
     stream.shutdown().await.unwrap();
     assert!(task.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn control_socket_rejects_oversize_unterminated_input_without_waiting_for_eof() {
+    let temp = tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut allocator = GenerationAllocator::open(temp.path().join("generation"), 16).unwrap();
+    let initial = allocator.next_generation().unwrap();
+    let authority = GenerationAuthority::new(
+        allocator,
+        initial,
+        EventHub::new(full_snapshot_event(initial).unwrap(), 16),
+    );
+    let socket = Arc::new(
+        ControlSocket::bind(
+            temp.path().join("control.sock"),
+            unsafe { libc::geteuid() },
+            Arc::new(MutationPipeline::new(authority, Arc::new(Backend))),
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve().await });
+    let mut client = tokio::net::UnixStream::connect(socket.path())
+        .await
+        .unwrap();
+    client.write_all(&vec![b'x'; 256 * 1024 + 1]).await.unwrap();
+    let mut closed = [0_u8; 1];
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        client.read(&mut closed),
+    )
+    .await
+    .expect("bounded reader must reject before peer EOF")
+    .unwrap();
+    assert_eq!(result, 0);
+    assert_eq!(
+        socket
+            .shutdown_and_drain(std::time::Duration::from_millis(250))
+            .await
+            .unwrap(),
+        1
+    );
+    task.await.unwrap().unwrap();
 }

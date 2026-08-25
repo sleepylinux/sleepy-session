@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::{NotificationActionDispatcher, NotificationCommand, NotificationEventService};
-use crate::sessiond::private_socket::{peer_uid, PrivateSocketEndpoint};
+use crate::sessiond::private_socket::{peer_uid, read_bounded_line, PrivateSocketEndpoint};
 use serde::{Deserialize, Serialize};
 use sleepy_sdk::{NotificationDocument, WIRE_SCHEMA_VERSION};
 use std::{
@@ -13,11 +13,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::UnixStream,
-    sync::Mutex,
-};
+use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Mutex};
 
 const MAX_LINE: usize = 256 * 1024;
 
@@ -228,15 +224,13 @@ async fn serve(
         ));
     }
     let (read, mut write) = stream.into_split();
-    let mut bytes = Vec::new();
-    let count = BufReader::new(read).read_until(b'\n', &mut bytes).await?;
-    if count == 0 || count > MAX_LINE || bytes.last() != Some(&b'\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid bounded notification request",
-        ));
-    }
-    bytes.pop();
+    let bytes = read_bounded_line(
+        read,
+        MAX_LINE,
+        Duration::from_secs(3),
+        "invalid bounded notification request",
+    )
+    .await?;
     let request: Request = serde_json::from_slice(&bytes).map_err(invalid)?;
     if request.schema_version != WIRE_SCHEMA_VERSION
         || uuid::Uuid::parse_str(&request.request_id).is_err()

@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::store::{SecureDir, StoreError};
@@ -190,6 +191,27 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
         ));
     }
     Ok(credentials.uid)
+}
+
+pub(crate) async fn read_bounded_line<R: AsyncRead + Unpin>(
+    reader: R,
+    max_line: usize,
+    deadline: std::time::Duration,
+    description: &'static str,
+) -> io::Result<Vec<u8>> {
+    let read = async {
+        let mut limited = BufReader::new(reader).take((max_line + 1) as u64);
+        let mut bytes = Vec::with_capacity(max_line + 1);
+        let count = limited.read_until(b'\n', &mut bytes).await?;
+        if count == 0 || count > max_line || bytes.last() != Some(&b'\n') {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, description));
+        }
+        bytes.pop();
+        Ok(bytes)
+    };
+    tokio::time::timeout(deadline, read)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, description))?
 }
 
 fn store_error(error: StoreError) -> io::Error {

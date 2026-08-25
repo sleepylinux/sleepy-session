@@ -12,7 +12,7 @@ use sleepy_session::{
     sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
 };
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
 async fn notification_socket_returns_real_history_and_mutates_shared_dnd_state() {
@@ -94,4 +94,54 @@ async fn request(path: &std::path::Path, line: &str) -> serde_json::Value {
     let mut response = String::new();
     BufReader::new(read).read_line(&mut response).await.unwrap();
     serde_json::from_str(&response).unwrap()
+}
+
+#[tokio::test]
+async fn notification_socket_rejects_oversize_unterminated_input_and_drains_connection() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = NotificationStore::open(temp.path().join("notifications"), 500).unwrap();
+    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let mut allocator = GenerationAllocator::open(temp.path().join("generation"), 16).unwrap();
+    let generation = allocator.next_generation().unwrap();
+    let authority = GenerationAuthority::new(
+        allocator,
+        generation,
+        EventHub::new(full_snapshot_event(generation).unwrap(), 16),
+    );
+    let service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        provider, authority,
+    )));
+    let socket = Arc::new(
+        NotificationSocket::bind(
+            temp.path().join("notification.sock"),
+            unsafe { libc::geteuid() },
+            service,
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve().await });
+    let mut client = tokio::net::UnixStream::connect(socket.path())
+        .await
+        .unwrap();
+    client.write_all(&vec![b'x'; 256 * 1024 + 1]).await.unwrap();
+    let mut closed = [0_u8; 1];
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        client.read(&mut closed),
+    )
+    .await
+    .expect("bounded reader must reject before peer EOF")
+    .unwrap();
+    assert_eq!(result, 0);
+    assert_eq!(
+        socket
+            .shutdown_and_drain(std::time::Duration::from_millis(250))
+            .await
+            .unwrap(),
+        1
+    );
+    task.await.unwrap().unwrap();
 }
