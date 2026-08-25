@@ -12,6 +12,7 @@ use sleepy_session::sessiond::{
     full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority, ProductionSources,
     SessionSocket, ShutdownCoordinator,
 };
+use sleepy_session::{theme::ThemeManager, theme_socket::ThemeSocket};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -27,10 +28,12 @@ async fn main() -> ExitCode {
 async fn run() -> io::Result<()> {
     let runtime_dir = required_path("XDG_RUNTIME_DIR")?;
     let state_dir = state_home()?;
+    let config_dir = config_home()?;
     let cache_dir = cache_home()?;
     let socket_path = runtime_dir.join("sleepy/session.sock");
     let osd_socket_path = runtime_dir.join("sleepy/osd.sock");
     let daily_socket_path = runtime_dir.join("sleepy/daily.sock");
+    let theme_socket_path = runtime_dir.join("sleepy/theme.sock");
     let generation_path = state_dir.join("sleepy/session-generation");
     let (overview_sender, overview_events) = overview_event_channel(256);
     let daily_backend = Arc::new(ProductionDailyBackend::open_with_overview(
@@ -74,6 +77,15 @@ async fn run() -> io::Result<()> {
     let socket = SessionSocket::bind(&socket_path, expected_uid, hub.clone()).await?;
     let osd_socket = OsdSocket::bind(&osd_socket_path, expected_uid, osd_hub).await?;
     let daily_socket = DailySocket::bind(&daily_socket_path, expected_uid, daily_backend).await?;
+    let theme_manager = ThemeManager::open(&config_dir, &state_dir)
+        .map_err(|error| io::Error::other(format!("theme provider: {error}")))?;
+    let theme_socket = ThemeSocket::bind(
+        &theme_socket_path,
+        expected_uid,
+        theme_manager,
+        authority.clone(),
+    )
+    .await?;
     let sources = ProductionSources::start_with_overview(authority.clone(), overview_sender);
     let shutdown = ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
     let result = {
@@ -81,6 +93,7 @@ async fn run() -> io::Result<()> {
             result = socket.serve() => result,
             result = osd_socket.serve() => result,
             result = daily_socket.serve() => result,
+            result = theme_socket.serve() => result,
             bridge = &mut osd_bridge => match bridge {
                 Ok(Ok(())) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "OSD publication bridge stopped")),
                 Ok(Err(error)) => Err(error),
@@ -140,6 +153,12 @@ async fn run() -> io::Result<()> {
     {
         cleanup_error.get_or_insert(error);
     }
+    if let Err(error) = theme_socket
+        .shutdown_and_drain(std::time::Duration::from_secs(2))
+        .await
+    {
+        cleanup_error.get_or_insert(error);
+    }
     osd_bridge.abort();
     let _ = osd_bridge.await;
     osd_task.abort();
@@ -168,4 +187,11 @@ fn cache_home() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     Ok(required_path("HOME")?.join(".cache"))
+}
+
+fn config_home() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(required_path("HOME")?.join(".config"))
 }

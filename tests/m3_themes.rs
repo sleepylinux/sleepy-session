@@ -84,6 +84,32 @@ fn low_contrast_import_is_rejected_without_replacing_last_valid_theme() {
 }
 
 #[test]
+fn ui_color_that_only_fails_on_surface_is_rejected_before_sdk_repin() {
+    let temp = TempDir::new().unwrap();
+    let store = manager(&temp);
+    let document = serde_json::json!({
+        "schemaVersion": 1,
+        "id": "9ed1119d-5f95-4aa7-b31b-ecbb44a052ce",
+        "name": "Split",
+        "origin": "user",
+        "appearance": "dark",
+        "effects": "none",
+        "reducedMotion": true,
+        "opaqueFallback": true,
+        "colors": {
+            "background": "#000000",
+            "surface": "#FFFFFF",
+            "textPrimary": "#767676",
+            "textSecondary": "#767676",
+            "accent": "#FFFFFF",
+            "control": "#767676"
+        }
+    });
+    assert!(store.import(&document.to_string()).is_err());
+    assert!(store.durable_state_bytes().unwrap().is_empty());
+}
+
+#[test]
 fn preview_is_memory_only() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
@@ -235,6 +261,77 @@ async fn every_apply_boundary_rolls_back_to_confirmed_theme() {
 }
 
 #[tokio::test]
+async fn cleanup_remove_and_directory_sync_failures_enter_confirmed_rollback() {
+    for stage in [
+        ThemeApplyStage::JournalRemoved,
+        ThemeApplyStage::JournalDirectorySynced,
+    ] {
+        let temp = TempDir::new().unwrap();
+        let mut store = manager(&temp);
+        let imported = store
+            .import(&user_json("9ed1119d-5f95-4aa7-b31b-ecbb44a052ce"))
+            .unwrap();
+        assert!(store
+            .apply_observed(
+                &imported.id,
+                "d78951f8-c6f5-4f7d-8599-d72ed0b34803",
+                0,
+                &RecordingSink::default(),
+                &authority(&temp),
+                &mut FailAt(stage),
+            )
+            .await
+            .is_err());
+        assert_eq!(store.current().unwrap().id, "builtin.sleepy-dark");
+        assert!(!store.has_journal().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn crash_after_cleanup_recovery_is_reconciled_on_restart() {
+    struct CrashAfterRecovery;
+    impl ThemeTransactionObserver for CrashAfterRecovery {
+        fn observe(&mut self, stage: ThemeApplyStage) -> Result<(), String> {
+            if matches!(
+                stage,
+                ThemeApplyStage::JournalRemoved | ThemeApplyStage::CleanupRecoveryWritten
+            ) {
+                Err("injected cleanup crash".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let temp = TempDir::new().unwrap();
+    let mut store = manager(&temp);
+    let imported = store
+        .import(&user_json("9ed1119d-5f95-4aa7-b31b-ecbb44a052ce"))
+        .unwrap();
+    assert!(store
+        .apply_observed(
+            &imported.id,
+            "d78951f8-c6f5-4f7d-8599-d72ed0b34803",
+            0,
+            &RecordingSink::default(),
+            &authority(&temp),
+            &mut CrashAfterRecovery,
+        )
+        .await
+        .is_err());
+    assert_eq!(store.current().unwrap().id, imported.id);
+    assert!(store.has_journal().unwrap());
+
+    drop(store);
+    let mut restarted = manager(&temp);
+    restarted
+        .reconcile(&RecordingSink::default(), &authority(&temp))
+        .await
+        .unwrap();
+    assert_eq!(restarted.current().unwrap().id, "builtin.sleepy-dark");
+    assert!(!restarted.has_journal().unwrap());
+}
+
+#[tokio::test]
 async fn rollback_fault_keeps_journal_for_startup_reconciliation() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
@@ -336,6 +433,76 @@ async fn desktop_acknowledgement_and_rollback_are_bounded_by_daemon_timeout() {
     assert!(started.elapsed() < Duration::from_millis(200));
     assert_eq!(store.current().unwrap().id, "builtin.sleepy-dark");
     assert!(store.has_journal().unwrap());
+}
+
+struct GatedSink {
+    started: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl DesktopThemeSink for GatedSink {
+    fn acknowledge<'a>(
+        &'a self,
+        _theme: &'a ThemeDocument,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_interprocess_lock_serializes_delete_and_import_against_apply() {
+    let temp = TempDir::new().unwrap();
+    let mut applying = manager(&temp);
+    let deleting = manager(&temp);
+    let importing = manager(&temp);
+    let imported = applying
+        .import(&user_json("9ed1119d-5f95-4aa7-b31b-ecbb44a052ce"))
+        .unwrap();
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let sink = GatedSink {
+        started: started.clone(),
+        release: release.clone(),
+    };
+    let auth = authority(&temp);
+    let apply_id = imported.id.clone();
+    let apply = tokio::spawn(async move {
+        applying
+            .apply(
+                &apply_id,
+                "d78951f8-c6f5-4f7d-8599-d72ed0b34803",
+                0,
+                &sink,
+                &auth,
+            )
+            .await
+    });
+    started.notified().await;
+
+    let delete_id = imported.id.clone();
+    let mut delete = tokio::task::spawn_blocking(move || deleting.delete(&delete_id));
+    let mut import = tokio::task::spawn_blocking(move || {
+        importing.import(&user_json("67fb90b3-123b-4e3e-9489-3a8ddb66d4f2"))
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(30), &mut delete)
+        .await
+        .is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(30), &mut import)
+        .await
+        .is_err());
+    release.notify_one();
+    apply.await.unwrap().unwrap();
+    assert!(delete.await.unwrap().is_err());
+    let concurrently_imported = import.await.unwrap().unwrap();
+    assert_eq!(manager(&temp).current().unwrap().id, imported.id);
+    assert_eq!(
+        manager(&temp).theme(&concurrently_imported.id).unwrap(),
+        concurrently_imported
+    );
 }
 
 #[tokio::test]

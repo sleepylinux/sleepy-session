@@ -70,9 +70,13 @@ pub enum ThemeApplyStage {
     CurrentWritten,
     RollbackAcknowledged,
     RollbackWritten,
+    JournalRemoveStarted,
+    JournalRemoved,
+    JournalDirectorySynced,
+    CleanupRecoveryWritten,
 }
 
-pub trait ThemeTransactionObserver {
+pub trait ThemeTransactionObserver: Send {
     fn observe(&mut self, _stage: ThemeApplyStage) -> Result<(), String> {
         Ok(())
     }
@@ -181,16 +185,19 @@ impl ThemeManager {
     }
 
     pub fn import(&self, input: &str) -> Result<ThemeDocument, ThemeError> {
+        let lock = self.mutation_lock("theme import")?;
         let mut document =
             validate_theme_document(input).map_err(|error| ThemeError::new(error.to_string()))?;
         document.id = uuid::Uuid::new_v4().to_string();
         document.origin = ThemeOrigin::User;
         validate_document(&document)?;
         self.write_user(&document)?;
+        drop(lock);
         Ok(document)
     }
 
     pub fn copy_for_edit(&self, id: &str, name: &str) -> Result<ThemeDocument, ThemeError> {
+        let lock = self.mutation_lock("theme copy")?;
         if name.trim().is_empty() {
             return Err(ThemeError::new("theme name must not be empty"));
         }
@@ -200,10 +207,12 @@ impl ThemeManager {
         copy.origin = ThemeOrigin::User;
         validate_document(&copy)?;
         self.write_user(&copy)?;
+        drop(lock);
         Ok(copy)
     }
 
     pub fn delete(&self, id: &str) -> Result<(), ThemeError> {
+        let lock = self.mutation_lock("theme delete")?;
         if Self::builtin(id).is_some() {
             return Err(ThemeError::new("built-in themes are immutable"));
         }
@@ -213,6 +222,7 @@ impl ThemeManager {
         self.documents
             .remove_file(OsStr::new(&theme_file_name(id)?))?;
         self.documents.sync()?;
+        drop(lock);
         Ok(())
     }
 
@@ -257,9 +267,7 @@ impl ThemeManager {
         authority: &GenerationAuthority,
         observer: &mut dyn ThemeTransactionObserver,
     ) -> Result<AppliedTheme, ThemeError> {
-        let lock = self.state.open_lock(OsStr::new("apply.lock"))?;
-        lock.lock_exclusive()
-            .map_err(|error| ThemeError::new(format!("theme transaction lock failed: {error}")))?;
+        let _lock = self.mutation_lock("theme transaction")?;
         uuid::Uuid::parse_str(request_id)
             .map_err(|_| ThemeError::new("request id must be a UUID"))?;
         if self.has_journal()? {
@@ -282,24 +290,60 @@ impl ThemeManager {
             previous: previous.clone(),
             candidate: candidate.clone(),
         };
-        self.atomic_state_write(JOURNAL, &json_bytes(&journal)?)?;
+        let journal_bytes = json_bytes(&journal)?;
+        self.atomic_state_write(JOURNAL, &journal_bytes)?;
 
         let outcome = self
             .continue_apply(&candidate, request_id, sink, &mut generation, observer)
             .await;
         match outcome {
-            Ok(generation) => {
-                self.state.remove_file(OsStr::new(JOURNAL))?;
-                self.state.sync()?;
+            Ok(applied_generation) => {
+                if let Err(cleanup_error) = self.cleanup_journal(observer) {
+                    let recovery_error = match self.atomic_state_write(JOURNAL, &journal_bytes) {
+                        Ok(()) => {
+                            observe(observer, ThemeApplyStage::CleanupRecoveryWritten)?;
+                            None
+                        }
+                        Err(error) => Some(error),
+                    };
+                    let rollback = self
+                        .rollback(
+                            &previous,
+                            request_id,
+                            sink,
+                            &mut generation,
+                            observer,
+                            &journal_bytes,
+                        )
+                        .await;
+                    return match rollback {
+                        Ok(()) => match recovery_error {
+                            Some(recovery) => Err(ThemeError::new(format!(
+                                "{cleanup_error}; cleanup recovery write failed before confirmed rollback: {recovery}"
+                            ))),
+                            None => Err(cleanup_error),
+                        },
+                        Err(rollback) => Err(ThemeError::new(format!(
+                            "{cleanup_error}; confirmed rollback failed: {rollback}"
+                        ))),
+                    };
+                }
                 self.preview = None;
                 Ok(AppliedTheme {
                     theme: candidate,
-                    generation,
+                    generation: applied_generation,
                 })
             }
             Err(error) => {
                 let rollback = self
-                    .rollback(&previous, request_id, sink, &mut generation, observer)
+                    .rollback(
+                        &previous,
+                        request_id,
+                        sink,
+                        &mut generation,
+                        observer,
+                        &journal_bytes,
+                    )
                     .await;
                 match rollback {
                     Ok(()) => Err(error),
@@ -348,6 +392,7 @@ impl ThemeManager {
         sink: &dyn DesktopThemeSink,
         generation: &mut GenerationGuard<'_>,
         observer: &mut dyn ThemeTransactionObserver,
+        journal_bytes: &[u8],
     ) -> Result<(), ThemeError> {
         self.acknowledge(sink, previous, "desktop rollback acknowledgement")
             .await?;
@@ -366,8 +411,12 @@ impl ThemeManager {
                 }),
             )
             .await?;
-        self.state.remove_file(OsStr::new(JOURNAL))?;
-        self.state.sync()?;
+        if let Err(error) = self.cleanup_journal(&mut NoopObserver) {
+            self.atomic_state_write(JOURNAL, journal_bytes)?;
+            return Err(ThemeError::new(format!(
+                "rollback journal cleanup failed and was restored: {error}"
+            )));
+        }
         Ok(())
     }
 
@@ -376,10 +425,7 @@ impl ThemeManager {
         sink: &dyn DesktopThemeSink,
         authority: &GenerationAuthority,
     ) -> Result<bool, ThemeError> {
-        let lock = self.state.open_lock(OsStr::new("apply.lock"))?;
-        lock.lock_exclusive().map_err(|error| {
-            ThemeError::new(format!("theme reconciliation lock failed: {error}"))
-        })?;
+        let _lock = self.mutation_lock("theme reconciliation")?;
         let Some(bytes) = self.state.read_optional(OsStr::new(JOURNAL))? else {
             return Ok(false);
         };
@@ -396,6 +442,7 @@ impl ThemeManager {
             sink,
             &mut generation,
             &mut NoopObserver,
+            &bytes,
         )
         .await?;
         self.preview = None;
@@ -423,13 +470,16 @@ impl ThemeManager {
 
     #[doc(hidden)]
     pub fn seed_crash_journal_for_test(&self, candidate_id: &str) -> Result<(), ThemeError> {
+        let lock = self.mutation_lock("theme test journal")?;
         let journal = ApplyJournal {
             schema_version: 1,
             request_id: uuid::Uuid::new_v4().to_string(),
             previous: self.current()?,
             candidate: self.theme(candidate_id)?,
         };
-        self.atomic_state_write(JOURNAL, &json_bytes(&journal)?)
+        let result = self.atomic_state_write(JOURNAL, &json_bytes(&journal)?);
+        drop(lock);
+        result
     }
 
     fn write_user(&self, document: &ThemeDocument) -> Result<(), ThemeError> {
@@ -462,6 +512,24 @@ impl ThemeManager {
             Err(_) => Err(ThemeError::new(format!("{operation} timed out"))),
         }
     }
+
+    fn mutation_lock(&self, operation: &str) -> Result<std::fs::File, ThemeError> {
+        let lock = self.state.open_lock(OsStr::new("apply.lock"))?;
+        lock.lock_exclusive()
+            .map_err(|error| ThemeError::new(format!("{operation} lock failed: {error}")))?;
+        Ok(lock)
+    }
+
+    fn cleanup_journal(
+        &self,
+        observer: &mut dyn ThemeTransactionObserver,
+    ) -> Result<(), ThemeError> {
+        observe(observer, ThemeApplyStage::JournalRemoveStarted)?;
+        self.state.remove_file(OsStr::new(JOURNAL))?;
+        observe(observer, ThemeApplyStage::JournalRemoved)?;
+        self.state.sync()?;
+        observe(observer, ThemeApplyStage::JournalDirectorySynced)
+    }
 }
 
 fn observe(
@@ -486,7 +554,46 @@ fn parse_document(bytes: &[u8]) -> Result<ThemeDocument, ThemeError> {
 
 fn validate_document(document: &ThemeDocument) -> Result<(), ThemeError> {
     parse_document(&serde_json::to_vec(document)?)?;
+    for (name, foreground) in [
+        ("accent", &document.colors.accent),
+        ("control", &document.colors.control),
+    ] {
+        for (surface_name, surface) in [
+            ("background", &document.colors.background),
+            ("surface", &document.colors.surface),
+        ] {
+            if local_contrast_ratio(foreground, surface)? < 3.0 {
+                return Err(ThemeError::new(format!(
+                    "theme {name}/{surface_name} contrast must be at least 3:1"
+                )));
+            }
+        }
+    }
     Ok(())
+}
+
+fn local_contrast_ratio(first: &str, second: &str) -> Result<f64, ThemeError> {
+    fn luminance(color: &str) -> Result<f64, ThemeError> {
+        if color.len() != 7 || !color.starts_with('#') {
+            return Err(ThemeError::new("theme color must be #RRGGBB"));
+        }
+        let component = |range: std::ops::Range<usize>| {
+            u8::from_str_radix(&color[range], 16)
+                .map_err(|_| ThemeError::new("theme color must be #RRGGBB"))
+                .map(|value| {
+                    let value = f64::from(value) / 255.0;
+                    if value <= 0.04045 {
+                        value / 12.92
+                    } else {
+                        ((value + 0.055) / 1.055).powf(2.4)
+                    }
+                })
+        };
+        Ok(0.2126 * component(1..3)? + 0.7152 * component(3..5)? + 0.0722 * component(5..7)?)
+    }
+    let first = luminance(first)?;
+    let second = luminance(second)?;
+    Ok((first.max(second) + 0.05) / (first.min(second) + 0.05))
 }
 
 fn document_bytes(document: &ThemeDocument) -> Result<Vec<u8>, ThemeError> {

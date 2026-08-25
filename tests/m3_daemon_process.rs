@@ -1,7 +1,7 @@
 use std::{
     ffi::CString,
     fs::OpenOptions,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::Path,
     process::{Child, Command, Stdio},
@@ -14,6 +14,7 @@ use sleepy_sdk::{
     validate_event_envelope, EventCauseKind, LifecycleEvent, LifecycleState, OsdKind, SessionEvent,
 };
 use sleepy_session::osd::OsdPublication;
+use sleepy_session::theme_socket::{ThemeMessage, ThemeStatus};
 
 #[test]
 fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
@@ -28,6 +29,7 @@ fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_DATA_HOME", temp.path().join("data"))
         .stdin(Stdio::null())
@@ -37,7 +39,26 @@ fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
         .unwrap();
     let mut daemon = ChildGuard(Some(daemon));
     let socket = runtime.join("sleepy/session.sock");
+    let theme_socket = runtime.join("sleepy/theme.sock");
     wait_for_path(&socket, Duration::from_secs(2));
+    wait_for_path(&theme_socket, Duration::from_secs(2));
+
+    let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
+    theme
+        .write_all(b"{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{\"type\":\"get\"}}\n")
+        .unwrap();
+    let mut theme_response = String::new();
+    BufReader::new(theme)
+        .read_line(&mut theme_response)
+        .unwrap();
+    assert!(matches!(
+        serde_json::from_str::<ThemeMessage>(&theme_response).unwrap(),
+        ThemeMessage::Result {
+            status: ThemeStatus::Confirmed,
+            theme: Some(theme),
+            ..
+        } if theme.id == "builtin.sleepy-dark"
+    ));
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_sleepyctl"))
         .args(["events", "watch", "--format", "ndjson"])
@@ -81,6 +102,7 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_DATA_HOME", temp.path().join("data"))
         .stdin(Stdio::null())
@@ -91,8 +113,10 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let mut daemon = ChildGuard(Some(daemon));
     let socket = runtime.join("sleepy/session.sock");
     let osd_socket = runtime.join("sleepy/osd.sock");
+    let theme_socket = runtime.join("sleepy/theme.sock");
     wait_for_path(&socket, Duration::from_secs(2));
     wait_for_path(&osd_socket, Duration::from_secs(2));
+    wait_for_path(&theme_socket, Duration::from_secs(2));
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_sleepyctl"))
         .args(["events", "watch", "--format", "ndjson"])
@@ -130,6 +154,7 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     assert!(status.success());
     assert!(!socket.exists());
     assert!(!osd_socket.exists());
+    assert!(!theme_socket.exists());
     assert!(watcher.wait().unwrap().success());
 }
 
@@ -191,6 +216,7 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_DATA_HOME", temp.path().join("data"))
         .env("PATH", path)
@@ -259,6 +285,7 @@ fn malformed_provider_state_degrades_locally_without_blocking_daily_startup() {
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_DATA_HOME", temp.path().join("data"))
         .env("SLEEPY_CALENDAR_DIR", temp.path().join("missing-calendar"))
