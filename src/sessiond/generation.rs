@@ -1,10 +1,10 @@
 use std::{
     ffi::{OsStr, OsString},
-    fs::{self, File},
+    fs::File,
     io::{self},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{MetadataExt, PermissionsExt},
+        fs::MetadataExt,
     },
     path::Path,
 };
@@ -37,28 +37,6 @@ impl GenerationAllocator {
                 "generation state path must be absolute",
             ));
         }
-        if let Some(parent) = state_path.parent() {
-            fs::create_dir_all(parent)?;
-            let metadata = fs::symlink_metadata(parent)?;
-            if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "generation parent must be an owned real directory",
-                ));
-            }
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        }
-        if let Ok(metadata) = fs::symlink_metadata(state_path) {
-            if !metadata.file_type().is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o777 != 0o600
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "generation state must be an owned mode-0600 regular file",
-                ));
-            }
-        }
         let parent = state_path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -75,6 +53,7 @@ impl GenerationAllocator {
         lock_bytes.extend_from_slice(b".lock");
         let lock_name = OsString::from_vec(lock_bytes);
         let directory = SecureDir::open_writable(parent, true).map_err(store_error)?;
+        directory.enforce_private_directory().map_err(store_error)?;
         directory
             .validate_private_file_if_present(&state_name)
             .map_err(store_error)?;

@@ -1,7 +1,8 @@
 use std::{env, io, path::PathBuf, process::ExitCode};
 
 use sleepy_session::sessiond::{
-    full_snapshot_event, EventHub, GenerationAllocator, SessionSocket, ShutdownCoordinator,
+    full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority, SessionSocket,
+    ShutdownCoordinator,
 };
 
 #[tokio::main]
@@ -24,18 +25,15 @@ async fn run() -> io::Result<()> {
     let mut allocator = GenerationAllocator::open(generation_path, 1024)?;
     let generation = allocator.next_generation()?;
     let hub = EventHub::new(full_snapshot_event(generation)?, 256);
+    let authority = GenerationAuthority::new(allocator, generation, hub.clone());
     let socket = SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub.clone()).await?;
-    let shutdown = ShutdownCoordinator::new(
-        allocator,
-        generation,
-        hub,
-        std::time::Duration::from_secs(2),
-    );
+    let shutdown = ShutdownCoordinator::new(authority, std::time::Duration::from_secs(2));
     tokio::select! {
         result = socket.serve() => result,
         signal = tokio::signal::ctrl_c() => {
             signal?;
             shutdown.reconcile(&[]).await?;
+            socket.shutdown_and_drain(std::time::Duration::from_secs(2)).await?;
             Ok(())
         }
     }

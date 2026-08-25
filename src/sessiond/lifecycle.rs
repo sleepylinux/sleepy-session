@@ -1,12 +1,9 @@
 use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
 
-use sleepy_sdk::{
-    EventCause, EventCauseKind, EventEnvelope, LifecycleEvent, LifecycleState, SessionEvent,
-    WIRE_SCHEMA_VERSION,
-};
-use tokio::{sync::Mutex, task::JoinSet};
+use sleepy_sdk::{EventCause, EventCauseKind, LifecycleEvent, LifecycleState, SessionEvent};
+use tokio::task::JoinSet;
 
-use super::{utc_now, EventHub, GenerationAllocator};
+use super::GenerationAuthority;
 
 pub trait LifecycleReconciler: Send + Sync + 'static {
     fn reconcile(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>>;
@@ -19,30 +16,15 @@ pub struct ReconciliationReport {
     pub failed: usize,
 }
 
-struct LifecycleStateAuthority {
-    allocator: GenerationAllocator,
-    current_generation: u64,
-}
-
 pub struct ShutdownCoordinator {
-    state: Mutex<LifecycleStateAuthority>,
-    hub: EventHub,
+    authority: GenerationAuthority,
     reconciliation_timeout: Duration,
 }
 
 impl ShutdownCoordinator {
-    pub fn new(
-        allocator: GenerationAllocator,
-        current_generation: u64,
-        hub: EventHub,
-        reconciliation_timeout: Duration,
-    ) -> Self {
+    pub fn new(authority: GenerationAuthority, reconciliation_timeout: Duration) -> Self {
         Self {
-            state: Mutex::new(LifecycleStateAuthority {
-                allocator,
-                current_generation,
-            }),
-            hub,
+            authority,
             reconciliation_timeout,
         }
     }
@@ -51,8 +33,8 @@ impl ShutdownCoordinator {
         &self,
         reconcilers: &[Arc<dyn LifecycleReconciler>],
     ) -> io::Result<ReconciliationReport> {
-        let mut state = self.state.lock().await;
-        publish_lifecycle(&self.hub, &mut state, LifecycleState::Stopping).await?;
+        let mut authority = self.authority.lock().await;
+        publish_lifecycle(&mut authority, LifecycleState::Stopping).await?;
 
         let mut tasks = JoinSet::new();
         for reconciler in reconcilers {
@@ -76,7 +58,7 @@ impl ShutdownCoordinator {
             }
         }
 
-        publish_lifecycle(&self.hub, &mut state, LifecycleState::Reconciled).await?;
+        publish_lifecycle(&mut authority, LifecycleState::Reconciled).await?;
         Ok(report)
     }
 }
@@ -88,27 +70,19 @@ enum ReconcileOutcome {
 }
 
 async fn publish_lifecycle(
-    hub: &EventHub,
-    state: &mut LifecycleStateAuthority,
+    authority: &mut super::authority::GenerationGuard<'_>,
     lifecycle_state: LifecycleState,
 ) -> io::Result<()> {
-    let generation = state.allocator.next_after(state.current_generation)?;
-    let event = EventEnvelope {
-        schema_version: WIRE_SCHEMA_VERSION,
-        generation,
-        event_id: uuid::Uuid::new_v4().to_string(),
-        emitted_at: utc_now()?,
-        cause: EventCause {
-            kind: EventCauseKind::Lifecycle,
-            request_id: None,
-        },
-        payload: SessionEvent::Lifecycle(LifecycleEvent {
-            state: lifecycle_state,
-        }),
-    };
-    hub.publish(event)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event hub closed"))?;
-    state.current_generation = generation;
+    authority
+        .publish(
+            EventCause {
+                kind: EventCauseKind::Lifecycle,
+                request_id: None,
+            },
+            SessionEvent::Lifecycle(LifecycleEvent {
+                state: lifecycle_state,
+            }),
+        )
+        .await?;
     Ok(())
 }

@@ -1,15 +1,17 @@
 mod adapter;
+mod authority;
 mod generation;
 mod hub;
 mod lifecycle;
 mod mutation;
 mod socket;
 
+pub use authority::GenerationAuthority;
 pub use generation::GenerationAllocator;
-pub use hub::{EventHub, EventSubscriber};
+pub use hub::{EventHub, EventSubscriber, PublishError};
 pub use lifecycle::{LifecycleReconciler, ReconciliationReport, ShutdownCoordinator};
 pub use mutation::{MutationBackend, MutationPipeline, PipelineError};
-pub use socket::SessionSocket;
+pub use socket::{SessionSocket, SocketDrainReport};
 
 use sleepy_sdk::{
     CapabilityAvailability, CapabilityFailure, CapabilityRecord, EventCause, EventCauseKind,

@@ -1,13 +1,10 @@
 use std::{error::Error, fmt, future::Future, io, pin::Pin, sync::Arc, time::Duration};
 
+use super::GenerationAuthority;
 use sleepy_sdk::{
-    validate_mutation_request, DaemonCommand, EventCause, EventCauseKind, EventEnvelope,
-    MutationFailure, MutationResult, MutationStatus, RuntimeSnapshot, SessionEvent,
-    WIRE_SCHEMA_VERSION,
+    validate_mutation_request, DaemonCommand, EventCause, EventCauseKind, MutationFailure,
+    MutationResult, MutationStatus, RuntimeSnapshot, SessionEvent, WIRE_SCHEMA_VERSION,
 };
-use tokio::sync::Mutex;
-
-use super::{EventHub, GenerationAllocator};
 
 pub trait MutationBackend: Send + Sync + 'static {
     fn execute<'a>(
@@ -20,14 +17,8 @@ pub trait MutationBackend: Send + Sync + 'static {
     fn confirms(&self, command: &DaemonCommand, snapshot: &RuntimeSnapshot) -> bool;
 }
 
-struct PipelineState {
-    allocator: GenerationAllocator,
-    current_generation: u64,
-}
-
 pub struct MutationPipeline<B: MutationBackend> {
-    state: Mutex<PipelineState>,
-    hub: EventHub,
+    authority: GenerationAuthority,
     backend: Arc<B>,
     operation_timeout: Duration,
 }
@@ -39,34 +30,17 @@ pub enum PipelineError {
 }
 
 impl<B: MutationBackend> MutationPipeline<B> {
-    pub fn new(
-        allocator: GenerationAllocator,
-        current_generation: u64,
-        hub: EventHub,
-        backend: Arc<B>,
-    ) -> Self {
-        Self::with_timeout(
-            allocator,
-            current_generation,
-            hub,
-            backend,
-            Duration::from_millis(1200),
-        )
+    pub fn new(authority: GenerationAuthority, backend: Arc<B>) -> Self {
+        Self::with_timeout(authority, backend, Duration::from_millis(1200))
     }
 
     pub fn with_timeout(
-        allocator: GenerationAllocator,
-        current_generation: u64,
-        hub: EventHub,
+        authority: GenerationAuthority,
         backend: Arc<B>,
         operation_timeout: Duration,
     ) -> Self {
         Self {
-            state: Mutex::new(PipelineState {
-                allocator,
-                current_generation,
-            }),
-            hub,
+            authority,
             backend,
             operation_timeout,
         }
@@ -75,12 +49,12 @@ impl<B: MutationBackend> MutationPipeline<B> {
     pub async fn handle_json(&self, input: &str) -> Result<MutationResult, PipelineError> {
         let request = validate_mutation_request(input)
             .map_err(|error| PipelineError::Contract(error.to_string()))?;
-        let mut state = self.state.lock().await;
+        let mut authority = self.authority.lock().await;
 
-        if request.expected_generation != state.current_generation {
+        if request.expected_generation != authority.current_generation() {
             return Ok(rejected(
                 &request.request_id,
-                state.current_generation,
+                authority.current_generation(),
                 "staleGeneration",
                 "expectedGeneration does not match the daemon generation",
             ));
@@ -92,7 +66,7 @@ impl<B: MutationBackend> MutationPipeline<B> {
             Ok(Err(error)) => {
                 return Ok(unconfirmed(
                     &request.request_id,
-                    state.current_generation,
+                    authority.current_generation(),
                     MutationStatus::Unknown,
                     "execute",
                     &error.to_string(),
@@ -101,7 +75,7 @@ impl<B: MutationBackend> MutationPipeline<B> {
             Err(_) => {
                 return Ok(unconfirmed(
                     &request.request_id,
-                    state.current_generation,
+                    authority.current_generation(),
                     MutationStatus::Unknown,
                     "executeTimeout",
                     "mutation execution exceeded its total deadline",
@@ -113,7 +87,7 @@ impl<B: MutationBackend> MutationPipeline<B> {
             Ok(Err(error)) => {
                 return Ok(unconfirmed(
                     &request.request_id,
-                    state.current_generation,
+                    authority.current_generation(),
                     MutationStatus::Unknown,
                     "readback",
                     &error.to_string(),
@@ -122,7 +96,7 @@ impl<B: MutationBackend> MutationPipeline<B> {
             Err(_) => {
                 return Ok(unconfirmed(
                     &request.request_id,
-                    state.current_generation,
+                    authority.current_generation(),
                     MutationStatus::Unknown,
                     "readbackTimeout",
                     "mutation readback exceeded its total deadline",
@@ -132,32 +106,35 @@ impl<B: MutationBackend> MutationPipeline<B> {
         if !self.backend.confirms(&request.command, &snapshot) {
             return Ok(unconfirmed(
                 &request.request_id,
-                state.current_generation,
+                authority.current_generation(),
                 MutationStatus::Unknown,
                 "readbackMismatch",
                 "mutation readback did not confirm the requested state",
             ));
         }
 
-        let current_generation = state.current_generation;
-        let generation = state
-            .allocator
-            .next_after(current_generation)
-            .map_err(PipelineError::Io)?;
-        let event = EventEnvelope {
-            schema_version: WIRE_SCHEMA_VERSION,
-            generation,
-            event_id: uuid::Uuid::new_v4().to_string(),
-            emitted_at: utc_now()?,
-            cause: EventCause {
-                kind: EventCauseKind::Request,
-                request_id: Some(request.request_id.clone()),
-            },
-            payload: SessionEvent::FullSnapshot(snapshot),
+        let event = match authority
+            .publish(
+                EventCause {
+                    kind: EventCauseKind::Request,
+                    request_id: Some(request.request_id.clone()),
+                },
+                SessionEvent::FullSnapshot(snapshot),
+            )
+            .await
+        {
+            Ok(event) => event,
+            Err(error) => {
+                return Ok(unconfirmed(
+                    &request.request_id,
+                    authority.current_generation(),
+                    MutationStatus::Unknown,
+                    "publication",
+                    &error.to_string(),
+                ));
+            }
         };
-
-        state.current_generation = generation;
-        let _ = self.hub.publish(event.clone()).await;
+        let generation = event.generation;
         Ok(MutationResult {
             schema_version: WIRE_SCHEMA_VERSION,
             request_id: request.request_id,
@@ -201,28 +178,6 @@ fn unconfirmed(
             },
         }),
     }
-}
-
-fn utc_now() -> Result<String, PipelineError> {
-    let now = unsafe { libc::time(std::ptr::null_mut()) };
-    if now == -1 {
-        return Err(PipelineError::Io(io::Error::last_os_error()));
-    }
-    let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
-    let result = unsafe { libc::gmtime_r(&now, broken_down.as_mut_ptr()) };
-    if result.is_null() {
-        return Err(PipelineError::Io(io::Error::last_os_error()));
-    }
-    let value = unsafe { broken_down.assume_init() };
-    Ok(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        value.tm_year + 1900,
-        value.tm_mon + 1,
-        value.tm_mday,
-        value.tm_hour,
-        value.tm_min,
-        value.tm_sec
-    ))
 }
 
 impl fmt::Display for PipelineError {

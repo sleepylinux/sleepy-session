@@ -17,7 +17,8 @@ use sleepy_sdk::{
 };
 use sleepy_session::sessiond::{
     AdapterActor, AdapterFailure, CapabilityAdapter, EventHub, GenerationAllocator,
-    LifecycleReconciler, MutationBackend, MutationPipeline, SessionSocket, ShutdownCoordinator,
+    GenerationAuthority, LifecycleReconciler, MutationBackend, MutationPipeline, SessionSocket,
+    ShutdownCoordinator,
 };
 
 fn lifecycle(generation: u64, state: LifecycleState) -> EventEnvelope {
@@ -46,6 +47,14 @@ fn snapshot_event(generation: u64, snapshot: RuntimeSnapshot) -> EventEnvelope {
         },
         payload: SessionEvent::FullSnapshot(snapshot),
     }
+}
+
+fn authority(
+    allocator: GenerationAllocator,
+    generation: u64,
+    hub: EventHub,
+) -> GenerationAuthority {
+    GenerationAuthority::new(allocator, generation, hub)
 }
 
 #[test]
@@ -86,6 +95,24 @@ fn generation_allocator_rejects_symlinked_state_without_touching_target() {
         .unwrap()
         .file_type()
         .is_symlink());
+}
+
+#[test]
+fn generation_path_validation_precedes_all_redirected_directory_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let redirected = temp.path().join("redirected");
+    fs::create_dir(&redirected).unwrap();
+    let linked = temp.path().join("linked");
+    symlink(&redirected, &linked).unwrap();
+
+    let error = GenerationAllocator::open(linked.join("sleepy/generation"), 4)
+        .err()
+        .expect("an intermediate symlink must fail before path mutation");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!redirected.join("sleepy").exists());
 }
 
 #[test]
@@ -182,26 +209,28 @@ async fn reconnect_replay_folds_prior_capability_updates_into_a_full_snapshot() 
 async fn event_hub_never_rewinds_its_replay_snapshot_to_a_stale_generation() {
     let initial = sleepy_session::sessiond::initial_snapshot();
     let hub = EventHub::new(snapshot_event(2, initial.clone()), 8);
-    hub.publish(EventEnvelope {
-        schema_version: WIRE_SCHEMA_VERSION,
-        generation: 1,
-        event_id: "018f3f4c-8af1-7f6b-bf42-1bd472868e61".into(),
-        emitted_at: "2026-08-24T21:00:01Z".into(),
-        cause: EventCause {
-            kind: EventCauseKind::External,
-            request_id: None,
-        },
-        payload: SessionEvent::CapabilityUpdate(CapabilityRecord {
-            id: RuntimeCapabilityId::Network,
-            status: CapabilityAvailability::Timeout,
-            value: None,
-            diagnostic: Some(CapabilityFailure {
-                message: "stale adapter result".into(),
+    let error = hub
+        .publish(EventEnvelope {
+            schema_version: WIRE_SCHEMA_VERSION,
+            generation: 1,
+            event_id: "018f3f4c-8af1-7f6b-bf42-1bd472868e61".into(),
+            emitted_at: "2026-08-24T21:00:01Z".into(),
+            cause: EventCause {
+                kind: EventCauseKind::External,
+                request_id: None,
+            },
+            payload: SessionEvent::CapabilityUpdate(CapabilityRecord {
+                id: RuntimeCapabilityId::Network,
+                status: CapabilityAvailability::Timeout,
+                value: None,
+                diagnostic: Some(CapabilityFailure {
+                    message: "stale adapter result".into(),
+                }),
             }),
-        }),
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .expect_err("the hub must explicitly reject a stale generation");
+    assert!(error.to_string().contains("does not advance"));
 
     let replay = hub.subscribe().await.recv().await.unwrap();
     assert_eq!(replay.generation, 2);
@@ -289,6 +318,40 @@ async fn session_socket_shutdown_removes_the_owned_socket_path() {
 }
 
 #[tokio::test]
+async fn session_socket_shutdown_waits_for_queued_client_output_and_connection_tasks() {
+    use tokio::io::AsyncBufReadExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("sleepy/session.sock");
+    let hub = EventHub::new(lifecycle(1, LifecycleState::Ready), 8);
+    let socket = Arc::new(
+        SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub.clone())
+            .await
+            .unwrap(),
+    );
+    let server_socket = Arc::clone(&socket);
+    let server = tokio::spawn(async move { server_socket.serve().await });
+    let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    let mut lines = tokio::io::BufReader::new(stream).lines();
+    lines.next_line().await.unwrap().unwrap();
+    let queued = lifecycle(2, LifecycleState::Stopping);
+    hub.publish(queued.clone()).await.unwrap();
+
+    let report = socket
+        .shutdown_and_drain(std::time::Duration::from_millis(200))
+        .await
+        .unwrap();
+    let delivered: EventEnvelope =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+
+    assert_eq!(delivered, queued);
+    assert_eq!(lines.next_line().await.unwrap(), None);
+    assert_eq!(report.completed, 1);
+    assert_eq!(report.aborted, 0);
+    assert!(server.await.unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn session_socket_rejects_a_symlinked_parent_directory() {
     use std::os::unix::fs::symlink;
 
@@ -307,6 +370,72 @@ async fn session_socket_rejects_a_symlinked_parent_directory() {
 
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(!redirected.join("session.sock").exists());
+}
+
+#[tokio::test]
+async fn socket_path_validation_precedes_all_redirected_directory_mutation() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let redirected = temp.path().join("redirected");
+    fs::create_dir(&redirected).unwrap();
+    let linked = temp.path().join("linked");
+    symlink(&redirected, &linked).unwrap();
+    let hub = EventHub::new(lifecycle(1, LifecycleState::Ready), 8);
+
+    let error = SessionSocket::bind(
+        linked.join("sleepy/session.sock"),
+        unsafe { libc::geteuid() },
+        hub,
+    )
+    .await
+    .err()
+    .expect("an intermediate symlink must fail before path mutation");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!redirected.join("sleepy").exists());
+}
+
+#[tokio::test]
+async fn second_daemon_refuses_to_unlink_a_live_private_socket() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("sleepy/session.sock");
+    let hub = EventHub::new(lifecycle(1, LifecycleState::Ready), 8);
+    let first = SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub.clone())
+        .await
+        .unwrap();
+
+    let error = SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub)
+        .await
+        .err()
+        .expect("a live daemon endpoint must not be replaced");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    let client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    drop(client);
+    drop(first);
+}
+
+#[tokio::test]
+async fn daemon_replaces_only_a_stale_owned_private_socket() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("sleepy");
+    fs::create_dir(&parent).unwrap();
+    let socket_path = parent.join("session.sock");
+    let stale = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(stale);
+    let hub = EventHub::new(lifecycle(1, LifecycleState::Ready), 8);
+
+    let socket = SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(socket);
 }
 
 #[test]
@@ -385,7 +514,7 @@ async fn mutation_pipeline_serializes_execute_readback_event_and_reply_generatio
     let mut subscriber = hub.subscribe().await;
     subscriber.recv().await.unwrap();
     let backend = Arc::new(FakeMutationBackend::default());
-    let pipeline = MutationPipeline::new(allocator, 4, hub, backend.clone());
+    let pipeline = MutationPipeline::new(authority(allocator, 4, hub), backend.clone());
 
     let request = serde_json::json!({
         "schemaVersion": 2,
@@ -412,7 +541,7 @@ async fn stale_mutation_is_rejected_without_backend_execution() {
     let allocator = GenerationAllocator::open(temp.path().join("generation"), 4).unwrap();
     let hub = EventHub::new(lifecycle(8, LifecycleState::Ready), 8);
     let backend = Arc::new(FakeMutationBackend::default());
-    let pipeline = MutationPipeline::new(allocator, 8, hub, backend.clone());
+    let pipeline = MutationPipeline::new(authority(allocator, 8, hub), backend.clone());
     let request = serde_json::json!({
         "schemaVersion": 2,
         "requestId": "018f3f4c-8af1-7f6b-bf42-1bd472868e65",
@@ -442,7 +571,7 @@ async fn mutation_readback_disagreement_reports_unknown_without_committing_gener
         fail_execute: false,
         fail_readback: false,
     });
-    let pipeline = MutationPipeline::new(allocator, 8, hub, backend.clone());
+    let pipeline = MutationPipeline::new(authority(allocator, 8, hub), backend.clone());
     let request = serde_json::json!({
         "schemaVersion": 2,
         "requestId": "018f3f4c-8af1-7f6b-bf42-1bd472868e65",
@@ -480,7 +609,7 @@ async fn mutation_with_unprovable_readback_reports_unknown_never_rejected() {
         fail_execute: false,
         fail_readback: true,
     });
-    let pipeline = MutationPipeline::new(allocator, 8, hub, backend);
+    let pipeline = MutationPipeline::new(authority(allocator, 8, hub), backend);
     let request = serde_json::json!({
         "schemaVersion": 2,
         "requestId": "018f3f4c-8af1-7f6b-bf42-1bd472868e65",
@@ -509,7 +638,7 @@ async fn mutation_execution_error_reports_unknown_when_commit_is_unprovable() {
         fail_execute: true,
         fail_readback: false,
     });
-    let pipeline = MutationPipeline::new(allocator, 8, hub, backend);
+    let pipeline = MutationPipeline::new(authority(allocator, 8, hub), backend);
     let request = serde_json::json!({
         "schemaVersion": 2,
         "requestId": "018f3f4c-8af1-7f6b-bf42-1bd472868e65",
@@ -554,9 +683,7 @@ async fn mutation_readback_has_a_total_deadline_and_reports_unknown_on_timeout()
         8,
     );
     let pipeline = MutationPipeline::with_timeout(
-        allocator,
-        8,
-        hub,
+        authority(allocator, 8, hub),
         Arc::new(HangingReadbackBackend),
         std::time::Duration::from_millis(20),
     );
@@ -817,8 +944,10 @@ async fn shutdown_reconciliation_is_bounded_and_publishes_ordered_lifecycle_even
     );
     let mut subscriber = hub.subscribe().await;
     subscriber.recv().await.unwrap();
-    let coordinator =
-        ShutdownCoordinator::new(allocator, 4, hub, std::time::Duration::from_millis(20));
+    let coordinator = ShutdownCoordinator::new(
+        authority(allocator, 4, hub),
+        std::time::Duration::from_millis(20),
+    );
     let reconcilers: Vec<Arc<dyn LifecycleReconciler>> =
         vec![Arc::new(SuccessfulReconciler), Arc::new(HangingReconciler)];
 
@@ -845,4 +974,44 @@ async fn shutdown_reconciliation_is_bounded_and_publishes_ordered_lifecycle_even
             state: LifecycleState::Reconciled
         })
     ));
+}
+
+#[tokio::test]
+async fn mutation_never_confirms_when_an_independent_producer_advanced_the_hub() {
+    let temp = tempfile::tempdir().unwrap();
+    let hub = EventHub::new(
+        snapshot_event(4, sleepy_session::sessiond::initial_snapshot()),
+        8,
+    );
+    let lifecycle = ShutdownCoordinator::new(
+        authority(
+            GenerationAllocator::open(temp.path().join("lifecycle-generation"), 4).unwrap(),
+            4,
+            hub.clone(),
+        ),
+        std::time::Duration::from_millis(20),
+    );
+    lifecycle.reconcile(&[]).await.unwrap();
+    let backend = Arc::new(FakeMutationBackend::default());
+    let pipeline = MutationPipeline::new(
+        authority(
+            GenerationAllocator::open(temp.path().join("mutation-generation"), 4).unwrap(),
+            4,
+            hub.clone(),
+        ),
+        backend,
+    );
+    let request = serde_json::json!({
+        "schemaVersion": 2,
+        "requestId": "018f3f4c-8af1-7f6b-bf42-1bd472868e65",
+        "expectedGeneration": 4,
+        "command": { "type": "setDnd", "data": { "enabled": true } }
+    });
+
+    let result = pipeline.handle_json(&request.to_string()).await.unwrap();
+    let replay = hub.subscribe().await.recv().await.unwrap();
+
+    assert_eq!(result.status, MutationStatus::Unknown);
+    assert!(result.confirmed_event.is_none());
+    assert_eq!(replay.generation, 6);
 }

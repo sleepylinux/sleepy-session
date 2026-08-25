@@ -59,6 +59,14 @@ pub(crate) struct SecureFileSnapshot {
     changed_nanoseconds: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SecureNodeMetadata {
+    pub mode: libc::mode_t,
+    pub uid: libc::uid_t,
+    pub device: libc::dev_t,
+    pub inode: libc::ino_t,
+}
+
 pub(crate) enum NoReplacePublication {
     NotPublished(StoreError),
     Published(SecureFileSnapshot),
@@ -170,6 +178,51 @@ impl SecureDir {
             descriptor: Arc::new(descriptor),
             display_path: path,
         })
+    }
+
+    pub fn enforce_private_directory(&self) -> Result<(), StoreError> {
+        cvt(unsafe { libc::fchmod(self.as_raw_fd(), 0o700) }).map_err(StoreError::io)?;
+        validate_writable_directory(self.as_raw_fd(), &self.display_path)
+    }
+
+    pub fn descriptor_path(&self, name: &OsStr) -> Result<PathBuf, StoreError> {
+        c_string(name, &self.display_path.join(name))?;
+        Ok(PathBuf::from(format!("/proc/self/fd/{}", self.as_raw_fd())).join(name))
+    }
+
+    pub fn entry_metadata(&self, name: &OsStr) -> Result<Option<SecureNodeMetadata>, StoreError> {
+        let path = self.display_path.join(name);
+        let name = c_string(name, &path)?;
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            libc::fstatat(
+                self.as_raw_fd(),
+                name.as_ptr(),
+                metadata.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(StoreError::io(error));
+        }
+        let metadata = unsafe { metadata.assume_init() };
+        Ok(Some(SecureNodeMetadata {
+            mode: metadata.st_mode,
+            uid: metadata.st_uid,
+            device: metadata.st_dev,
+            inode: metadata.st_ino,
+        }))
+    }
+
+    pub fn chmod_entry(&self, name: &OsStr, mode: libc::mode_t) -> Result<(), StoreError> {
+        let path = self.display_path.join(name);
+        let name = c_string(name, &path)?;
+        cvt(unsafe { libc::fchmodat(self.as_raw_fd(), name.as_ptr(), mode, 0) })
+            .map_err(StoreError::io)
     }
 
     pub fn read_optional(&self, name: &OsStr) -> Result<Option<Vec<u8>>, StoreError> {

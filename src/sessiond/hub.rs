@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use sleepy_sdk::{EventCause, EventCauseKind, EventEnvelope, SessionEvent};
 use tokio::sync::{broadcast, RwLock};
@@ -14,6 +14,24 @@ pub struct EventSubscriber {
     last_generation: u64,
     receiver: broadcast::Receiver<EventEnvelope>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishError {
+    StaleGeneration { attempted: u64, current: u64 },
+}
+
+impl fmt::Display for PublishError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleGeneration { attempted, current } => write!(
+                formatter,
+                "event generation {attempted} does not advance current generation {current}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublishError {}
 
 impl EventHub {
     pub fn new(mut initial_snapshot: EventEnvelope, capacity: usize) -> Self {
@@ -41,14 +59,14 @@ impl EventHub {
         }
     }
 
-    pub async fn publish(
-        &self,
-        event: EventEnvelope,
-    ) -> Result<usize, broadcast::error::SendError<EventEnvelope>> {
+    pub async fn publish(&self, event: EventEnvelope) -> Result<usize, PublishError> {
         {
             let mut replay = self.latest_snapshot.write().await;
             if event.generation <= replay.generation {
-                return Ok(0);
+                return Err(PublishError::StaleGeneration {
+                    attempted: event.generation,
+                    current: replay.generation,
+                });
             }
             if matches!(event.payload, SessionEvent::FullSnapshot(_)) {
                 *replay = event.clone();
