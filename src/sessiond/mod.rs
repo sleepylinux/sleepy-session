@@ -11,7 +11,7 @@ pub use generation::GenerationAllocator;
 pub use hub::{EventHub, EventSubscriber, PublishError};
 pub use lifecycle::{LifecycleReconciler, ReconciliationReport, ShutdownCoordinator};
 pub use mutation::{MutationBackend, MutationPipeline, PipelineError};
-pub use socket::{SessionSocket, SocketDrainReport};
+pub use socket::{SessionSocket, SessionSocketBindObserver, SocketDrainReport};
 
 use sleepy_sdk::{
     CapabilityAvailability, CapabilityFailure, CapabilityRecord, EventCause, EventCauseKind,

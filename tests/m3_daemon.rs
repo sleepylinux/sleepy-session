@@ -18,7 +18,7 @@ use sleepy_sdk::{
 use sleepy_session::sessiond::{
     AdapterActor, AdapterFailure, CapabilityAdapter, EventHub, GenerationAllocator,
     GenerationAuthority, LifecycleReconciler, MutationBackend, MutationPipeline, SessionSocket,
-    ShutdownCoordinator,
+    SessionSocketBindObserver, ShutdownCoordinator,
 };
 
 fn lifecycle(generation: u64, state: LifecycleState) -> EventEnvelope {
@@ -436,6 +436,51 @@ async fn daemon_replaces_only_a_stale_owned_private_socket() {
         0o600
     );
     drop(socket);
+}
+
+struct SwapStaleSocketForLiveEndpoint {
+    retained_path: std::path::PathBuf,
+    live_listener: Mutex<Option<std::os::unix::net::UnixListener>>,
+}
+
+impl SessionSocketBindObserver for SwapStaleSocketForLiveEndpoint {
+    fn stale_socket_probed(&self, socket_path: &std::path::Path) -> std::io::Result<()> {
+        fs::rename(socket_path, &self.retained_path)?;
+        let listener = std::os::unix::net::UnixListener::bind(socket_path)?;
+        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
+        *self.live_listener.lock().unwrap() = Some(listener);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn stale_socket_removal_refuses_an_inode_swapped_for_a_live_private_endpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("sleepy");
+    fs::create_dir(&parent).unwrap();
+    let socket_path = parent.join("session.sock");
+    let stale = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+    drop(stale);
+    let observer = Arc::new(SwapStaleSocketForLiveEndpoint {
+        retained_path: parent.join("stale-retained.sock"),
+        live_listener: Mutex::new(None),
+    });
+    let hub = EventHub::new(lifecycle(1, LifecycleState::Ready), 8);
+
+    let error = SessionSocket::bind_with_observer(
+        &socket_path,
+        unsafe { libc::geteuid() },
+        hub,
+        observer.clone(),
+    )
+    .await
+    .err()
+    .expect("the replacement live inode must win ownership of the path");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    let client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    drop(client);
 }
 
 #[test]

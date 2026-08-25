@@ -3,7 +3,10 @@ use std::{
     io,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -35,11 +38,32 @@ pub struct SocketDrainReport {
     pub aborted: usize,
 }
 
+pub trait SessionSocketBindObserver: Send + Sync + 'static {
+    fn stale_socket_probed(&self, socket_path: &Path) -> io::Result<()>;
+}
+
+struct NoopBindObserver;
+
+impl SessionSocketBindObserver for NoopBindObserver {
+    fn stale_socket_probed(&self, _socket_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl SessionSocket {
     pub async fn bind(
         path: impl AsRef<Path>,
         expected_uid: libc::uid_t,
         hub: EventHub,
+    ) -> io::Result<Self> {
+        Self::bind_with_observer(path, expected_uid, hub, Arc::new(NoopBindObserver)).await
+    }
+
+    pub async fn bind_with_observer(
+        path: impl AsRef<Path>,
+        expected_uid: libc::uid_t,
+        hub: EventHub,
+        observer: Arc<dyn SessionSocketBindObserver>,
     ) -> io::Result<Self> {
         if expected_uid != unsafe { libc::geteuid() } {
             return Err(io::Error::new(
@@ -81,7 +105,25 @@ impl SessionSocket {
                     ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                    directory.remove_file(&socket_name).map_err(store_error)?;
+                    observer.stale_socket_probed(&path)?;
+                    match directory
+                        .entry_metadata(&socket_name)
+                        .map_err(store_error)?
+                    {
+                        Some(current)
+                            if (current.device, current.inode)
+                                == (metadata.device, metadata.inode) =>
+                        {
+                            directory.remove_file(&socket_name).map_err(store_error)?;
+                        }
+                        None => {}
+                        Some(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "session socket changed while stale ownership was checked",
+                            ));
+                        }
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
