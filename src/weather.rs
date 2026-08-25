@@ -682,15 +682,17 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
             .cache
             .lock()
             .map_err(|_| io::Error::other("geocoding cache lock poisoned"))?;
-        cache.insert(key, results.clone());
-        validate_geocode_cache(&cache)?;
+        let mut candidate = cache.clone();
+        candidate.insert(key, results.clone());
+        validate_geocode_cache(&candidate)?;
         write_json_private(
             &self.cache_path,
             &GeocodeCache {
                 schema_version: CACHE_VERSION,
-                queries: cache.clone(),
+                queries: candidate.clone(),
             },
         )?;
+        *cache = candidate;
         Ok(results)
     }
 }
@@ -941,6 +943,7 @@ fn invalid(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[derive(Clone, Default)]
     struct EmptyTransport;
@@ -982,5 +985,50 @@ mod tests {
             second.submit("Second place").unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    #[derive(Clone)]
+    struct SequenceTransport(Arc<Mutex<VecDeque<HttpResponse>>>);
+    impl HttpTransport for SequenceTransport {
+        fn execute(&self, _request: HttpRequest) -> io::Result<HttpResponse> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| io::Error::other("no response"))
+        }
+    }
+
+    #[test]
+    fn invalid_nominatim_candidate_never_poison_live_or_persisted_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let display = "x".repeat(1025);
+        let body = serde_json::to_vec(&serde_json::json!([{
+            "display_name": display,
+            "lat": "50.0",
+            "lon": "14.0"
+        }]))
+        .unwrap();
+        let transport = SequenceTransport(Arc::new(Mutex::new(VecDeque::from([HttpResponse {
+            status: 200,
+            headers: BTreeMap::new(),
+            body,
+        }]))));
+        let path = root.path().join("geo.json");
+        let provider = NominatimProvider::new_with_limiter(
+            "https://example.test/search",
+            "Sleepy/3 ops@example.test",
+            path.clone(),
+            transport,
+            ManualClock::new(1),
+            NominatimRateLimiter::isolated(),
+        )
+        .unwrap();
+        assert!(provider.submit("Poison candidate").is_err());
+        assert!(
+            provider.submit("Poison candidate").is_err(),
+            "invalid result leaked from live cache"
+        );
+        assert!(!path.exists(), "invalid result was persisted");
     }
 }

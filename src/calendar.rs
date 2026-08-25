@@ -6,10 +6,14 @@ use std::{
     io::{self, Read},
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
+    sync::{atomic::AtomicBool, Arc},
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 use sleepy_sdk::{CalendarEvent, CalendarSnapshot, CalendarSourceError, WIRE_SCHEMA_VERSION};
+
+use crate::system::RunControl;
 
 const MAX_ICS_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_UNFOLDED_LINES: usize = 65_536;
@@ -31,6 +35,20 @@ impl IcsCalendarProvider {
     }
 
     pub fn snapshot(&self, window_start: &str, window_end: &str) -> io::Result<CalendarSnapshot> {
+        let control = RunControl::for_request(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(AtomicBool::new(false)),
+        );
+        self.snapshot_controlled(window_start, window_end, &control)
+    }
+
+    pub fn snapshot_controlled(
+        &self,
+        window_start: &str,
+        window_end: &str,
+        control: &RunControl,
+    ) -> io::Result<CalendarSnapshot> {
+        check_control(control)?;
         if self.sources.len() > MAX_CALENDAR_SOURCES {
             return Err(invalid("calendar source count exceeded limit"));
         }
@@ -44,23 +62,51 @@ impl IcsCalendarProvider {
         }
         let mut events = Vec::new();
         let mut source_errors = Vec::new();
+        let mut bytes_used = window_start
+            .len()
+            .saturating_add(window_end.len())
+            .saturating_add(256);
         for source in &self.sources {
+            check_control(control)?;
             let source_id = source
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("unknown")
                 .to_owned();
-            match parse_source(source, &source_id, start, end, self.max_occurrences) {
-                Ok(mut parsed) => {
+            match parse_source(
+                source,
+                &source_id,
+                start,
+                end,
+                self.max_occurrences,
+                MAX_SNAPSHOT_BYTES.saturating_sub(bytes_used),
+                control,
+            ) {
+                Ok((mut parsed, parsed_bytes)) => {
                     if events.len().saturating_add(parsed.len()) > MAX_TOTAL_EVENTS {
                         return Err(invalid("calendar aggregate event limit exceeded"));
                     }
+                    bytes_used = bytes_used
+                        .checked_add(parsed_bytes)
+                        .filter(|used| *used <= MAX_SNAPSHOT_BYTES)
+                        .ok_or_else(budget_error)?;
                     events.append(&mut parsed)
                 }
-                Err(error) => source_errors.push(CalendarSourceError {
-                    source_id,
-                    message: error.to_string(),
-                }),
+                Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(error),
+                Err(error) => {
+                    let source_error = CalendarSourceError {
+                        source_id,
+                        message: error.to_string(),
+                    };
+                    let error_bytes = serde_json::to_vec(&source_error)
+                        .map_err(io::Error::other)?
+                        .len();
+                    bytes_used = bytes_used
+                        .checked_add(error_bytes)
+                        .filter(|used| *used <= MAX_SNAPSHOT_BYTES)
+                        .ok_or_else(budget_error)?;
+                    source_errors.push(source_error);
+                }
             }
         }
         events.sort_by(|left, right| {
@@ -141,7 +187,10 @@ fn parse_source(
     window_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
     limit: usize,
-) -> io::Result<Vec<CalendarEvent>> {
+    byte_budget: usize,
+    control: &RunControl,
+) -> io::Result<(Vec<CalendarEvent>, usize)> {
+    check_control(control)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -154,12 +203,21 @@ fn parse_source(
         ));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_ICS_BYTES + 1).read_to_end(&mut bytes)?;
+    let mut file = file.take(MAX_ICS_BYTES + 1);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        check_control(control)?;
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
     if bytes.len() > MAX_ICS_BYTES as usize {
         return Err(invalid("ICS source exceeded limit"));
     }
     let text = String::from_utf8(bytes).map_err(|_| invalid("ICS source is not UTF-8"))?;
-    let lines = unfold(&text)?;
+    let lines = unfold(&text, control)?;
     if lines.first().map(String::as_str) != Some("BEGIN:VCALENDAR")
         || lines.last().map(String::as_str) != Some("END:VCALENDAR")
     {
@@ -170,7 +228,9 @@ fn parse_source(
     }
     let mut raw = None::<RawEvent>;
     let mut parsed = Vec::new();
+    let mut parsed_bytes = 0_usize;
     for line in lines {
+        check_control(control)?;
         if line == "BEGIN:VEVENT" {
             if raw.is_some() {
                 return Err(invalid("nested VEVENT"));
@@ -180,7 +240,20 @@ fn parse_source(
         }
         if line == "END:VEVENT" {
             let event = raw.take().ok_or_else(|| invalid("unmatched VEVENT end"))?;
-            parsed.extend(expand(event, source_id, window_start, window_end, limit)?);
+            let (mut expanded, expanded_bytes) = expand(
+                event,
+                source_id,
+                window_start,
+                window_end,
+                limit,
+                byte_budget.saturating_sub(parsed_bytes),
+                control,
+            )?;
+            parsed_bytes = parsed_bytes
+                .checked_add(expanded_bytes)
+                .filter(|used| *used <= byte_budget)
+                .ok_or_else(budget_error)?;
+            parsed.append(&mut expanded);
             if parsed.len() > limit {
                 return Err(invalid("calendar expansion exceeded limit"));
             }
@@ -210,12 +283,13 @@ fn parse_source(
     if raw.is_some() {
         return Err(invalid("unterminated VEVENT"));
     }
-    Ok(parsed)
+    Ok((parsed, parsed_bytes))
 }
 
-fn unfold(input: &str) -> io::Result<Vec<String>> {
+fn unfold(input: &str, control: &RunControl) -> io::Result<Vec<String>> {
     let mut lines = Vec::<String>::new();
     for raw in input.lines() {
+        check_control(control)?;
         let line = raw.trim_end_matches('\r');
         if line.starts_with([' ', '\t']) {
             let previous = lines
@@ -322,7 +396,10 @@ fn expand(
     window_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
     limit: usize,
-) -> io::Result<Vec<CalendarEvent>> {
+    byte_budget: usize,
+    control: &RunControl,
+) -> io::Result<(Vec<CalendarEvent>, usize)> {
+    check_control(control)?;
     let uid = raw
         .uid
         .filter(|value| !value.is_empty())
@@ -360,6 +437,7 @@ fn expand(
         let mut current = start.at;
         let mut current_local = start.local.clone();
         for _ in 1..count {
+            check_control(control)?;
             if let Some((local, timezone)) = current_local.as_mut() {
                 *local = local
                     .checked_add_days(step)
@@ -389,7 +467,9 @@ fn expand(
         return Err(invalid("calendar expansion exceeded limit"));
     }
     let mut events = Vec::new();
+    let mut event_bytes = 0_usize;
     for (at, local) in starts {
+        check_control(control)?;
         if raw.exdates.contains(&at) {
             continue;
         }
@@ -398,7 +478,7 @@ fn expand(
             _ => at + duration,
         };
         if occurrence_end > window_start && at < window_end {
-            events.push(CalendarEvent {
+            let event = CalendarEvent {
                 id: format!("{uid}@{}", at.timestamp()),
                 summary: summary.clone(),
                 starts_at: format_time(at),
@@ -406,10 +486,34 @@ fn expand(
                 all_day: start.all_day,
                 source_id: source_id.to_owned(),
                 location: raw.location.clone(),
-            });
+            };
+            let serialized = serde_json::to_vec(&event).map_err(io::Error::other)?.len();
+            event_bytes = event_bytes
+                .checked_add(serialized)
+                .filter(|used| *used <= byte_budget)
+                .ok_or_else(budget_error)?;
+            events.push(event);
         }
     }
-    Ok(events)
+    Ok((events, event_bytes))
+}
+
+fn check_control(control: &RunControl) -> io::Result<()> {
+    if control.is_cancelled() || control.remaining().is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "calendar request cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn budget_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::FileTooLarge,
+        "calendar aggregate byte budget exceeded",
+    )
 }
 
 fn parse_utc(value: &str) -> io::Result<DateTime<Utc>> {

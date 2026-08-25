@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
+    collections::VecDeque,
     io,
-    sync::{mpsc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -111,65 +112,151 @@ pub trait OverviewEventSource: Send + Sync + 'static {
     fn try_event(&self) -> io::Result<Option<OverviewEvent>> {
         Ok(None)
     }
+
+    fn prepare_request(&self, current_sequence: u64) -> io::Result<(u64, Option<OverviewEvent>)> {
+        Ok((current_sequence, None))
+    }
 }
 
 #[derive(Clone)]
-pub struct OverviewEventSender(mpsc::SyncSender<OverviewEvent>);
+pub struct OverviewEventSender(Arc<OverviewChannel>);
 
-pub struct ChannelOverviewEvents(Mutex<mpsc::Receiver<OverviewEvent>>);
+pub struct ChannelOverviewEvents {
+    channel: Arc<OverviewChannel>,
+    cursor: Mutex<u64>,
+}
+
+struct OverviewChannel {
+    state: Mutex<OverviewChannelState>,
+    changed: Condvar,
+}
+
+struct OverviewChannelState {
+    events: VecDeque<OverviewEvent>,
+    capacity: usize,
+    latest_sequence: u64,
+    dropped_through: u64,
+}
 
 pub fn overview_event_channel(capacity: usize) -> (OverviewEventSender, ChannelOverviewEvents) {
-    let (sender, receiver) = mpsc::sync_channel(capacity.max(1));
+    let channel = Arc::new(OverviewChannel {
+        state: Mutex::new(OverviewChannelState {
+            events: VecDeque::new(),
+            capacity: capacity.max(1),
+            latest_sequence: 0,
+            dropped_through: 0,
+        }),
+        changed: Condvar::new(),
+    });
     (
-        OverviewEventSender(sender),
-        ChannelOverviewEvents(Mutex::new(receiver)),
+        OverviewEventSender(Arc::clone(&channel)),
+        ChannelOverviewEvents {
+            channel,
+            cursor: Mutex::new(0),
+        },
     )
 }
 
 impl OverviewEventSender {
     pub fn publish(&self, event: OverviewEvent) -> io::Result<()> {
-        match self.0.try_send(event) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "overview event receiver stopped",
-            )),
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("overview event channel lock poisoned"))?;
+        if event.sequence() <= state.latest_sequence {
+            return Ok(());
         }
+        if state.events.len() == state.capacity {
+            if let Some(dropped) = state.events.pop_front() {
+                state.dropped_through = dropped.sequence();
+            }
+        }
+        state.latest_sequence = event.sequence();
+        state.events.push_back(event);
+        self.0.changed.notify_all();
+        Ok(())
     }
 }
 
 impl OverviewEventSource for ChannelOverviewEvents {
     fn next_event(&self, timeout: Duration) -> io::Result<Option<OverviewEvent>> {
-        match self
-            .0
+        let mut cursor = self
+            .cursor
             .lock()
-            .map_err(|_| io::Error::other("overview event receiver lock poisoned"))?
-            .recv_timeout(timeout)
-        {
-            Ok(event) => Ok(Some(event)),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "Niri overview event source stopped",
-            )),
-        }
+            .map_err(|_| io::Error::other("overview cursor lock poisoned"))?;
+        let state = self
+            .channel
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("overview event channel lock poisoned"))?;
+        let (state, _) = self
+            .channel
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.latest_sequence <= *cursor && state.dropped_through <= *cursor
+            })
+            .map_err(|_| io::Error::other("overview event channel lock poisoned"))?;
+        next_channel_event(&state, &mut cursor)
     }
 
     fn try_event(&self) -> io::Result<Option<OverviewEvent>> {
-        match self
-            .0
+        let mut cursor = self
+            .cursor
             .lock()
-            .map_err(|_| io::Error::other("overview event receiver lock poisoned"))?
-            .try_recv()
-        {
-            Ok(event) => Ok(Some(event)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "Niri overview event source stopped",
-            )),
-        }
+            .map_err(|_| io::Error::other("overview cursor lock poisoned"))?;
+        let state = self
+            .channel
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("overview event channel lock poisoned"))?;
+        next_channel_event(&state, &mut cursor)
     }
+
+    fn prepare_request(&self, current_sequence: u64) -> io::Result<(u64, Option<OverviewEvent>)> {
+        let mut cursor = self
+            .cursor
+            .lock()
+            .map_err(|_| io::Error::other("overview cursor lock poisoned"))?;
+        let state = self
+            .channel
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("overview event channel lock poisoned"))?;
+        if *cursor < state.dropped_through {
+            *cursor = state.dropped_through;
+            return Err(lagged_error());
+        }
+        *cursor = state.latest_sequence;
+        let latest = state.events.back().cloned();
+        Ok((current_sequence.max(state.latest_sequence), latest))
+    }
+}
+
+fn next_channel_event(
+    state: &OverviewChannelState,
+    cursor: &mut u64,
+) -> io::Result<Option<OverviewEvent>> {
+    if *cursor < state.dropped_through {
+        *cursor = state.dropped_through;
+        return Err(lagged_error());
+    }
+    let event = state
+        .events
+        .iter()
+        .find(|event| event.sequence() > *cursor)
+        .cloned();
+    if let Some(event) = &event {
+        *cursor = event.sequence();
+    }
+    Ok(event)
+}
+
+fn lagged_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Niri overview event subscription lagged",
+    )
 }
 
 pub struct NiriOverview<R, E> {
@@ -221,7 +308,8 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
         command: DaemonCommand,
         control: &RunControl,
     ) -> io::Result<OverviewEvent> {
-        while let Some(event) = self.events.try_event()? {
+        let (baseline, current) = self.events.prepare_request(self.sequence)?;
+        if let Some(event) = current {
             self.observe(event);
         }
         if !self.online {
@@ -231,7 +319,7 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
             ));
         }
         let args = fixed_args(&command)?;
-        let baseline = self.sequence;
+        let baseline = baseline.max(self.sequence);
         let routed_output = self.focused_output.clone();
         let deadline = Instant::now() + self.timeout;
         self.runner

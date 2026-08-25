@@ -344,6 +344,31 @@ fn production_channel_requires_an_event_published_after_command_submission() {
 }
 
 #[test]
+fn overview_channel_reports_lag_instead_of_retaining_stale_and_dropping_newest() {
+    let (sender, events) = overview_event_channel(1);
+    sender
+        .publish(OverviewEvent::FocusChanged {
+            output_id: "old".into(),
+            window_id: Some(1),
+            workspace_id: 1,
+            sequence: 1,
+        })
+        .unwrap();
+    sender
+        .publish(OverviewEvent::FocusChanged {
+            output_id: "new".into(),
+            window_id: Some(2),
+            workspace_id: 2,
+            sequence: 2,
+        })
+        .unwrap();
+    assert_eq!(
+        events.try_event().unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
 fn launcher_bounds_resource_and_directory_amplification() {
     let root = tempdir().unwrap();
     fs::write(
@@ -743,6 +768,33 @@ fn calendar_rejects_aggregate_source_amplification() {
         .is_err());
 }
 
+#[test]
+fn calendar_honors_request_cancellation_and_stops_incremental_expansion() {
+    use std::sync::atomic::AtomicBool;
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("many.ics"), "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSUMMARY:X\nDTSTART:20260801T000000Z\nDTEND:20260801T010000Z\nRRULE:FREQ=DAILY;COUNT=4096\nEND:VEVENT\nEND:VCALENDAR\n").unwrap();
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let control = sleepy_session::system::RunControl::for_request(
+        std::time::Instant::now() + Duration::from_secs(5),
+        cancelled,
+    );
+    let error = IcsCalendarProvider::new(vec![root.path().join("many.ics")], 4096)
+        .snapshot_controlled("2026-08-01T00:00:00Z", "2038-01-01T00:00:00Z", &control)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+fn calendar_rejects_serialized_budget_during_not_after_event_accumulation() {
+    let root = tempdir().unwrap();
+    let summary = "x".repeat(100_000);
+    fs::write(root.path().join("large.ics"), format!("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSUMMARY:{summary}\nDTSTART:20260801T000000Z\nDTEND:20260801T010000Z\nRRULE:FREQ=DAILY;COUNT=30\nEND:VEVENT\nEND:VCALENDAR\n")).unwrap();
+    let error = IcsCalendarProvider::new(vec![root.path().join("large.ics")], 64)
+        .snapshot("2026-08-01T00:00:00Z", "2026-09-15T00:00:00Z")
+        .unwrap_err();
+    assert_eq!(error.to_string(), "calendar aggregate byte budget exceeded");
+}
+
 fn entry(name: &str, exec: &str, extra: &str) -> String {
     format!("[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n{extra}")
 }
@@ -839,7 +891,9 @@ async fn daily_socket_bounds_workers_keeps_runtime_responsive_and_joins_on_shutd
     let serve = tokio::spawn(async move { serving.serve().await });
     let request = b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"operation\":{\"type\":\"launcherSearch\",\"data\":{\"query\":\"term\"}}}\n";
     let mut clients = Vec::new();
-    for _ in 0..12 {
+    // Admission is now bounded at the same limit as workers; excess peers are
+    // covered by the dedicated Busy test below rather than queued here.
+    for _ in 0..2 {
         let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
         stream.write_all(request).await.unwrap();
         clients.push(stream);
@@ -872,4 +926,48 @@ async fn daily_socket_bounds_workers_keeps_runtime_responsive_and_joins_on_shutd
     assert_eq!(backend.active.load(Ordering::SeqCst), 0);
     assert!(backend.peak.load(Ordering::SeqCst) <= 2);
     drop(clients);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daily_socket_rejects_excess_connections_before_spawning_queued_tasks() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let root = tempdir().unwrap();
+    let path = root.path().join("sleepy/daily.sock");
+    let backend = Arc::new(ControlledDaily {
+        active: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let socket = Arc::new(
+        DailySocket::bind_with_limits(
+            &path,
+            unsafe { libc::geteuid() },
+            backend,
+            1,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let serve = tokio::spawn(async move { serving.serve().await });
+    let request = b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"operation\":{\"type\":\"launcherSearch\",\"data\":{\"query\":\"term\"}}}\n";
+    let mut first = tokio::net::UnixStream::connect(&path).await.unwrap();
+    first.write_all(request).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let mut line = String::new();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        tokio::io::BufReader::new(second).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response: DailyResponse = serde_json::from_str(line.trim()).unwrap();
+    assert!(matches!(response.status, DailyStatus::Busy));
+    socket
+        .shutdown_and_drain(Duration::from_secs(1))
+        .await
+        .unwrap();
+    serve.await.unwrap().unwrap();
 }

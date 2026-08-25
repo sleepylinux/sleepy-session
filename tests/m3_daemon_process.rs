@@ -239,6 +239,68 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
     assert!(daemon.0.take().unwrap().wait().unwrap().success());
 }
 
+#[test]
+fn malformed_provider_state_degrades_locally_without_blocking_daily_startup() {
+    use std::io::Write;
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    let cache = temp.path().join("cache/sleepy");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    for name in ["met.json", "nominatim.json"] {
+        let path = cache.join(name);
+        std::fs::write(&path, b"{malformed").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .env("SLEEPY_CALENDAR_DIR", temp.path().join("missing-calendar"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut daemon = ChildGuard(Some(daemon));
+    let socket = runtime.join("sleepy/daily.sock");
+    wait_for_path(&socket, Duration::from_secs(2));
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"operation\":{\"type\":\"launcherSearch\",\"data\":{\"query\":\"term\"}}}\n").unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let response: sleepy_session::daily::DailyResponse = serde_json::from_str(&line).unwrap();
+    assert!(matches!(
+        response.status,
+        sleepy_session::daily::DailyStatus::Confirmed
+    ));
+    let mut calendar = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    calendar
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    calendar.write_all(b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e66\",\"operation\":{\"type\":\"calendar\",\"data\":{\"windowStart\":\"2026-08-01T00:00:00Z\",\"windowEnd\":\"2026-09-01T00:00:00Z\"}}}\n").unwrap();
+    let mut line = String::new();
+    BufReader::new(calendar).read_line(&mut line).unwrap();
+    let response: sleepy_session::daily::DailyResponse = serde_json::from_str(&line).unwrap();
+    assert!(matches!(
+        response.status,
+        sleepy_session::daily::DailyStatus::Error
+    ));
+    assert!(response
+        .error
+        .unwrap()
+        .contains("calendar provider is degraded"));
+    daemon.kill_and_wait();
+}
+
 struct ChildGuard(Option<std::process::Child>);
 
 struct IsolatedBus {

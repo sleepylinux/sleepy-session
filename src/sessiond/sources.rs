@@ -366,8 +366,6 @@ async fn run_niri_source(
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut sequence = 0_u64;
-    let mut focused_workspace = 0_u64;
-    let mut focused_window = None;
     'supervisor: loop {
         if *shutdown.borrow() {
             return Ok(());
@@ -397,6 +395,10 @@ async fn run_niri_source(
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("Niri stdout missing"))?;
+        // A restarted stream begins with no trusted focus state. Its initial
+        // snapshot must rebuild both values before commands can be confirmed.
+        let mut focused_workspace = 0_u64;
+        let mut focused_window = None;
         let mut lines = BufReader::with_capacity(4096, stdout);
         let mut workspaces = HashMap::<u64, String>::new();
         loop {
@@ -413,15 +415,46 @@ async fn run_niri_source(
             };
             match read {
                 Ok(Some(line)) => {
-                    if let Some(sender) = &overview_events {
-                        if let Some(event) = parse_overview_event(
-                            &line,
-                            &workspaces,
-                            &mut sequence,
-                            &mut focused_workspace,
-                            &mut focused_window,
-                        )? {
-                            sender.publish(event)?;
+                    let overview = parse_overview_event(
+                        &line,
+                        &workspaces,
+                        &mut sequence,
+                        &mut focused_workspace,
+                        &mut focused_window,
+                    );
+                    match overview {
+                        Ok(Some(event)) => {
+                            if let Some(sender) = &overview_events {
+                                sender.publish(event)?;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            if let Some(sender) = &overview_events {
+                                sequence = sequence.saturating_add(1);
+                                sender.publish(OverviewEvent::Offline { sequence })?;
+                            }
+                            stop_child(&mut child).await;
+                            clear_focus(&focused_output)?;
+                            workspaces.clear();
+                            publish(
+                                &authority,
+                                SessionEvent::Niri(NiriEvent {
+                                    focused_output_id: None,
+                                }),
+                            )
+                            .await?;
+                            publish_degraded(
+                                &authority,
+                                RuntimeCapabilityId::Niri,
+                                io::ErrorKind::InvalidData,
+                                &format!("Niri overview event was invalid: {error}"),
+                            )
+                            .await?;
+                            if wait_backoff(&mut shutdown).await {
+                                return Ok(());
+                            }
+                            continue 'supervisor;
                         }
                     }
                     match parse_niri_event(&line, &mut workspaces) {
@@ -445,8 +478,13 @@ async fn run_niri_source(
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            if let Some(sender) = &overview_events {
+                                sequence = sequence.saturating_add(1);
+                                sender.publish(OverviewEvent::Offline { sequence })?;
+                            }
                             stop_child(&mut child).await;
                             clear_focus(&focused_output)?;
+                            workspaces.clear();
                             publish(
                                 &authority,
                                 SessionEvent::Niri(NiriEvent {
@@ -475,6 +513,7 @@ async fn run_niri_source(
                     }
                     stop_child(&mut child).await;
                     clear_focus(&focused_output)?;
+                    workspaces.clear();
                     publish(
                         &authority,
                         SessionEvent::Niri(NiriEvent {
@@ -501,6 +540,7 @@ async fn run_niri_source(
                     }
                     stop_child(&mut child).await;
                     clear_focus(&focused_output)?;
+                    workspaces.clear();
                     publish(
                         &authority,
                         SessionEvent::Niri(NiriEvent {

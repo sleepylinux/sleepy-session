@@ -86,6 +86,7 @@ pub struct DailyResponse {
 #[serde(rename_all = "camelCase")]
 pub enum DailyStatus {
     Confirmed,
+    Busy,
     Error,
 }
 
@@ -100,12 +101,29 @@ pub trait DailyBackend: Send + Sync + 'static {
 pub struct ProductionDailyBackend {
     launcher: DesktopEntryIndex,
     metrics: Mutex<LauncherMetrics>,
-    calendar: IcsCalendarProvider,
-    weather: MetNoProvider<CurlTransport, SystemClock>,
-    geocoder: NominatimProvider<CurlTransport, SystemClock>,
+    calendar: ProviderSlot<IcsCalendarProvider>,
+    weather: ProviderSlot<MetNoProvider<CurlTransport, SystemClock>>,
+    geocoder: ProviderSlot<NominatimProvider<CurlTransport, SystemClock>>,
     runner: ProcessCommandRunner,
     overview: Mutex<NiriOverview<ProcessOverviewRunner, ChannelOverviewEvents>>,
     fallback_overview_sender: Option<crate::overview::OverviewEventSender>,
+}
+
+enum ProviderSlot<T> {
+    Available(T),
+    Degraded(String),
+}
+
+impl<T> ProviderSlot<T> {
+    fn get(&self, provider: &str) -> io::Result<&T> {
+        match self {
+            Self::Available(value) => Ok(value),
+            Self::Degraded(message) => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("{provider} provider is degraded: {message}"),
+            )),
+        }
+    }
 }
 
 impl ProductionDailyBackend {
@@ -124,10 +142,12 @@ impl ProductionDailyBackend {
         let launcher = DesktopEntryIndex::scan_xdg(executable_available)?;
         let metrics = LauncherMetrics::open(&state_dir.join("sleepy/launcher.json"))?;
         let calendar_dir = std::env::var_os("SLEEPY_CALENDAR_DIR").map(PathBuf::from);
-        let calendar_sources = calendar_dir
-            .map(enumerate_calendar_sources)
-            .transpose()?
-            .unwrap_or_default();
+        let calendar = match calendar_dir.map(enumerate_calendar_sources).transpose() {
+            Ok(sources) => {
+                ProviderSlot::Available(IcsCalendarProvider::new(sources.unwrap_or_default(), 4096))
+            }
+            Err(error) => ProviderSlot::Degraded(error.to_string()),
+        };
         let user_agent = std::env::var("SLEEPY_PROVIDER_USER_AGENT")
             .unwrap_or_else(|_| "SleepyLinux/3 https://sleepylinux.org".into());
         let met_endpoint = std::env::var("SLEEPY_MET_ENDPOINT").unwrap_or_else(|_| {
@@ -138,21 +158,21 @@ impl ProductionDailyBackend {
         Ok(Self {
             launcher,
             metrics: Mutex::new(metrics),
-            calendar: IcsCalendarProvider::new(calendar_sources, 4096),
-            weather: MetNoProvider::new(
+            calendar,
+            weather: provider_slot(MetNoProvider::new(
                 &met_endpoint,
                 &user_agent,
                 cache_dir.join("sleepy/met.json"),
                 CurlTransport,
                 SystemClock,
-            )?,
-            geocoder: NominatimProvider::new(
+            )),
+            geocoder: provider_slot(NominatimProvider::new(
                 &nominatim_endpoint,
                 &user_agent,
                 cache_dir.join("sleepy/nominatim.json"),
                 CurlTransport,
                 SystemClock,
-            )?,
+            )),
             runner: ProcessCommandRunner,
             overview: Mutex::new(NiriOverview::new(
                 ProcessOverviewRunner::default(),
@@ -164,9 +184,19 @@ impl ProductionDailyBackend {
     }
 }
 
+fn provider_slot<T>(result: io::Result<T>) -> ProviderSlot<T> {
+    match result {
+        Ok(provider) => ProviderSlot::Available(provider),
+        Err(error) => ProviderSlot::Degraded(error.to_string()),
+    }
+}
+
 fn enumerate_calendar_sources(directory: PathBuf) -> io::Result<Vec<PathBuf>> {
     let mut sources = Vec::new();
-    for entry in fs::read_dir(directory)? {
+    for (entry_index, entry) in fs::read_dir(directory)?.enumerate() {
+        if entry_index == 4096 {
+            return Err(invalid("calendar directory entry count exceeded limit"));
+        }
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_some_and(|value| value == "ics") {
@@ -212,20 +242,7 @@ impl ProductionDailyBackend {
                 if request.schema_version != WIRE_SCHEMA_VERSION {
                     return Err(invalid("unsupported launch schema"));
                 }
-                let resources = LaunchResources {
-                    files: request
-                        .resources
-                        .iter()
-                        .filter(|value| !value.contains("://"))
-                        .cloned()
-                        .collect(),
-                    urls: request
-                        .resources
-                        .iter()
-                        .filter(|value| value.contains("://"))
-                        .cloned()
-                        .collect(),
-                };
+                let resources = classify_launch_resources(&request.resources)?;
                 let argv = self.launcher.launch_argv(
                     &request.desktop_id,
                     request.action_id.as_deref(),
@@ -257,18 +274,50 @@ impl ProductionDailyBackend {
             DailyOperation::Calendar {
                 window_start,
                 window_end,
-            } => serde_json::to_value(self.calendar.snapshot(&window_start, &window_end)?)
-                .map_err(io::Error::other),
-            DailyOperation::Weather { location } => {
-                serde_json::to_value(self.weather.snapshot_controlled(&location, control)?)
-                    .map_err(io::Error::other)
-            }
-            DailyOperation::GeocodeSubmit { query } => {
-                serde_json::to_value(self.geocoder.submit_controlled(&query, control)?)
-                    .map_err(io::Error::other)
-            }
+            } => serde_json::to_value(self.calendar.get("calendar")?.snapshot_controlled(
+                &window_start,
+                &window_end,
+                control,
+            )?)
+            .map_err(io::Error::other),
+            DailyOperation::Weather { location } => serde_json::to_value(
+                self.weather
+                    .get("weather")?
+                    .snapshot_controlled(&location, control)?,
+            )
+            .map_err(io::Error::other),
+            DailyOperation::GeocodeSubmit { query } => serde_json::to_value(
+                self.geocoder
+                    .get("geocoding")?
+                    .submit_controlled(&query, control)?,
+            )
+            .map_err(io::Error::other),
         }
     }
+}
+
+fn classify_launch_resources(resources: &[String]) -> io::Result<LaunchResources> {
+    let mut classified = LaunchResources::default();
+    for value in resources {
+        if value.is_empty() || value.contains('\0') {
+            return Err(invalid("launch resource is invalid"));
+        }
+        if has_uri_scheme(value) {
+            classified.urls.push(value.clone());
+        } else {
+            classified.files.push(value.clone());
+        }
+    }
+    Ok(classified)
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once(':') else {
+        return false;
+    };
+    let mut bytes = scheme.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
 impl DailyBackend for ProductionDailyBackend {
@@ -346,6 +395,7 @@ pub struct DailySocket<B> {
     shutdown: tokio::sync::broadcast::Sender<()>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
     workers: Arc<tokio::sync::Semaphore>,
+    admission: Arc<tokio::sync::Semaphore>,
     request_timeout: Duration,
     stopping: Arc<AtomicBool>,
 }
@@ -382,6 +432,7 @@ impl<B: DailyBackend> DailySocket<B> {
             shutdown,
             tasks: tokio::sync::Mutex::new(Vec::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(max_workers)),
+            admission: Arc::new(tokio::sync::Semaphore::new(max_workers)),
             request_timeout,
             stopping: Arc::new(AtomicBool::new(false)),
         })
@@ -393,25 +444,43 @@ impl<B: DailyBackend> DailySocket<B> {
             if self.stopping.load(Ordering::SeqCst) {
                 return Ok(());
             }
+            if peer_uid(&stream)? != self.endpoint.expected_uid() {
+                continue;
+            }
+            let connection_permit = match Arc::clone(&self.admission).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    reject_busy(stream).await?;
+                    continue;
+                }
+            };
             let backend = Arc::clone(&self.backend);
             let workers = Arc::clone(&self.workers);
             let client_shutdown = self.shutdown.subscribe();
             let request_timeout = self.request_timeout;
             let stopping = Arc::clone(&self.stopping);
-            let uid = self.endpoint.expected_uid();
             let mut tasks = self.tasks.lock().await;
+            let mut index = 0;
+            while index < tasks.len() {
+                if tasks[index].is_finished() {
+                    let completed = tasks.remove(index);
+                    let _ = completed.await;
+                } else {
+                    index += 1;
+                }
+            }
             if self.stopping.load(Ordering::SeqCst) {
                 return Ok(());
             }
             tasks.push(tokio::spawn(async move {
                 serve_client(
                     stream,
-                    uid,
                     backend,
                     workers,
                     client_shutdown,
                     request_timeout,
                     stopping,
+                    connection_permit,
                 )
                 .await
             }));
@@ -460,19 +529,13 @@ impl<B: DailyBackend> DailySocket<B> {
 
 async fn serve_client<B: DailyBackend>(
     stream: UnixStream,
-    expected_uid: libc::uid_t,
     backend: Arc<B>,
     workers: Arc<tokio::sync::Semaphore>,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
     request_timeout: Duration,
     stopping: Arc<AtomicBool>,
+    _connection_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> io::Result<()> {
-    if peer_uid(&stream)? != expected_uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "daily socket peer UID mismatch",
-        ));
-    }
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     loop {
@@ -539,6 +602,21 @@ async fn serve_client<B: DailyBackend>(
         bytes.push(b'\n');
         write.write_all(&bytes).await?;
     }
+}
+
+async fn reject_busy(mut stream: UnixStream) -> io::Result<()> {
+    let response = DailyResponse {
+        schema_version: WIRE_SCHEMA_VERSION,
+        request_id: "unknown".into(),
+        status: DailyStatus::Busy,
+        data: None,
+        error: Some("daily service is busy".into()),
+    };
+    let mut bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    let _ = tokio::time::timeout(Duration::from_millis(100), stream.write_all(&bytes)).await;
+    let _ = stream.shutdown().await;
+    Ok(())
 }
 
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
@@ -617,5 +695,19 @@ mod tests {
         assert!(unit
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.')));
+    }
+
+    #[test]
+    fn resource_classification_recognizes_all_valid_uri_schemes() {
+        let resources = classify_launch_resources(&[
+            "mailto:person@example.test".into(),
+            "magnet:?xt=urn:btih:abc".into(),
+            "geo:50.0,14.0".into(),
+            "/tmp/local:name".into(),
+            "relative-file".into(),
+        ])
+        .unwrap();
+        assert_eq!(resources.urls.len(), 3);
+        assert_eq!(resources.files, ["/tmp/local:name", "relative-file"]);
     }
 }
