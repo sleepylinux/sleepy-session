@@ -585,6 +585,7 @@ fn process_runner_enforces_timeout_without_a_shell() {
         args: vec!["1".to_owned()],
         env: vec![("LC_ALL".to_owned(), "C".to_owned())],
         timeout: Duration::from_millis(20),
+        max_output_bytes: 64 * 1024,
     };
     let started = Instant::now();
     let error = ProcessCommandRunner.run(&command).unwrap_err();
@@ -599,10 +600,21 @@ fn process_runner_rejects_output_over_the_capture_limit() {
         args: vec!["1".to_owned(), "20000".to_owned()],
         env: vec![("LC_ALL".to_owned(), "C".to_owned())],
         timeout: Duration::from_secs(1),
+        max_output_bytes: 64 * 1024,
     };
     let error = ProcessCommandRunner.run(&command).unwrap_err();
     assert_eq!(error.kind(), RunnerErrorKind::Io);
     assert!(error.message().contains("bounded capture limit"));
+}
+
+#[test]
+fn process_runner_allows_a_separate_larger_bounded_capture_contract() {
+    let mut command = CommandSpec::new("seq", ["1", "20000"]);
+    command.timeout = Duration::from_secs(1);
+    command.max_output_bytes = 2 * 1024 * 1024 + 64 * 1024;
+    let output = ProcessCommandRunner.run(&command).unwrap();
+    assert!(output.stdout.len() > 64 * 1024);
+    assert!(output.stdout.len() < command.max_output_bytes);
 }
 
 #[test]
@@ -635,6 +647,7 @@ fn process_runner_kills_and_reaps_a_superseded_real_child() {
         ],
         env: vec![("LC_ALL".to_owned(), "C".to_owned())],
         timeout: Duration::from_secs(5),
+        max_output_bytes: 64 * 1024,
     };
     let child = std::thread::spawn(move || ProcessCommandRunner.run_controlled(&command, &control));
     let readiness_deadline = Instant::now() + Duration::from_secs(4);

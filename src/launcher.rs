@@ -15,22 +15,29 @@ use crate::store::SecureDir;
 
 const MAX_ENTRY_BYTES: u64 = 256 * 1024;
 const MAX_ENTRIES: usize = 16_384;
+const MAX_DIRECTORIES: usize = 4_096;
+const MAX_DEPTH: usize = 32;
+const MAX_RESOURCES: usize = 256;
+const MAX_RESOURCE_BYTES: usize = 16 * 1024;
+const MAX_RESOURCE_TOTAL_BYTES: usize = 1024 * 1024;
 const METRICS_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DesktopAction {
     pub id: String,
     pub name: String,
     exec: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DesktopEntry {
     pub desktop_id: String,
     pub name: String,
     pub icon: Option<String>,
     pub actions: Vec<DesktopAction>,
+    #[serde(skip)]
     path: PathBuf,
+    #[serde(skip)]
     exec: String,
 }
 
@@ -130,6 +137,7 @@ impl DesktopEntryIndex {
         action_id: Option<&str>,
         resources: &LaunchResources,
     ) -> io::Result<Vec<String>> {
+        validate_resources(resources)?;
         let entry = self.entries.get(desktop_id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "Desktop Entry is not indexed")
         })?;
@@ -155,22 +163,66 @@ fn collect_desktop_files(
     directory: &Path,
     output: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
-    for item in fs::read_dir(directory)? {
-        let item = item?;
-        let file_type = item.file_type()?;
-        let path = item.path();
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_desktop_files(root, &path, output)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|value| value == "desktop") {
-            output.push(path);
-        }
-        if output.len() > MAX_ENTRIES {
+    let mut pending = vec![(directory.to_owned(), 0usize)];
+    let mut directory_count = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        directory_count += 1;
+        if directory_count > MAX_DIRECTORIES || depth > MAX_DEPTH {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("too many entries below {}", root.display()),
+                format!(
+                    "Desktop Entry traversal exceeded limits below {}",
+                    root.display()
+                ),
+            ));
+        }
+        for item in fs::read_dir(directory)? {
+            let item = item?;
+            let file_type = item.file_type()?;
+            let path = item.path();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push((path, depth + 1));
+            } else if file_type.is_file()
+                && path.extension().is_some_and(|value| value == "desktop")
+            {
+                output.push(path);
+            }
+            if output.len() > MAX_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("too many entries below {}", root.display()),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_resources(resources: &LaunchResources) -> io::Result<()> {
+    if resources.files.len().saturating_add(resources.urls.len()) > MAX_RESOURCES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many launch resources",
+        ));
+    }
+    let mut total = 0usize;
+    for resource in resources.files.iter().chain(&resources.urls) {
+        if resource.is_empty() || resource.contains('\0') || resource.len() > MAX_RESOURCE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "launch resource is invalid or oversized",
+            ));
+        }
+        total = total.checked_add(resource.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "launch resources overflow")
+        })?;
+        if total > MAX_RESOURCE_TOTAL_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "launch resources exceed aggregate limit",
             ));
         }
     }

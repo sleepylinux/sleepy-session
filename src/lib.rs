@@ -3,6 +3,7 @@
 pub mod bindings;
 pub mod calendar;
 pub mod cli;
+pub mod daily;
 pub mod launcher;
 pub mod notifications;
 pub mod osd;

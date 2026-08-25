@@ -1,6 +1,7 @@
 use std::{env, io, path::PathBuf, process::ExitCode, sync::Arc};
 
 use sleepy_sdk::{EventCause, EventCauseKind, ProviderEvent, SessionEvent};
+use sleepy_session::daily::{DailySocket, ProductionDailyBackend};
 use sleepy_session::notifications::{
     FreedesktopNotificationProvider, NotificationDbusServer, NotificationEventService,
     NotificationStore,
@@ -25,9 +26,12 @@ async fn main() -> ExitCode {
 async fn run() -> io::Result<()> {
     let runtime_dir = required_path("XDG_RUNTIME_DIR")?;
     let state_dir = state_home()?;
+    let cache_dir = cache_home()?;
     let socket_path = runtime_dir.join("sleepy/session.sock");
     let osd_socket_path = runtime_dir.join("sleepy/osd.sock");
+    let daily_socket_path = runtime_dir.join("sleepy/daily.sock");
     let generation_path = state_dir.join("sleepy/session-generation");
+    let daily_backend = Arc::new(ProductionDailyBackend::open(&state_dir, &cache_dir)?);
 
     let mut allocator = GenerationAllocator::open(generation_path, 1024)?;
     let generation = allocator.next_generation()?;
@@ -63,12 +67,14 @@ async fn run() -> io::Result<()> {
     let expected_uid = unsafe { libc::geteuid() };
     let socket = SessionSocket::bind(&socket_path, expected_uid, hub.clone()).await?;
     let osd_socket = OsdSocket::bind(&osd_socket_path, expected_uid, osd_hub).await?;
+    let daily_socket = DailySocket::bind(&daily_socket_path, expected_uid, daily_backend).await?;
     let sources = ProductionSources::start(authority.clone());
     let shutdown = ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
     let result = {
         tokio::select! {
             result = socket.serve() => result,
             result = osd_socket.serve() => result,
+            result = daily_socket.serve() => result,
             bridge = &mut osd_bridge => match bridge {
                 Ok(Ok(())) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "OSD publication bridge stopped")),
                 Ok(Err(error)) => Err(error),
@@ -99,8 +105,16 @@ async fn run() -> io::Result<()> {
         }
     };
     let mut cleanup_error = None;
-    if let Err(error) = shutdown.reconcile(&[]).await {
+    if let Err(error) = sources
+        // Stop producers before the lifecycle reconciliation barrier so no
+        // capability event can overtake Stopping/Reconciled on shutdown.
+        .shutdown_and_join(std::time::Duration::from_secs(4))
+        .await
+    {
         cleanup_error = Some(error);
+    }
+    if let Err(error) = shutdown.reconcile(&[]).await {
+        cleanup_error.get_or_insert(error);
     }
     if let Err(error) = socket
         .shutdown_and_drain(std::time::Duration::from_secs(2))
@@ -114,11 +128,8 @@ async fn run() -> io::Result<()> {
     {
         cleanup_error.get_or_insert(error);
     }
-    if let Err(error) = sources
-        // Audio owns three sequential 900 ms fixed-argv readbacks. The source
-        // shutdown deadline must allow the in-flight blocking task to finish
-        // killing/waiting its child and join instead of detaching it.
-        .shutdown_and_join(std::time::Duration::from_secs(4))
+    if let Err(error) = daily_socket
+        .shutdown_and_drain(std::time::Duration::from_secs(2))
         .await
     {
         cleanup_error.get_or_insert(error);
@@ -144,4 +155,11 @@ fn state_home() -> io::Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     Ok(required_path("HOME")?.join(".local/state"))
+}
+
+fn cache_home() -> io::Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(required_path("HOME")?.join(".cache"))
 }

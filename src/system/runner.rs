@@ -18,6 +18,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub timeout: Duration,
+    pub max_output_bytes: usize,
 }
 
 impl CommandSpec {
@@ -31,6 +32,7 @@ impl CommandSpec {
             args: args.into_iter().map(Into::into).collect(),
             env: vec![("LC_ALL".to_owned(), "C".to_owned())],
             timeout: Duration::from_millis(900),
+            max_output_bytes: MAX_OUTPUT_BYTES,
         }
     }
 }
@@ -190,8 +192,9 @@ impl ProcessCommandRunner {
         })?;
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let stdout_reader = thread::spawn(move || read_capped(stdout));
-        let stderr_reader = thread::spawn(move || read_capped(stderr));
+        let capture_limit = spec.max_output_bytes;
+        let stdout_reader = thread::spawn(move || read_capped(stdout, capture_limit));
+        let stderr_reader = thread::spawn(move || read_capped(stderr, capture_limit));
         let started = Instant::now();
         let status = loop {
             if control.is_cancelled() {
@@ -243,7 +246,7 @@ fn terminate_and_reap(
     let _ = stderr_reader.join();
 }
 
-fn read_capped(mut reader: impl Read) -> Result<Vec<u8>, RunnerError> {
+fn read_capped(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, RunnerError> {
     let mut bytes = Vec::new();
     let mut exceeded = false;
     let mut chunk = [0_u8; 8192];
@@ -257,7 +260,7 @@ fn read_capped(mut reader: impl Read) -> Result<Vec<u8>, RunnerError> {
         if count == 0 {
             break;
         }
-        let remaining = MAX_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let remaining = limit.saturating_sub(bytes.len());
         bytes.extend_from_slice(&chunk[..count.min(remaining)]);
         exceeded |= count > remaining;
     }

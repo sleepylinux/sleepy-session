@@ -100,6 +100,7 @@ struct RawEvent {
 struct ParsedTime {
     at: DateTime<Utc>,
     all_day: bool,
+    local: Option<(NaiveDateTime, String)>,
 }
 
 #[derive(Clone)]
@@ -225,6 +226,7 @@ fn parse_time(value: &str, parameters: &[(&str, &str)]) -> io::Result<ParsedTime
         return Ok(ParsedTime {
             at: Utc.from_utc_datetime(&midnight),
             all_day: true,
+            local: None,
         });
     }
     if value.ends_with('Z') {
@@ -233,6 +235,7 @@ fn parse_time(value: &str, parameters: &[(&str, &str)]) -> io::Result<ParsedTime
         return Ok(ParsedTime {
             at: Utc.from_utc_datetime(&at),
             all_day: false,
+            local: None,
         });
     }
     let timezone = parameters
@@ -243,7 +246,11 @@ fn parse_time(value: &str, parameters: &[(&str, &str)]) -> io::Result<ParsedTime
     let local = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S")
         .map_err(|_| invalid("invalid local date-time"))?;
     let at = resolve_local_time(timezone, local)?;
-    Ok(ParsedTime { at, all_day: false })
+    Ok(ParsedTime {
+        at,
+        all_day: false,
+        local: Some((local, timezone.to_owned())),
+    })
 }
 
 fn parse_date_list(value: &str, parameters: &[(&str, &str)]) -> io::Result<Vec<DateTime<Utc>>> {
@@ -313,12 +320,18 @@ fn expand(
             start.at
         },
         all_day: start.all_day,
+        local: None,
     });
     if end.at <= start.at {
         return Err(invalid("VEVENT interval is not ordered"));
     }
     let duration = end.at - start.at;
-    let mut starts = vec![start.at];
+    let civil_duration = start.local.as_ref().zip(end.local.as_ref()).and_then(
+        |((start_local, start_tz), (end_local, end_tz))| {
+            (start_tz == end_tz).then_some(*end_local - *start_local)
+        },
+    );
+    let mut starts = vec![(start.at, start.local.clone())];
     if let Some(rule) = raw.rule {
         let step = match rule.frequency {
             Frequency::Daily => Days::new(1),
@@ -326,10 +339,18 @@ fn expand(
         };
         let count = rule.count.unwrap_or(usize::MAX);
         let mut current = start.at;
+        let mut current_local = start.local.clone();
         for _ in 1..count {
-            current = current
-                .checked_add_days(step)
-                .ok_or_else(|| invalid("RRULE overflow"))?;
+            if let Some((local, timezone)) = current_local.as_mut() {
+                *local = local
+                    .checked_add_days(step)
+                    .ok_or_else(|| invalid("RRULE overflow"))?;
+                current = resolve_local_time(timezone, *local)?;
+            } else {
+                current = current
+                    .checked_add_days(step)
+                    .ok_or_else(|| invalid("RRULE overflow"))?;
+            }
             if rule.until.is_some_and(|until| current > until) {
                 break;
             }
@@ -339,21 +360,26 @@ fn expand(
             if starts.len() >= limit {
                 return Err(invalid("RRULE expansion exceeded limit"));
             }
-            starts.push(current);
+            starts.push((current, current_local.clone()));
         }
     }
-    starts.extend(raw.rdates);
-    starts.sort();
-    starts.dedup();
+    starts.extend(raw.rdates.into_iter().map(|at| (at, None)));
+    starts.sort_by_key(|value| value.0);
+    starts.dedup_by_key(|value| value.0);
     if starts.len() > limit {
         return Err(invalid("calendar expansion exceeded limit"));
     }
-    Ok(starts
-        .into_iter()
-        .filter(|at| !raw.exdates.contains(at))
-        .filter_map(|at| {
-            let occurrence_end = at + duration;
-            (occurrence_end > window_start && at < window_end).then(|| CalendarEvent {
+    let mut events = Vec::new();
+    for (at, local) in starts {
+        if raw.exdates.contains(&at) {
+            continue;
+        }
+        let occurrence_end = match (local, civil_duration) {
+            (Some((local, timezone)), Some(civil)) => resolve_local_time(&timezone, local + civil)?,
+            _ => at + duration,
+        };
+        if occurrence_end > window_start && at < window_end {
+            events.push(CalendarEvent {
                 id: format!("{uid}@{}", at.timestamp()),
                 summary: summary.clone(),
                 starts_at: format_time(at),
@@ -361,9 +387,10 @@ fn expand(
                 all_day: start.all_day,
                 source_id: source_id.to_owned(),
                 location: raw.location.clone(),
-            })
-        })
-        .collect())
+            });
+        }
+    }
+    Ok(events)
 }
 
 fn parse_utc(value: &str) -> io::Result<DateTime<Utc>> {

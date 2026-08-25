@@ -46,6 +46,7 @@ pub trait HttpTransport: Clone + Send + Sync + 'static {
 
 pub trait Clock: Clone + Send + Sync + 'static {
     fn now(&self) -> u64;
+    fn monotonic_millis(&self) -> u64;
 }
 
 #[derive(Clone)]
@@ -64,6 +65,9 @@ impl Clock for ManualClock {
     fn now(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
     }
+    fn monotonic_millis(&self) -> u64 {
+        self.now().saturating_mul(1000)
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -75,6 +79,15 @@ impl Clock for SystemClock {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+    fn monotonic_millis(&self) -> u64 {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -99,6 +112,7 @@ impl HttpTransport for CurlTransport {
         args.push(request.url);
         let mut command = CommandSpec::new("curl", args);
         command.timeout = request.timeout;
+        command.max_output_bytes = MAX_HTTP_BODY + 64 * 1024;
         let output = ProcessCommandRunner
             .run(&command)
             .map_err(io::Error::other)?;
@@ -177,6 +191,9 @@ impl<T: HttpTransport, C: Clock> MetNoProvider<T, C> {
         {
             return Err(invalid("unknown MET cache schema"));
         }
+        if let Some(cache) = &cache {
+            validate_met_cache(cache, clock.now())?;
+        }
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').into(),
             user_agent: user_agent.into(),
@@ -249,11 +266,31 @@ impl<T: HttpTransport, C: Clock> MetNoProvider<T, C> {
                         ))
                     }
                 };
+                let last_modified = header(&response.headers, "Last-Modified").map(str::to_owned);
+                if last_modified.as_deref().is_some_and(invalid_header_value) {
+                    return Ok(unavailable(
+                        location,
+                        existing,
+                        ProviderStatus::Error,
+                        "MET Last-Modified header is invalid",
+                    ));
+                }
+                let expiration = match expires(&response.headers, now) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Ok(unavailable(
+                            location,
+                            existing,
+                            ProviderStatus::Error,
+                            &error.to_string(),
+                        ))
+                    }
+                };
                 let cache = MetCache {
                     schema_version: CACHE_VERSION,
                     location_key: key,
-                    expires_at: expires(&response.headers, now),
-                    last_modified: header(&response.headers, "Last-Modified").map(str::to_owned),
+                    expires_at: expiration,
+                    last_modified,
                     forecast: forecast.clone(),
                 };
                 write_json_private(&self.cache_path, &cache)?;
@@ -272,7 +309,17 @@ impl<T: HttpTransport, C: Clock> MetNoProvider<T, C> {
             304 => {
                 let mut cache =
                     existing.ok_or_else(|| invalid("MET returned 304 without a safe cache"))?;
-                cache.expires_at = expires(&response.headers, now);
+                cache.expires_at = match expires(&response.headers, now) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Ok(unavailable(
+                            location,
+                            Some(cache),
+                            ProviderStatus::Error,
+                            &error.to_string(),
+                        ))
+                    }
+                };
                 write_json_private(&self.cache_path, &cache)?;
                 let forecast = cache.forecast.clone();
                 *self
@@ -413,10 +460,18 @@ pub struct NominatimProvider<T, C> {
     cache_path: PathBuf,
     transport: T,
     clock: C,
+    limiter: Arc<NominatimRateLimiter>,
     cache: Mutex<BTreeMap<String, Vec<GeocodingResult>>>,
 }
 
-static NOMINATIM_LAST_REQUEST: OnceLock<Mutex<Option<u64>>> = OnceLock::new();
+static NOMINATIM_LAST_REQUEST: OnceLock<Arc<NominatimRateLimiter>> = OnceLock::new();
+
+pub struct NominatimRateLimiter(Mutex<Option<u64>>);
+impl NominatimRateLimiter {
+    pub fn isolated() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(None)))
+    }
+}
 
 impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
     pub fn new(
@@ -425,6 +480,27 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
         cache_path: PathBuf,
         transport: T,
         clock: C,
+    ) -> io::Result<Self> {
+        Self::new_with_limiter(
+            endpoint,
+            user_agent,
+            cache_path,
+            transport,
+            clock,
+            Arc::clone(
+                NOMINATIM_LAST_REQUEST
+                    .get_or_init(|| Arc::new(NominatimRateLimiter(Mutex::new(None)))),
+            ),
+        )
+    }
+
+    pub fn new_with_limiter(
+        endpoint: &str,
+        user_agent: &str,
+        cache_path: PathBuf,
+        transport: T,
+        clock: C,
+        limiter: Arc<NominatimRateLimiter>,
     ) -> io::Result<Self> {
         validate_endpoint_and_agent(endpoint, user_agent)?;
         let cache = read_json_if_present::<GeocodeCache>(&cache_path)?.map_or(
@@ -443,6 +519,7 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
             cache_path,
             transport,
             clock,
+            limiter,
             cache: Mutex::new(cache),
         })
     }
@@ -472,18 +549,19 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
         {
             return Ok(cached);
         }
-        let now = self.clock.now();
-        let mut last_request = NOMINATIM_LAST_REQUEST
-            .get_or_init(|| Mutex::new(None))
+        let monotonic_now = self.clock.monotonic_millis();
+        let mut last_request = self
+            .limiter
+            .0
             .lock()
             .map_err(|_| io::Error::other("geocoding limiter lock poisoned"))?;
-        if last_request.is_some_and(|last| now < last.saturating_add(1)) {
+        if last_request.is_some_and(|last| monotonic_now < last.saturating_add(1000)) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Nominatim requests are limited to one per second",
             ));
         }
-        *last_request = Some(now);
+        *last_request = Some(monotonic_now);
         drop(last_request);
         let request = HttpRequest {
             url: format!(
@@ -611,9 +689,9 @@ fn format_coordinate(value: f64) -> String {
         .to_owned()
 }
 
-fn expires(headers: &BTreeMap<String, String>, now: u64) -> u64 {
+fn expires(headers: &BTreeMap<String, String>, now: u64) -> io::Result<u64> {
     let Some(value) = header(headers, "Expires") else {
-        return now.saturating_add(300);
+        return Ok(now.saturating_add(300));
     };
     value
         .parse()
@@ -623,7 +701,54 @@ fn expires(headers: &BTreeMap<String, String>, now: u64) -> u64 {
                 .ok()
                 .map(|time| time.timestamp().max(0) as u64)
         })
-        .unwrap_or(now.saturating_add(300))
+        .ok_or_else(|| invalid("MET Expires header is invalid"))
+        .and_then(|value| {
+            if value > now.saturating_add(7 * 24 * 60 * 60) {
+                Err(invalid(
+                    "MET Expires header is implausibly far in the future",
+                ))
+            } else {
+                Ok(value)
+            }
+        })
+}
+
+fn invalid_header_value(value: &str) -> bool {
+    value.is_empty() || value.len() > 1024 || value.chars().any(|character| character.is_control())
+}
+
+fn validate_met_cache(cache: &MetCache, now: u64) -> io::Result<()> {
+    if cache.location_key.len() > 64
+        || cache
+            .location_key
+            .split_once(',')
+            .and_then(|(lat, lon)| Some((lat.parse::<f64>().ok()?, lon.parse::<f64>().ok()?)))
+            .is_none()
+    {
+        return Err(invalid("MET cache location key is invalid"));
+    }
+    if cache.expires_at > now.saturating_add(7 * 24 * 60 * 60)
+        || cache
+            .last_modified
+            .as_deref()
+            .is_some_and(invalid_header_value)
+    {
+        return Err(invalid("MET cache metadata is invalid"));
+    }
+    if cache.forecast.len() > 512 {
+        return Err(invalid("MET cache has too many forecast points"));
+    }
+    for point in &cache.forecast {
+        if DateTime::parse_from_rfc3339(&point.at).is_err()
+            || !point.temperature_c.is_finite()
+            || point.symbol.is_empty()
+            || point.symbol.len() > 128
+            || point.symbol.chars().any(char::is_control)
+        {
+            return Err(invalid("MET cache forecast is invalid"));
+        }
+    }
+    Ok(())
 }
 
 fn header<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Option<&'a str> {

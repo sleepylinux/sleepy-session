@@ -178,10 +178,7 @@ fn confirms(command: &DaemonCommand, event: &OverviewEvent, expected_output: Opt
                 window_id: actual,
                 ..
             },
-        ) => {
-            actual == &Some(*window_id)
-                && expected_output.is_none_or(|expected| expected == output_id)
-        }
+        ) => actual == &Some(*window_id) && !output_id.is_empty(),
         (
             DaemonCommand::CloseWindow { window_id },
             OverviewEvent::WindowClosed {

@@ -8,10 +8,12 @@ use std::{
 use sleepy_sdk::{CacheStatus, DaemonCommand, ProviderStatus, WeatherLocation};
 use sleepy_session::{
     calendar::IcsCalendarProvider,
+    daily::{DailyBackend, DailyOperation, DailyResponse, DailySocket, DailyStatus},
     launcher::{DesktopEntryIndex, LaunchResources, LauncherMetrics},
     overview::{NiriOverview, OverviewEvent, OverviewEventSource, OverviewRunner},
     weather::{
         HttpRequest, HttpResponse, HttpTransport, ManualClock, MetNoProvider, NominatimProvider,
+        NominatimRateLimiter,
     },
 };
 use tempfile::tempdir;
@@ -276,6 +278,62 @@ fn overview_confirms_close_and_workspace_only_on_fresh_matching_output() {
 }
 
 #[test]
+fn focus_window_can_confirm_on_the_windows_actual_new_output() {
+    let events = FakeOverviewEvents(Mutex::new(VecDeque::from([OverviewEvent::FocusChanged {
+        output_id: "DP-2".into(),
+        window_id: Some(42),
+        workspace_id: 9,
+        sequence: 2,
+    }])));
+    let mut overview = NiriOverview::new(
+        FakeOverviewRunner::default(),
+        events,
+        Duration::from_millis(10),
+    );
+    overview.observe(OverviewEvent::FocusChanged {
+        output_id: "DP-1".into(),
+        window_id: Some(1),
+        workspace_id: 1,
+        sequence: 1,
+    });
+    match overview
+        .execute(DaemonCommand::FocusWindow { window_id: 42 })
+        .unwrap()
+    {
+        OverviewEvent::FocusChanged { output_id, .. } => assert_eq!(output_id, "DP-2"),
+        _ => panic!("unexpected confirmation"),
+    }
+}
+
+#[test]
+fn launcher_bounds_resource_and_directory_amplification() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("safe.desktop"),
+        entry("Safe", "safe %F", ""),
+    )
+    .unwrap();
+    let index = DesktopEntryIndex::scan(&[root.path().into()], &[], |_| true).unwrap();
+    assert!(index
+        .launch_argv(
+            "safe.desktop",
+            None,
+            &LaunchResources {
+                files: vec!["x".into(); 257],
+                urls: vec![]
+            }
+        )
+        .is_err());
+    let deep = tempdir().unwrap();
+    let mut path = deep.path().to_owned();
+    for _ in 0..34 {
+        path.push("d");
+        fs::create_dir(&path).unwrap();
+    }
+    assert!(DesktopEntryIndex::scan(&[deep.path().into()], &[], |_| true).is_err());
+}
+
+#[test]
 fn ics_expands_recurrence_exclusions_and_isolates_bad_sources() {
     let root = tempdir().unwrap();
     fs::write(
@@ -324,6 +382,28 @@ fn ics_rejects_unbounded_expansion_without_hiding_other_sources() {
     .unwrap();
     assert_eq!(snapshot.events.len(), 1);
     assert_eq!(snapshot.source_errors.len(), 1);
+}
+
+#[test]
+fn ics_recurs_at_local_civil_time_across_dst() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("dst.ics"), "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:dst\nSUMMARY:DST\nDTSTART;TZID=Europe/Prague:20261024T090000\nDTEND;TZID=Europe/Prague:20261024T093000\nRRULE:FREQ=DAILY;COUNT=3\nEND:VEVENT\nEND:VCALENDAR\n").unwrap();
+    let snapshot = IcsCalendarProvider::new(vec![root.path().join("dst.ics")], 8)
+        .snapshot("2026-10-23T00:00:00Z", "2026-10-28T00:00:00Z")
+        .unwrap();
+    let starts = snapshot
+        .events
+        .iter()
+        .map(|event| event.starts_at.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        starts,
+        [
+            "2026-10-24T07:00:00Z",
+            "2026-10-25T08:00:00Z",
+            "2026-10-26T08:00:00Z"
+        ]
+    );
 }
 
 #[derive(Clone, Default)]
@@ -543,12 +623,13 @@ fn nominatim_requires_submit_rate_limits_caches_and_attributes() {
         r#"[{"place_id":123,"display_name":"Prague, Czechia","lat":"50.08","lon":"14.44","type":"city"}]"#,
     ));
     let clock = ManualClock::new(10);
-    let provider = NominatimProvider::new(
+    let provider = NominatimProvider::new_with_limiter(
         "https://nominatim.openstreetmap.org/search",
         "Sleepy/3 contact@example.test",
         root.path().join("geo.json"),
         http.clone(),
         clock.clone(),
+        NominatimRateLimiter::isolated(),
     )
     .unwrap();
     assert!(provider.autocomplete("Pra").is_err());
@@ -569,6 +650,100 @@ fn nominatim_requires_submit_rate_limits_caches_and_attributes() {
     );
 }
 
+#[test]
+fn nominatim_rate_limit_is_shared_across_instances_on_monotonic_time() {
+    let root = tempdir().unwrap();
+    let clock = ManualClock::new(1_000_000);
+    let first_http = FakeHttp::default();
+    first_http
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(response(200, &[], "[]"));
+    let limiter = NominatimRateLimiter::isolated();
+    let first = NominatimProvider::new_with_limiter(
+        "https://example.test/search",
+        "Sleepy/3 ops@example.test",
+        root.path().join("a.json"),
+        first_http,
+        clock.clone(),
+        Arc::clone(&limiter),
+    )
+    .unwrap();
+    let second = NominatimProvider::new_with_limiter(
+        "https://example.test/search",
+        "Sleepy/3 ops@example.test",
+        root.path().join("b.json"),
+        FakeHttp::default(),
+        clock,
+        limiter,
+    )
+    .unwrap();
+    first.submit("First place").unwrap();
+    assert_eq!(
+        second.submit("Second place").unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn met_cache_rejects_header_injection_and_implausible_expiry() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempdir().unwrap();
+    let path = root.path().join("met.json");
+    fs::write(&path, r#"{"schemaVersion":1,"locationKey":"1,2","expiresAt":9999999999,"lastModified":"ok\nInjected: yes","forecast":[]}"#).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(MetNoProvider::new(
+        "https://example.test/compact",
+        "Sleepy/3 ops@example.test",
+        path,
+        FakeHttp::default(),
+        ManualClock::new(1)
+    )
+    .is_err());
+}
+
 fn entry(name: &str, exec: &str, extra: &str) -> String {
     format!("[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n{extra}")
+}
+
+struct FakeDaily;
+impl DailyBackend for FakeDaily {
+    fn handle(&self, operation: DailyOperation) -> io::Result<serde_json::Value> {
+        match operation {
+            DailyOperation::LauncherSearch { query } => Ok(serde_json::json!({"query": query})),
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "not configured")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn daily_socket_is_private_uid_checked_strict_and_reachable() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let root = tempdir().unwrap();
+    let path = root.path().join("sleepy/daily.sock");
+    let socket = Arc::new(
+        DailySocket::bind(&path, unsafe { libc::geteuid() }, Arc::new(FakeDaily))
+            .await
+            .unwrap(),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve().await });
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    write.write_all(b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"operation\":{\"type\":\"launcherSearch\",\"data\":{\"query\":\"term\"}}}\n").await.unwrap();
+    let mut lines = tokio::io::BufReader::new(read).lines();
+    let response: DailyResponse =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert!(matches!(response.status, DailyStatus::Confirmed));
+    socket
+        .shutdown_and_drain(Duration::from_secs(1))
+        .await
+        .unwrap();
+    task.await.unwrap().unwrap();
 }
