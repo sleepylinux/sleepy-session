@@ -30,6 +30,7 @@
           nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ];
           buildInputs = [ pkgs.dbus ];
           SLEEPY_DBUS_SESSION_CONF = "${pkgs.dbus}/share/dbus-1/session.conf";
+          TZDIR = "${pkgs.tzdata}/share/zoneinfo";
           passthru.sleepy-sdk-source = sleepy-sdk;
           meta.license = pkgs.lib.licenses.gpl3Only;
         } // pkgs.lib.optionalAttrs withNiriContract {
