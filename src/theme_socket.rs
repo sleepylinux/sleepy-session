@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,8 @@ use tokio::{
 use crate::{
     sessiond::private_socket::{NoopBindObserver, PrivateSocketEndpoint},
     sessiond::{private_socket::peer_uid, GenerationAuthority},
-    theme::{DesktopThemeSink, ThemeManager},
+    system::RunControl,
+    theme::{DesktopThemeSink, ThemeError, ThemeErrorKind, ThemeManager},
 };
 
 const MAX_LINE: usize = 256 * 1024;
@@ -103,6 +104,9 @@ pub enum ThemeStatus {
     Reconciled,
     Unavailable,
     Error,
+    Busy,
+    Timeout,
+    Cancelled,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +170,7 @@ pub struct ThemeSocket {
     serving: AtomicBool,
     stopped: tokio::sync::Notify,
     permits: Arc<tokio::sync::Semaphore>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ThemeSocket {
@@ -191,6 +196,7 @@ impl ThemeSocket {
             serving: AtomicBool::new(false),
             stopped: tokio::sync::Notify::new(),
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -212,6 +218,7 @@ impl ThemeSocket {
             let authority = self.authority.clone();
             let expected_uid = self.endpoint.expected_uid();
             let connection_shutdown = self.shutdown.subscribe();
+            let cancelled = Arc::clone(&self.cancelled);
             let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
                 drop(stream);
                 continue;
@@ -234,6 +241,7 @@ impl ThemeSocket {
                     manager,
                     authority,
                     connection_shutdown,
+                    cancelled,
                 )
                 .await
             }));
@@ -242,6 +250,7 @@ impl ThemeSocket {
 
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<usize> {
         let deadline = tokio::time::Instant::now() + timeout;
+        self.cancelled.store(true, Ordering::SeqCst);
         let _ = self.shutdown.send(());
         if self.serving.load(Ordering::Acquire) {
             tokio::time::timeout_at(deadline, async {
@@ -266,7 +275,7 @@ impl ThemeSocket {
                 .is_err()
             {
                 handle.abort();
-                let _ = handle.await;
+                let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
             }
         }
         Ok(count)
@@ -293,6 +302,7 @@ async fn serve_connection(
     manager: Arc<Mutex<ThemeManager>>,
     authority: GenerationAuthority,
     mut shutdown: broadcast::Receiver<()>,
+    cancelled: Arc<AtomicBool>,
 ) -> io::Result<()> {
     if peer_uid(&stream)? != expected_uid {
         return Err(io::Error::new(
@@ -317,24 +327,22 @@ async fn serve_connection(
         reader,
         writer: Arc::clone(&writer),
     };
+    let control = RunControl::for_request(Instant::now() + Duration::from_secs(2), cancelled);
     let mut manager = manager.lock().await;
     if request.operation.is_mutation() && manager.has_journal().map_err(other)? {
-        let response = match manager.reconcile(&sink, &authority).await {
-            Ok(true) => result(
+        let response = match manager
+            .reconcile_controlled(&sink, &authority, &control)
+            .await
+        {
+            Ok(outcome) if outcome.reconciled => result(
                 &request.request_id,
                 ThemeStatus::Reconciled,
-                None,
+                outcome.generation,
                 Some(manager.current().map_err(other)?),
                 None,
             ),
-            Ok(false) => unreachable!("journal presence was checked under the manager lock"),
-            Err(error) => result(
-                &request.request_id,
-                ThemeStatus::Unavailable,
-                None,
-                None,
-                Some(error.to_string()),
-            ),
+            Ok(_) => unreachable!("journal presence was checked under the manager lock"),
+            Err(error) => error_result(&request.request_id, error),
         };
         return write_message(&writer, &response).await;
     }
@@ -355,24 +363,8 @@ async fn serve_connection(
                 Some(error.to_string()),
             ),
         },
-        ThemeOperation::Import { document } => match manager.import(&document) {
-            Ok(theme) => result(
-                &request.request_id,
-                ThemeStatus::Confirmed,
-                None,
-                Some(theme),
-                None,
-            ),
-            Err(error) => result(
-                &request.request_id,
-                ThemeStatus::Error,
-                None,
-                None,
-                Some(error.to_string()),
-            ),
-        },
-        ThemeOperation::CopyForEdit { theme_id, name } => {
-            match manager.copy_for_edit(&theme_id, &name) {
+        ThemeOperation::Import { document } => {
+            match manager.import_async_controlled(&document, &control).await {
                 Ok(theme) => result(
                     &request.request_id,
                     ThemeStatus::Confirmed,
@@ -380,41 +372,47 @@ async fn serve_connection(
                     Some(theme),
                     None,
                 ),
-                Err(error) => result(
-                    &request.request_id,
-                    ThemeStatus::Error,
-                    None,
-                    None,
-                    Some(error.to_string()),
-                ),
+                Err(error) => error_result(&request.request_id, error),
             }
         }
-        ThemeOperation::Delete { theme_id } => match manager.delete(&theme_id) {
-            Ok(()) => result(
-                &request.request_id,
-                ThemeStatus::Confirmed,
-                None,
-                None,
-                None,
-            ),
-            Err(error) => result(
-                &request.request_id,
-                ThemeStatus::Error,
-                None,
-                None,
-                Some(error.to_string()),
-            ),
-        },
+        ThemeOperation::CopyForEdit { theme_id, name } => {
+            match manager
+                .copy_for_edit_async_controlled(&theme_id, &name, &control)
+                .await
+            {
+                Ok(theme) => result(
+                    &request.request_id,
+                    ThemeStatus::Confirmed,
+                    None,
+                    Some(theme),
+                    None,
+                ),
+                Err(error) => error_result(&request.request_id, error),
+            }
+        }
+        ThemeOperation::Delete { theme_id } => {
+            match manager.delete_async_controlled(&theme_id, &control).await {
+                Ok(()) => result(
+                    &request.request_id,
+                    ThemeStatus::Confirmed,
+                    None,
+                    None,
+                    None,
+                ),
+                Err(error) => error_result(&request.request_id, error),
+            }
+        }
         ThemeOperation::Apply {
             theme_id,
             expected_generation,
         } => match manager
-            .apply(
+            .apply_controlled(
                 &theme_id,
                 &request.request_id,
                 expected_generation,
                 &sink,
                 &authority,
+                &control,
             )
             .await
         {
@@ -425,13 +423,7 @@ async fn serve_connection(
                 Some(applied.theme),
                 None,
             ),
-            Err(error) => result(
-                &request.request_id,
-                ThemeStatus::Unavailable,
-                None,
-                None,
-                Some(error.to_string()),
-            ),
+            Err(error) => error_result(&request.request_id, error),
         },
     };
     write_message(&writer, &response).await
@@ -498,6 +490,16 @@ fn result(
         theme,
         error,
     }
+}
+
+fn error_result(request_id: &str, error: ThemeError) -> ThemeMessage {
+    let status = match error.kind() {
+        ThemeErrorKind::Busy => ThemeStatus::Busy,
+        ThemeErrorKind::Timeout => ThemeStatus::Timeout,
+        ThemeErrorKind::Cancelled => ThemeStatus::Cancelled,
+        ThemeErrorKind::Other => ThemeStatus::Error,
+    };
+    result(request_id, status, None, None, Some(error.to_string()))
 }
 
 async fn read_line(reader: &Reader) -> io::Result<Vec<u8>> {

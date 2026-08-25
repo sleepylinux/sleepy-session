@@ -124,6 +124,14 @@ async fn run() -> io::Result<()> {
         }
     };
     let mut cleanup_error = None;
+    if let Err(error) = theme_socket
+        // Theme mutations can publish through the shared generation authority.
+        // Cancel and join them before the terminal lifecycle barrier.
+        .shutdown_and_drain(std::time::Duration::from_secs(2))
+        .await
+    {
+        cleanup_error = Some(error);
+    }
     if let Err(error) = sources
         // Stop producers before the lifecycle reconciliation barrier so no
         // capability event can overtake Stopping/Reconciled on shutdown.
@@ -148,12 +156,6 @@ async fn run() -> io::Result<()> {
         cleanup_error.get_or_insert(error);
     }
     if let Err(error) = daily_socket
-        .shutdown_and_drain(std::time::Duration::from_secs(2))
-        .await
-    {
-        cleanup_error.get_or_insert(error);
-    }
-    if let Err(error) = theme_socket
         .shutdown_and_drain(std::time::Duration::from_secs(2))
         .await
     {

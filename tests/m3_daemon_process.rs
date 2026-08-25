@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use fs2::FileExt;
 use sleepy_sdk::{
     validate_event_envelope, EventCauseKind, LifecycleEvent, LifecycleState, OsdKind, SessionEvent,
 };
@@ -130,17 +131,40 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let replay = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
     assert!(matches!(replay.payload, SessionEvent::FullSnapshot(_)));
 
+    let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
+    theme
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    theme
+        .write_all(
+            format!(
+                "{{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{{\"type\":\"apply\",\"data\":{{\"themeId\":\"builtin.sleepy-light\",\"expectedGeneration\":{}}}}}}}\n",
+                replay.generation
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut theme_lines = BufReader::new(theme).lines();
+    assert!(matches!(
+        serde_json::from_str::<ThemeMessage>(&theme_lines.next().unwrap().unwrap()).unwrap(),
+        ThemeMessage::Candidate { .. }
+    ));
+
     let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);
 
-    let stopping = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
+    let stopping = loop {
+        let event = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
+        if matches!(
+            event.payload,
+            SessionEvent::Lifecycle(LifecycleEvent {
+                state: LifecycleState::Stopping
+            })
+        ) {
+            break event;
+        }
+    };
     let reconciled = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
-    assert!(matches!(
-        stopping.payload,
-        SessionEvent::Lifecycle(LifecycleEvent {
-            state: LifecycleState::Stopping
-        })
-    ));
     assert!(matches!(
         reconciled.payload,
         SessionEvent::Lifecycle(LifecycleEvent {
@@ -149,6 +173,10 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     ));
     assert!(stopping.generation > replay.generation);
     assert!(reconciled.generation > stopping.generation);
+    assert!(
+        lines.next().is_none(),
+        "no event may follow lifecycle Reconciled"
+    );
 
     let status = daemon.0.take().unwrap().wait().unwrap();
     assert!(status.success());
@@ -156,6 +184,61 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     assert!(!osd_socket.exists());
     assert!(!theme_socket.exists());
     assert!(watcher.wait().unwrap().success());
+}
+
+#[test]
+fn externally_held_theme_lock_does_not_block_daemon_shutdown() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut daemon = ChildGuard(Some(daemon));
+    let socket = runtime.join("sleepy/theme.sock");
+    wait_for_path(&socket, Duration::from_secs(2));
+    let lock_path = state.join("sleepy/themes/apply.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    lock.lock_exclusive().unwrap();
+    let mut theme = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    theme
+        .write_all(b"{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{\"type\":\"delete\",\"data\":{\"themeId\":\"builtin.sleepy-light\"}}}\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(40));
+    let mut child = daemon.0.take().unwrap();
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(started.elapsed() < Duration::from_secs(3));
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    assert!(!socket.exists());
 }
 
 #[test]

@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{fs, sync::Mutex, time::Duration};
+use std::{
+    fs::{self, OpenOptions},
+    sync::{atomic::AtomicBool, Arc, Mutex},
+    time::{Duration, Instant},
+};
 
-use sleepy_sdk::{ThemeAppearance, ThemeDocument, ThemeEffects, ThemeOrigin};
+use fs2::FileExt;
+use sleepy_sdk::{SessionEvent, ThemeAppearance, ThemeDocument, ThemeEffects, ThemeOrigin};
 use sleepy_session::{
     sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
+    system::RunControl,
     theme::{
         derive_wallpaper_palette, ColorSchemePortal, DesktopThemeSink, EffectsPolicy,
-        PortalColorScheme, ThemeApplyStage, ThemeManager, ThemeTransactionObserver,
+        PortalColorScheme, ThemeApplyStage, ThemeErrorKind, ThemeManager, ThemeTransactionObserver,
     },
 };
 use tempfile::TempDir;
@@ -506,6 +512,40 @@ async fn one_interprocess_lock_serializes_delete_and_import_against_apply() {
 }
 
 #[tokio::test]
+async fn externally_held_interprocess_lock_returns_typed_timeout_without_blocking_runtime() {
+    let temp = TempDir::new().unwrap();
+    let mut store = manager(&temp);
+    let lock_path = temp.path().join("state/sleepy/themes/apply.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let control = RunControl::for_request(
+        Instant::now() + Duration::from_millis(40),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let started = Instant::now();
+    let error = store
+        .apply_controlled(
+            "builtin.sleepy-light",
+            "d78951f8-c6f5-4f7d-8599-d72ed0b34803",
+            0,
+            &RecordingSink::default(),
+            &authority(&temp),
+            &control,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ThemeErrorKind::Timeout);
+    assert!(started.elapsed() < Duration::from_millis(200));
+    assert!(!store.has_journal().unwrap());
+}
+
+#[tokio::test]
 async fn startup_reconciliation_rolls_back_crashed_candidate() {
     let temp = TempDir::new().unwrap();
     let mut store = manager(&temp);
@@ -517,6 +557,35 @@ async fn startup_reconciliation_rolls_back_crashed_candidate() {
     store.reconcile(&sink, &authority(&temp)).await.unwrap();
     assert_eq!(store.current().unwrap().id, "builtin.sleepy-dark");
     assert!(!store.has_journal().unwrap());
+}
+
+#[tokio::test]
+async fn reconciliation_outcome_generation_matches_published_rollback_event_exactly() {
+    let temp = TempDir::new().unwrap();
+    let mut store = manager(&temp);
+    store
+        .seed_crash_journal_for_test("builtin.sleepy-light")
+        .unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let mut events = hub.subscribe().await;
+    let authority = GenerationAuthority::new(
+        GenerationAllocator::open(temp.path().join("generation-exact"), 16).unwrap(),
+        0,
+        hub,
+    );
+    let outcome = store
+        .reconcile(&RecordingSink::default(), &authority)
+        .await
+        .unwrap();
+    assert!(outcome.reconciled);
+    events.recv().await.unwrap();
+    let rollback = events.recv().await.unwrap();
+    assert_eq!(outcome.generation, Some(rollback.generation));
+    assert!(matches!(
+        rollback.payload,
+        SessionEvent::Theme(ref event)
+            if event.theme_id == "builtin.sleepy-dark" && event.applied
+    ));
 }
 
 #[test]

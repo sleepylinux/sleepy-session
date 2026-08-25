@@ -134,8 +134,9 @@ async fn pending_restart_journal_reconciles_before_new_apply_is_accepted() {
         line(&mut read).await,
         ThemeMessage::Result {
             status: ThemeStatus::Reconciled,
+            generation: Some(generation),
             ..
-        }
+        } if generation > 1
     ));
     socket
         .shutdown_and_drain(Duration::from_secs(1))
@@ -172,7 +173,7 @@ async fn acknowledgement_timeout_is_bounded_and_preserves_recoverable_journal() 
     assert!(matches!(
         line(&mut read).await,
         ThemeMessage::Result {
-            status: ThemeStatus::Unavailable,
+            status: ThemeStatus::Timeout,
             ..
         }
     ));

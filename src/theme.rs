@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
-    collections::BTreeMap, ffi::OsStr, fmt, future::Future, io, path::Path, pin::Pin,
-    time::Duration,
+    collections::BTreeMap,
+    ffi::OsStr,
+    fmt,
+    future::Future,
+    io,
+    path::Path,
+    pin::Pin,
+    sync::{atomic::AtomicBool, Arc},
+    time::{Duration, Instant},
 };
 
 use fs2::FileExt;
@@ -15,23 +22,49 @@ use sleepy_sdk::{
 use crate::{
     sessiond::{GenerationAuthority, GenerationGuard},
     store::{SecureDir, StoreError},
+    system::RunControl,
 };
 
 const CURRENT: &str = "current.json";
 const JOURNAL: &str = "apply-journal.json";
 
 #[derive(Debug)]
-pub struct ThemeError(String);
+pub struct ThemeError {
+    kind: ThemeErrorKind,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeErrorKind {
+    Busy,
+    Timeout,
+    Cancelled,
+    Other,
+}
 
 impl ThemeError {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            kind: ThemeErrorKind::Other,
+            message: message.into(),
+        }
+    }
+
+    fn controlled(kind: ThemeErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> ThemeErrorKind {
+        self.kind
     }
 }
 
 impl fmt::Display for ThemeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -91,6 +124,12 @@ pub struct AppliedTheme {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeReconciliationOutcome {
+    pub reconciled: bool,
+    pub generation: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApplyJournal {
@@ -98,6 +137,13 @@ struct ApplyJournal {
     request_id: String,
     previous: ThemeDocument,
     candidate: ThemeDocument,
+}
+
+#[derive(Clone, Copy)]
+struct ApplyRequest<'a> {
+    theme_id: &'a str,
+    request_id: &'a str,
+    expected_generation: u64,
 }
 
 pub struct ThemeManager {
@@ -185,19 +231,66 @@ impl ThemeManager {
     }
 
     pub fn import(&self, input: &str) -> Result<ThemeDocument, ThemeError> {
-        let lock = self.mutation_lock("theme import")?;
+        self.import_controlled(input, &default_control())
+    }
+
+    pub fn import_controlled(
+        &self,
+        input: &str,
+        control: &RunControl,
+    ) -> Result<ThemeDocument, ThemeError> {
+        let lock = self.mutation_lock_blocking("theme import", control)?;
+        let result = self.import_unlocked(input);
+        drop(lock);
+        result
+    }
+
+    pub async fn import_async_controlled(
+        &self,
+        input: &str,
+        control: &RunControl,
+    ) -> Result<ThemeDocument, ThemeError> {
+        let _lock = self.mutation_lock_async("theme import", control).await?;
+        self.import_unlocked(input)
+    }
+
+    fn import_unlocked(&self, input: &str) -> Result<ThemeDocument, ThemeError> {
         let mut document =
             validate_theme_document(input).map_err(|error| ThemeError::new(error.to_string()))?;
         document.id = uuid::Uuid::new_v4().to_string();
         document.origin = ThemeOrigin::User;
         validate_document(&document)?;
         self.write_user(&document)?;
-        drop(lock);
         Ok(document)
     }
 
     pub fn copy_for_edit(&self, id: &str, name: &str) -> Result<ThemeDocument, ThemeError> {
-        let lock = self.mutation_lock("theme copy")?;
+        self.copy_for_edit_controlled(id, name, &default_control())
+    }
+
+    pub fn copy_for_edit_controlled(
+        &self,
+        id: &str,
+        name: &str,
+        control: &RunControl,
+    ) -> Result<ThemeDocument, ThemeError> {
+        let lock = self.mutation_lock_blocking("theme copy", control)?;
+        let result = self.copy_for_edit_unlocked(id, name);
+        drop(lock);
+        result
+    }
+
+    pub async fn copy_for_edit_async_controlled(
+        &self,
+        id: &str,
+        name: &str,
+        control: &RunControl,
+    ) -> Result<ThemeDocument, ThemeError> {
+        let _lock = self.mutation_lock_async("theme copy", control).await?;
+        self.copy_for_edit_unlocked(id, name)
+    }
+
+    fn copy_for_edit_unlocked(&self, id: &str, name: &str) -> Result<ThemeDocument, ThemeError> {
         if name.trim().is_empty() {
             return Err(ThemeError::new("theme name must not be empty"));
         }
@@ -207,12 +300,30 @@ impl ThemeManager {
         copy.origin = ThemeOrigin::User;
         validate_document(&copy)?;
         self.write_user(&copy)?;
-        drop(lock);
         Ok(copy)
     }
 
     pub fn delete(&self, id: &str) -> Result<(), ThemeError> {
-        let lock = self.mutation_lock("theme delete")?;
+        self.delete_controlled(id, &default_control())
+    }
+
+    pub fn delete_controlled(&self, id: &str, control: &RunControl) -> Result<(), ThemeError> {
+        let lock = self.mutation_lock_blocking("theme delete", control)?;
+        let result = self.delete_unlocked(id);
+        drop(lock);
+        result
+    }
+
+    pub async fn delete_async_controlled(
+        &self,
+        id: &str,
+        control: &RunControl,
+    ) -> Result<(), ThemeError> {
+        let _lock = self.mutation_lock_async("theme delete", control).await?;
+        self.delete_unlocked(id)
+    }
+
+    fn delete_unlocked(&self, id: &str) -> Result<(), ThemeError> {
         if Self::builtin(id).is_some() {
             return Err(ThemeError::new("built-in themes are immutable"));
         }
@@ -222,7 +333,6 @@ impl ThemeManager {
         self.documents
             .remove_file(OsStr::new(&theme_file_name(id)?))?;
         self.documents.sync()?;
-        drop(lock);
         Ok(())
     }
 
@@ -247,12 +357,36 @@ impl ThemeManager {
         sink: &dyn DesktopThemeSink,
         authority: &GenerationAuthority,
     ) -> Result<AppliedTheme, ThemeError> {
-        self.apply_observed(
+        let control = default_control();
+        self.apply_controlled(
             theme_id,
             request_id,
             expected_generation,
             sink,
             authority,
+            &control,
+        )
+        .await
+    }
+
+    pub async fn apply_controlled(
+        &mut self,
+        theme_id: &str,
+        request_id: &str,
+        expected_generation: u64,
+        sink: &dyn DesktopThemeSink,
+        authority: &GenerationAuthority,
+        control: &RunControl,
+    ) -> Result<AppliedTheme, ThemeError> {
+        self.apply_transaction(
+            ApplyRequest {
+                theme_id,
+                request_id,
+                expected_generation,
+            },
+            sink,
+            authority,
+            control,
             &mut NoopObserver,
         )
         .await
@@ -267,8 +401,33 @@ impl ThemeManager {
         authority: &GenerationAuthority,
         observer: &mut dyn ThemeTransactionObserver,
     ) -> Result<AppliedTheme, ThemeError> {
-        let _lock = self.mutation_lock("theme transaction")?;
-        uuid::Uuid::parse_str(request_id)
+        let control = default_control();
+        self.apply_transaction(
+            ApplyRequest {
+                theme_id,
+                request_id,
+                expected_generation,
+            },
+            sink,
+            authority,
+            &control,
+            observer,
+        )
+        .await
+    }
+
+    async fn apply_transaction(
+        &mut self,
+        request: ApplyRequest<'_>,
+        sink: &dyn DesktopThemeSink,
+        authority: &GenerationAuthority,
+        control: &RunControl,
+        observer: &mut dyn ThemeTransactionObserver,
+    ) -> Result<AppliedTheme, ThemeError> {
+        let _lock = self
+            .mutation_lock_async("theme transaction", control)
+            .await?;
+        uuid::Uuid::parse_str(request.request_id)
             .map_err(|_| ThemeError::new("request id must be a UUID"))?;
         if self.has_journal()? {
             return Err(ThemeError::new(
@@ -276,17 +435,18 @@ impl ThemeManager {
             ));
         }
         let mut generation = authority.lock().await;
-        if generation.current_generation() != expected_generation {
+        if generation.current_generation() != request.expected_generation {
             return Err(ThemeError::new(format!(
-                "stale theme generation: expected {expected_generation}, current {}",
+                "stale theme generation: expected {}, current {}",
+                request.expected_generation,
                 generation.current_generation()
             )));
         }
-        let candidate = self.theme(theme_id)?;
+        let candidate = self.theme(request.theme_id)?;
         let previous = self.current()?;
         let journal = ApplyJournal {
             schema_version: 1,
-            request_id: request_id.to_owned(),
+            request_id: request.request_id.to_owned(),
             previous: previous.clone(),
             candidate: candidate.clone(),
         };
@@ -294,7 +454,14 @@ impl ThemeManager {
         self.atomic_state_write(JOURNAL, &journal_bytes)?;
 
         let outcome = self
-            .continue_apply(&candidate, request_id, sink, &mut generation, observer)
+            .continue_apply(
+                &candidate,
+                request.request_id,
+                sink,
+                &mut generation,
+                control,
+                observer,
+            )
             .await;
         match outcome {
             Ok(applied_generation) => {
@@ -308,16 +475,16 @@ impl ThemeManager {
                     };
                     let rollback = self
                         .rollback(
-                            &previous,
-                            request_id,
+                            &journal,
                             sink,
                             &mut generation,
+                            control,
                             observer,
                             &journal_bytes,
                         )
                         .await;
                     return match rollback {
-                        Ok(()) => match recovery_error {
+                        Ok(_) => match recovery_error {
                             Some(recovery) => Err(ThemeError::new(format!(
                                 "{cleanup_error}; cleanup recovery write failed before confirmed rollback: {recovery}"
                             ))),
@@ -337,19 +504,20 @@ impl ThemeManager {
             Err(error) => {
                 let rollback = self
                     .rollback(
-                        &previous,
-                        request_id,
+                        &journal,
                         sink,
                         &mut generation,
+                        control,
                         observer,
                         &journal_bytes,
                     )
                     .await;
                 match rollback {
-                    Ok(()) => Err(error),
-                    Err(rollback) => Err(ThemeError::new(format!(
-                        "{error}; confirmed rollback failed: {rollback}"
-                    ))),
+                    Ok(_) => Err(error),
+                    Err(rollback) => Err(ThemeError::controlled(
+                        error.kind(),
+                        format!("{error}; confirmed rollback failed: {rollback}"),
+                    )),
                 }
             }
         }
@@ -361,12 +529,14 @@ impl ThemeManager {
         request_id: &str,
         sink: &dyn DesktopThemeSink,
         generation: &mut GenerationGuard<'_>,
+        control: &RunControl,
         observer: &mut dyn ThemeTransactionObserver,
     ) -> Result<u64, ThemeError> {
         observe(observer, ThemeApplyStage::JournalWritten)?;
-        self.acknowledge(sink, candidate, "desktop acknowledgement")
+        self.acknowledge(sink, candidate, "desktop acknowledgement", control)
             .await?;
         observe(observer, ThemeApplyStage::DesktopAcknowledged)?;
+        ensure_active(control, "theme apply")?;
         let event = generation
             .publish(
                 EventCause {
@@ -387,26 +557,32 @@ impl ThemeManager {
 
     async fn rollback(
         &self,
-        previous: &ThemeDocument,
-        request_id: &str,
+        journal: &ApplyJournal,
         sink: &dyn DesktopThemeSink,
         generation: &mut GenerationGuard<'_>,
+        control: &RunControl,
         observer: &mut dyn ThemeTransactionObserver,
         journal_bytes: &[u8],
-    ) -> Result<(), ThemeError> {
-        self.acknowledge(sink, previous, "desktop rollback acknowledgement")
-            .await?;
+    ) -> Result<u64, ThemeError> {
+        self.acknowledge(
+            sink,
+            &journal.previous,
+            "desktop rollback acknowledgement",
+            control,
+        )
+        .await?;
         observe(observer, ThemeApplyStage::RollbackAcknowledged)?;
-        self.atomic_state_write(CURRENT, &document_bytes(previous)?)?;
+        ensure_active(control, "theme rollback")?;
+        self.atomic_state_write(CURRENT, &document_bytes(&journal.previous)?)?;
         observe(observer, ThemeApplyStage::RollbackWritten)?;
-        generation
+        let event = generation
             .publish(
                 EventCause {
                     kind: EventCauseKind::Request,
-                    request_id: Some(request_id.to_owned()),
+                    request_id: Some(journal.request_id.clone()),
                 },
                 SessionEvent::Theme(ThemeEvent {
-                    theme_id: previous.id.clone(),
+                    theme_id: journal.previous.id.clone(),
                     applied: true,
                 }),
             )
@@ -417,17 +593,32 @@ impl ThemeManager {
                 "rollback journal cleanup failed and was restored: {error}"
             )));
         }
-        Ok(())
+        Ok(event.generation)
     }
 
     pub async fn reconcile(
         &mut self,
         sink: &dyn DesktopThemeSink,
         authority: &GenerationAuthority,
-    ) -> Result<bool, ThemeError> {
-        let _lock = self.mutation_lock("theme reconciliation")?;
+    ) -> Result<ThemeReconciliationOutcome, ThemeError> {
+        let control = default_control();
+        self.reconcile_controlled(sink, authority, &control).await
+    }
+
+    pub async fn reconcile_controlled(
+        &mut self,
+        sink: &dyn DesktopThemeSink,
+        authority: &GenerationAuthority,
+        control: &RunControl,
+    ) -> Result<ThemeReconciliationOutcome, ThemeError> {
+        let _lock = self
+            .mutation_lock_async("theme reconciliation", control)
+            .await?;
         let Some(bytes) = self.state.read_optional(OsStr::new(JOURNAL))? else {
-            return Ok(false);
+            return Ok(ThemeReconciliationOutcome {
+                reconciled: false,
+                generation: None,
+            });
         };
         let journal: ApplyJournal = serde_json::from_slice(&bytes)?;
         if journal.schema_version != 1 {
@@ -436,17 +627,21 @@ impl ThemeManager {
         validate_document(&journal.previous)?;
         validate_document(&journal.candidate)?;
         let mut generation = authority.lock().await;
-        self.rollback(
-            &journal.previous,
-            &journal.request_id,
-            sink,
-            &mut generation,
-            &mut NoopObserver,
-            &bytes,
-        )
-        .await?;
+        let generation = self
+            .rollback(
+                &journal,
+                sink,
+                &mut generation,
+                control,
+                &mut NoopObserver,
+                &bytes,
+            )
+            .await?;
         self.preview = None;
-        Ok(true)
+        Ok(ThemeReconciliationOutcome {
+            reconciled: true,
+            generation: Some(generation),
+        })
     }
 
     pub fn has_journal(&self) -> Result<bool, ThemeError> {
@@ -470,7 +665,7 @@ impl ThemeManager {
 
     #[doc(hidden)]
     pub fn seed_crash_journal_for_test(&self, candidate_id: &str) -> Result<(), ThemeError> {
-        let lock = self.mutation_lock("theme test journal")?;
+        let lock = self.mutation_lock_blocking("theme test journal", &default_control())?;
         let journal = ApplyJournal {
             schema_version: 1,
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -505,19 +700,72 @@ impl ThemeManager {
         sink: &dyn DesktopThemeSink,
         theme: &ThemeDocument,
         operation: &str,
+        control: &RunControl,
     ) -> Result<(), ThemeError> {
-        match tokio::time::timeout(self.acknowledgement_timeout, sink.acknowledge(theme)).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(ThemeError::new(format!("{operation} failed: {error}"))),
-            Err(_) => Err(ThemeError::new(format!("{operation} timed out"))),
+        ensure_active(control, operation)?;
+        let timeout = self.acknowledgement_timeout.min(control.remaining());
+        if timeout.is_zero() {
+            return Err(ThemeError::controlled(
+                ThemeErrorKind::Timeout,
+                format!("{operation} timed out"),
+            ));
+        }
+        let acknowledgement = sink.acknowledge(theme);
+        tokio::pin!(acknowledgement);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            ensure_active(control, operation)?;
+            let tick = Duration::from_millis(5).min(control.remaining());
+            tokio::select! {
+                result = &mut acknowledgement => return result
+                    .map_err(|error| ThemeError::new(format!("{operation} failed: {error}"))),
+                _ = tokio::time::sleep_until(deadline) => return Err(ThemeError::controlled(
+                    ThemeErrorKind::Timeout,
+                    format!("{operation} timed out"),
+                )),
+                _ = tokio::time::sleep(tick) => {}
+            }
         }
     }
 
-    fn mutation_lock(&self, operation: &str) -> Result<std::fs::File, ThemeError> {
+    fn mutation_lock_blocking(
+        &self,
+        operation: &str,
+        control: &RunControl,
+    ) -> Result<std::fs::File, ThemeError> {
         let lock = self.state.open_lock(OsStr::new("apply.lock"))?;
-        lock.lock_exclusive()
-            .map_err(|error| ThemeError::new(format!("{operation} lock failed: {error}")))?;
-        Ok(lock)
+        loop {
+            ensure_active(control, operation)?;
+            match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => return Ok(lock),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5).min(control.remaining()));
+                }
+                Err(error) => {
+                    return Err(ThemeError::new(format!("{operation} lock failed: {error}")))
+                }
+            }
+        }
+    }
+
+    async fn mutation_lock_async(
+        &self,
+        operation: &str,
+        control: &RunControl,
+    ) -> Result<std::fs::File, ThemeError> {
+        let lock = self.state.open_lock(OsStr::new("apply.lock"))?;
+        loop {
+            ensure_active(control, operation)?;
+            match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => return Ok(lock),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5).min(control.remaining())).await;
+                }
+                Err(error) => {
+                    return Err(ThemeError::new(format!("{operation} lock failed: {error}")))
+                }
+            }
+        }
     }
 
     fn cleanup_journal(
@@ -530,6 +778,29 @@ impl ThemeManager {
         self.state.sync()?;
         observe(observer, ThemeApplyStage::JournalDirectorySynced)
     }
+}
+
+fn default_control() -> RunControl {
+    RunControl::for_request(
+        Instant::now() + Duration::from_secs(2),
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+fn ensure_active(control: &RunControl, operation: &str) -> Result<(), ThemeError> {
+    if control.is_cancelled() {
+        return Err(ThemeError::controlled(
+            ThemeErrorKind::Cancelled,
+            format!("{operation} was cancelled"),
+        ));
+    }
+    if control.remaining().is_zero() {
+        return Err(ThemeError::controlled(
+            ThemeErrorKind::Timeout,
+            format!("{operation} lock timed out"),
+        ));
+    }
+    Ok(())
 }
 
 fn observe(
