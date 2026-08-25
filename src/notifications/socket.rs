@@ -16,6 +16,8 @@ use std::{
 use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Mutex};
 
 const MAX_LINE: usize = 256 * 1024;
+const MAX_CONNECTIONS: usize = 16;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -98,6 +100,7 @@ pub struct NotificationSocket {
     actions: Option<NotificationActionDispatcher>,
     shutdown: tokio::sync::broadcast::Sender<()>,
     connections: Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
+    permits: Arc<tokio::sync::Semaphore>,
     serving: AtomicBool,
     stopped: tokio::sync::Notify,
 }
@@ -115,6 +118,7 @@ impl NotificationSocket {
             actions: None,
             shutdown,
             connections: Mutex::new(Vec::new()),
+            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
             serving: AtomicBool::new(false),
             stopped: tokio::sync::Notify::new(),
         })
@@ -156,7 +160,22 @@ impl NotificationSocket {
             let expected_uid = self.endpoint.expected_uid();
             let service = Arc::clone(&self.service);
             let actions = self.actions.clone();
-            self.connections.lock().await.push(tokio::spawn(async move {
+            let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
+            let mut connections = self.connections.lock().await;
+            let mut index = 0;
+            while index < connections.len() {
+                if connections[index].is_finished() {
+                    let finished = connections.remove(index);
+                    let _ = finished.await;
+                } else {
+                    index += 1;
+                }
+            }
+            connections.push(tokio::spawn(async move {
+                let _permit = permit;
                 serve(stream, expected_uid, service, actions).await
             }));
         }
@@ -333,8 +352,17 @@ async fn serve(
     })
     .map_err(invalid)?;
     response.push(b'\n');
-    write.write_all(&response).await?;
-    write.shutdown().await
+    tokio::time::timeout(WRITE_TIMEOUT, async {
+        write.write_all(&response).await?;
+        write.shutdown().await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "notification response write timed out",
+        )
+    })?
 }
 
 fn snapshot(service: &NotificationEventService) -> Data {

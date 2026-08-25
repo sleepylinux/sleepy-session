@@ -145,3 +145,163 @@ async fn notification_socket_rejects_oversize_unterminated_input_and_drains_conn
     );
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn notification_socket_reaps_completed_handlers_and_caps_concurrent_clients() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = NotificationStore::open(temp.path().join("notifications"), 500).unwrap();
+    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let mut allocator = GenerationAllocator::open(temp.path().join("generation"), 16).unwrap();
+    let generation = allocator.next_generation().unwrap();
+    let authority = GenerationAuthority::new(
+        allocator,
+        generation,
+        EventHub::new(full_snapshot_event(generation).unwrap(), 16),
+    );
+    let service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        provider, authority,
+    )));
+    let socket = Arc::new(
+        NotificationSocket::bind(
+            temp.path().join("notification.sock"),
+            unsafe { libc::geteuid() },
+            service,
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve().await });
+    for _ in 0..64 {
+        let mut client = tokio::net::UnixStream::connect(socket.path())
+            .await
+            .unwrap();
+        client.write_all(b"{}\n").await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+    }
+    assert!(
+        socket
+            .shutdown_and_drain(std::time::Duration::from_millis(500))
+            .await
+            .unwrap()
+            <= 1,
+        "completed notification handlers must be reaped during serving"
+    );
+    task.await.unwrap().unwrap();
+
+    let store = NotificationStore::open(temp.path().join("notifications-2"), 500).unwrap();
+    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let mut allocator = GenerationAllocator::open(temp.path().join("generation-2"), 16).unwrap();
+    let generation = allocator.next_generation().unwrap();
+    let authority = GenerationAuthority::new(
+        allocator,
+        generation,
+        EventHub::new(full_snapshot_event(generation).unwrap(), 16),
+    );
+    let service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        provider, authority,
+    )));
+    let socket = Arc::new(
+        NotificationSocket::bind(
+            temp.path().join("notification-2.sock"),
+            unsafe { libc::geteuid() },
+            service,
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve().await });
+    let mut clients = Vec::new();
+    for _ in 0..16 {
+        clients.push(
+            tokio::net::UnixStream::connect(socket.path())
+                .await
+                .unwrap(),
+        );
+    }
+    let mut rejected = tokio::net::UnixStream::connect(socket.path())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let mut closed = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            rejected.read(&mut closed)
+        )
+        .await
+        .expect("the seventeenth notification client must be rejected")
+        .unwrap(),
+        0
+    );
+    drop(clients);
+    socket
+        .shutdown_and_drain(std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn notification_socket_times_out_a_non_reading_response_peer() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = NotificationStore::open(temp.path().join("notifications"), 500).unwrap();
+    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let mut allocator = GenerationAllocator::open(temp.path().join("generation"), 32).unwrap();
+    let generation = allocator.next_generation().unwrap();
+    let authority = GenerationAuthority::new(
+        allocator,
+        generation,
+        EventHub::new(full_snapshot_event(generation).unwrap(), 32),
+    );
+    let service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        provider, authority,
+    )));
+    for index in 0..16 {
+        service
+            .lock()
+            .await
+            .notify(NotifyRequest {
+                origin: format!(":1.{index}"),
+                notification: NotificationDocument {
+                    schema_version: WIRE_SCHEMA_VERSION,
+                    id: 0,
+                    application_id: "org.example.Large".into(),
+                    summary: format!("Large {index}"),
+                    body: "x".repeat(48 * 1024),
+                    urgency: NotificationUrgency::Normal,
+                    created_at: "2026-08-24T21:00:00Z".into(),
+                    timeout_ms: None,
+                    read: false,
+                    archived: false,
+                    actions: Vec::new(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let socket = Arc::new(
+        NotificationSocket::bind(
+            temp.path().join("notification.sock"),
+            unsafe { libc::geteuid() },
+            service,
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve_one().await });
+    let mut client = tokio::net::UnixStream::connect(socket.path())
+        .await
+        .unwrap();
+    client.write_all(b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"operation\":{\"type\":\"snapshot\"}}\n").await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(1500), task)
+        .await
+        .expect("notification response write must have a deadline")
+        .unwrap();
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+}
