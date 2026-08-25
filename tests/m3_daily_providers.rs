@@ -10,10 +10,12 @@ use sleepy_session::{
     calendar::IcsCalendarProvider,
     daily::{DailyBackend, DailyOperation, DailyResponse, DailySocket, DailyStatus},
     launcher::{DesktopEntryIndex, LaunchResources, LauncherMetrics},
-    overview::{NiriOverview, OverviewEvent, OverviewEventSource, OverviewRunner},
+    overview::{
+        overview_event_channel, NiriOverview, OverviewEvent, OverviewEventSender,
+        OverviewEventSource, OverviewRunner,
+    },
     weather::{
         HttpRequest, HttpResponse, HttpTransport, ManualClock, MetNoProvider, NominatimProvider,
-        NominatimRateLimiter,
     },
 };
 use tempfile::tempdir;
@@ -303,6 +305,42 @@ fn focus_window_can_confirm_on_the_windows_actual_new_output() {
         OverviewEvent::FocusChanged { output_id, .. } => assert_eq!(output_id, "DP-2"),
         _ => panic!("unexpected confirmation"),
     }
+}
+
+#[derive(Clone)]
+struct PublishingOverviewRunner(OverviewEventSender);
+
+impl OverviewRunner for PublishingOverviewRunner {
+    fn run(&self, _program: &str, _args: &[String], _timeout: Duration) -> io::Result<()> {
+        self.0.publish(OverviewEvent::FocusChanged {
+            output_id: "DP-2".into(),
+            window_id: Some(42),
+            workspace_id: 9,
+            sequence: 2,
+        })
+    }
+}
+
+#[test]
+fn production_channel_requires_an_event_published_after_command_submission() {
+    let (sender, events) = overview_event_channel(8);
+    sender
+        .publish(OverviewEvent::FocusChanged {
+            output_id: "DP-1".into(),
+            window_id: Some(42),
+            workspace_id: 1,
+            sequence: 1,
+        })
+        .unwrap();
+    let mut overview = NiriOverview::new(
+        PublishingOverviewRunner(sender),
+        events,
+        Duration::from_millis(50),
+    );
+    let confirmed = overview
+        .execute(DaemonCommand::FocusWindow { window_id: 42 })
+        .unwrap();
+    assert_eq!(confirmed.sequence(), 2);
 }
 
 #[test]
@@ -623,13 +661,12 @@ fn nominatim_requires_submit_rate_limits_caches_and_attributes() {
         r#"[{"place_id":123,"display_name":"Prague, Czechia","lat":"50.08","lon":"14.44","type":"city"}]"#,
     ));
     let clock = ManualClock::new(10);
-    let provider = NominatimProvider::new_with_limiter(
+    let provider = NominatimProvider::new(
         "https://nominatim.openstreetmap.org/search",
         "Sleepy/3 contact@example.test",
         root.path().join("geo.json"),
         http.clone(),
         clock.clone(),
-        NominatimRateLimiter::isolated(),
     )
     .unwrap();
     assert!(provider.autocomplete("Pra").is_err());
@@ -651,42 +688,6 @@ fn nominatim_requires_submit_rate_limits_caches_and_attributes() {
 }
 
 #[test]
-fn nominatim_rate_limit_is_shared_across_instances_on_monotonic_time() {
-    let root = tempdir().unwrap();
-    let clock = ManualClock::new(1_000_000);
-    let first_http = FakeHttp::default();
-    first_http
-        .responses
-        .lock()
-        .unwrap()
-        .push_back(response(200, &[], "[]"));
-    let limiter = NominatimRateLimiter::isolated();
-    let first = NominatimProvider::new_with_limiter(
-        "https://example.test/search",
-        "Sleepy/3 ops@example.test",
-        root.path().join("a.json"),
-        first_http,
-        clock.clone(),
-        Arc::clone(&limiter),
-    )
-    .unwrap();
-    let second = NominatimProvider::new_with_limiter(
-        "https://example.test/search",
-        "Sleepy/3 ops@example.test",
-        root.path().join("b.json"),
-        FakeHttp::default(),
-        clock,
-        limiter,
-    )
-    .unwrap();
-    first.submit("First place").unwrap();
-    assert_eq!(
-        second.submit("Second place").unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
-}
-
-#[test]
 fn met_cache_rejects_header_injection_and_implausible_expiry() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempdir().unwrap();
@@ -703,17 +704,82 @@ fn met_cache_rejects_header_injection_and_implausible_expiry() {
     .is_err());
 }
 
+#[test]
+fn provider_caches_reject_noncanonical_sdk_values() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempdir().unwrap();
+    let met = root.path().join("met-invalid.json");
+    fs::write(&met, r#"{"schemaVersion":1,"locationKey":"91,2","expiresAt":2,"lastModified":null,"forecast":[{"at":"2026-08-25T14:00:00+02:00","temperatureC":18.0,"symbol":"clear"}]}"#).unwrap();
+    fs::set_permissions(&met, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(MetNoProvider::new(
+        "https://example.test/compact",
+        "Sleepy/3 ops@example.test",
+        met,
+        FakeHttp::default(),
+        ManualClock::new(1)
+    )
+    .is_err());
+
+    let geocode = root.path().join("geo-invalid.json");
+    fs::write(&geocode, r#"{"schemaVersion":1,"queries":{"prague":[{"displayName":"Prague","latitude":91.0,"longitude":14.4,"attribution":"wrong"}]}}"#).unwrap();
+    fs::set_permissions(&geocode, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(NominatimProvider::new(
+        "https://example.test/search",
+        "Sleepy/3 ops@example.test",
+        geocode,
+        FakeHttp::default(),
+        ManualClock::new(1)
+    )
+    .is_err());
+}
+
+#[test]
+fn calendar_rejects_aggregate_source_amplification() {
+    let sources = (0..1025)
+        .map(|index| std::path::PathBuf::from(format!("missing-{index}.ics")))
+        .collect();
+    assert!(IcsCalendarProvider::new(sources, 8)
+        .snapshot("2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z")
+        .is_err());
+}
+
 fn entry(name: &str, exec: &str, extra: &str) -> String {
     format!("[Desktop Entry]\nType=Application\nName={name}\nExec={exec}\n{extra}")
 }
 
 struct FakeDaily;
 impl DailyBackend for FakeDaily {
-    fn handle(&self, operation: DailyOperation) -> io::Result<serde_json::Value> {
+    fn handle_controlled(
+        &self,
+        operation: DailyOperation,
+        _control: &sleepy_session::system::RunControl,
+    ) -> io::Result<serde_json::Value> {
         match operation {
             DailyOperation::LauncherSearch { query } => Ok(serde_json::json!({"query": query})),
             _ => Err(io::Error::new(io::ErrorKind::Unsupported, "not configured")),
         }
+    }
+}
+
+struct ControlledDaily {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl DailyBackend for ControlledDaily {
+    fn handle_controlled(
+        &self,
+        _operation: DailyOperation,
+        control: &sleepy_session::system::RunControl,
+    ) -> io::Result<serde_json::Value> {
+        use std::sync::atomic::Ordering;
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(active, Ordering::SeqCst);
+        while !control.is_cancelled() && !control.remaining().is_zero() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
     }
 }
 
@@ -746,4 +812,64 @@ async fn daily_socket_is_private_uid_checked_strict_and_reachable() {
         .await
         .unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daily_socket_bounds_workers_keeps_runtime_responsive_and_joins_on_shutdown() {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+    let root = tempdir().unwrap();
+    let path = root.path().join("sleepy/daily.sock");
+    let backend = Arc::new(ControlledDaily {
+        active: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let socket = Arc::new(
+        DailySocket::bind_with_limits(
+            &path,
+            unsafe { libc::geteuid() },
+            Arc::clone(&backend),
+            2,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let serve = tokio::spawn(async move { serving.serve().await });
+    let request = b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"operation\":{\"type\":\"launcherSearch\",\"data\":{\"query\":\"term\"}}}\n";
+    let mut clients = Vec::new();
+    for _ in 0..12 {
+        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+        stream.write_all(request).await.unwrap();
+        clients.push(stream);
+    }
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while backend.active.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let progress_task = Arc::clone(&progress);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::spawn(async move {
+        progress_task.fetch_add(1, Ordering::SeqCst);
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.load(Ordering::SeqCst),
+        1,
+        "blocking work stalled Tokio"
+    );
+    socket
+        .shutdown_and_drain(Duration::from_secs(1))
+        .await
+        .unwrap();
+    serve.await.unwrap().unwrap();
+    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    assert!(backend.peak.load(Ordering::SeqCst) <= 2);
+    drop(clients);
 }

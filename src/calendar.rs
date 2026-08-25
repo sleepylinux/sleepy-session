@@ -13,6 +13,9 @@ use sleepy_sdk::{CalendarEvent, CalendarSnapshot, CalendarSourceError, WIRE_SCHE
 
 const MAX_ICS_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_UNFOLDED_LINES: usize = 65_536;
+const MAX_CALENDAR_SOURCES: usize = 1024;
+const MAX_TOTAL_EVENTS: usize = 8192;
+const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct IcsCalendarProvider {
     sources: Vec<PathBuf>,
@@ -28,6 +31,9 @@ impl IcsCalendarProvider {
     }
 
     pub fn snapshot(&self, window_start: &str, window_end: &str) -> io::Result<CalendarSnapshot> {
+        if self.sources.len() > MAX_CALENDAR_SOURCES {
+            return Err(invalid("calendar source count exceeded limit"));
+        }
         let start = parse_utc(window_start)?;
         let end = parse_utc(window_end)?;
         if start >= end {
@@ -45,7 +51,12 @@ impl IcsCalendarProvider {
                 .unwrap_or("unknown")
                 .to_owned();
             match parse_source(source, &source_id, start, end, self.max_occurrences) {
-                Ok(mut parsed) => events.append(&mut parsed),
+                Ok(mut parsed) => {
+                    if events.len().saturating_add(parsed.len()) > MAX_TOTAL_EVENTS {
+                        return Err(invalid("calendar aggregate event limit exceeded"));
+                    }
+                    events.append(&mut parsed)
+                }
                 Err(error) => source_errors.push(CalendarSourceError {
                     source_id,
                     message: error.to_string(),
@@ -57,14 +68,22 @@ impl IcsCalendarProvider {
                 .cmp(&right.starts_at)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        Ok(CalendarSnapshot {
+        let snapshot = CalendarSnapshot {
             schema_version: WIRE_SCHEMA_VERSION,
             provider_id: "local-ics".into(),
             window_start: window_start.into(),
             window_end: window_end.into(),
             events,
             source_errors,
-        })
+        };
+        if serde_json::to_vec(&snapshot)
+            .map_err(io::Error::other)?
+            .len()
+            > MAX_SNAPSHOT_BYTES
+        {
+            return Err(invalid("calendar serialized snapshot exceeded limit"));
+        }
+        Ok(snapshot)
     }
 }
 

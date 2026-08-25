@@ -25,6 +25,7 @@ use tokio::{
 };
 
 use crate::{
+    overview::{OverviewEvent, OverviewEventSender},
     sessiond::GenerationAuthority,
     system::{ProcessCommandRunner, SystemFacade},
 };
@@ -75,6 +76,20 @@ pub struct ProductionSources {
 
 impl ProductionSources {
     pub fn start(authority: GenerationAuthority) -> Self {
+        Self::start_inner(authority, None)
+    }
+
+    pub fn start_with_overview(
+        authority: GenerationAuthority,
+        overview_events: OverviewEventSender,
+    ) -> Self {
+        Self::start_inner(authority, Some(overview_events))
+    }
+
+    fn start_inner(
+        authority: GenerationAuthority,
+        overview_events: Option<OverviewEventSender>,
+    ) -> Self {
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let facade = SystemFacade::new(ProcessCommandRunner);
         let focused_output = Arc::new(RwLock::new(None::<String>));
@@ -111,6 +126,7 @@ impl ProductionSources {
         tasks.push(tokio::spawn(run_niri_source(
             authority.clone(),
             focused_output,
+            overview_events,
             shutdown_receiver.clone(),
         )));
 
@@ -346,8 +362,12 @@ async fn run_process_event_source(
 async fn run_niri_source(
     authority: GenerationAuthority,
     focused_output: Arc<RwLock<Option<String>>>,
+    overview_events: Option<OverviewEventSender>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
+    let mut sequence = 0_u64;
+    let mut focused_workspace = 0_u64;
+    let mut focused_window = None;
     'supervisor: loop {
         if *shutdown.borrow() {
             return Ok(());
@@ -356,6 +376,10 @@ async fn run_niri_source(
             Ok(child) => child,
             Err(error) => {
                 clear_focus(&focused_output)?;
+                if let Some(sender) = &overview_events {
+                    sequence = sequence.saturating_add(1);
+                    sender.publish(OverviewEvent::Offline { sequence })?;
+                }
                 publish_degraded(
                     &authority,
                     RuntimeCapabilityId::Niri,
@@ -388,50 +412,67 @@ async fn run_niri_source(
                 read = read_bounded_line(&mut lines) => read,
             };
             match read {
-                Ok(Some(line)) => match parse_niri_event(&line, &mut workspaces) {
-                    Ok(Some(output)) => {
-                        *focused_output
-                            .write()
-                            .map_err(|_| io::Error::other("Niri focus cache was poisoned"))? =
-                            Some(output.clone());
-                        publish(
-                            &authority,
-                            SessionEvent::Niri(NiriEvent {
-                                focused_output_id: Some(output),
-                            }),
-                        )
-                        .await?;
-                        publish(
-                            &authority,
-                            SessionEvent::CapabilityUpdate(niri_record(&workspaces)),
-                        )
-                        .await?;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        stop_child(&mut child).await;
-                        clear_focus(&focused_output)?;
-                        publish(
-                            &authority,
-                            SessionEvent::Niri(NiriEvent {
-                                focused_output_id: None,
-                            }),
-                        )
-                        .await?;
-                        publish_degraded(
-                            &authority,
-                            RuntimeCapabilityId::Niri,
-                            io::ErrorKind::InvalidData,
-                            &error.to_string(),
-                        )
-                        .await?;
-                        if wait_backoff(&mut shutdown).await {
-                            return Ok(());
+                Ok(Some(line)) => {
+                    if let Some(sender) = &overview_events {
+                        if let Some(event) = parse_overview_event(
+                            &line,
+                            &workspaces,
+                            &mut sequence,
+                            &mut focused_workspace,
+                            &mut focused_window,
+                        )? {
+                            sender.publish(event)?;
                         }
-                        continue 'supervisor;
                     }
-                },
+                    match parse_niri_event(&line, &mut workspaces) {
+                        Ok(Some(output)) => {
+                            *focused_output
+                                .write()
+                                .map_err(|_| io::Error::other("Niri focus cache was poisoned"))? =
+                                Some(output.clone());
+                            publish(
+                                &authority,
+                                SessionEvent::Niri(NiriEvent {
+                                    focused_output_id: Some(output),
+                                }),
+                            )
+                            .await?;
+                            publish(
+                                &authority,
+                                SessionEvent::CapabilityUpdate(niri_record(&workspaces)),
+                            )
+                            .await?;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            stop_child(&mut child).await;
+                            clear_focus(&focused_output)?;
+                            publish(
+                                &authority,
+                                SessionEvent::Niri(NiriEvent {
+                                    focused_output_id: None,
+                                }),
+                            )
+                            .await?;
+                            publish_degraded(
+                                &authority,
+                                RuntimeCapabilityId::Niri,
+                                io::ErrorKind::InvalidData,
+                                &error.to_string(),
+                            )
+                            .await?;
+                            if wait_backoff(&mut shutdown).await {
+                                return Ok(());
+                            }
+                            continue 'supervisor;
+                        }
+                    }
+                }
                 Ok(None) => {
+                    if let Some(sender) = &overview_events {
+                        sequence = sequence.saturating_add(1);
+                        sender.publish(OverviewEvent::Offline { sequence })?;
+                    }
                     stop_child(&mut child).await;
                     clear_focus(&focused_output)?;
                     publish(
@@ -454,6 +495,10 @@ async fn run_niri_source(
                     continue 'supervisor;
                 }
                 Err(error) => {
+                    if let Some(sender) = &overview_events {
+                        sequence = sequence.saturating_add(1);
+                        sender.publish(OverviewEvent::Offline { sequence })?;
+                    }
                     stop_child(&mut child).await;
                     clear_focus(&focused_output)?;
                     publish(
@@ -478,6 +523,86 @@ async fn run_niri_source(
             }
         }
     }
+}
+
+fn parse_overview_event(
+    bytes: &[u8],
+    workspaces: &HashMap<u64, String>,
+    sequence: &mut u64,
+    focused_workspace: &mut u64,
+    focused_window: &mut Option<u64>,
+) -> io::Result<Option<OverviewEvent>> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if let Some(items) = value
+        .pointer("/WorkspacesChanged/workspaces")
+        .and_then(Value::as_array)
+    {
+        if let Some(workspace) = items
+            .iter()
+            .find(|workspace| workspace.get("is_focused").and_then(Value::as_bool) == Some(true))
+        {
+            *focused_workspace = workspace.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "focused Niri workspace omitted id",
+                )
+            })?;
+            let output_id = workspace
+                .get("output")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "focused Niri workspace omitted output",
+                    )
+                })?
+                .to_owned();
+            *sequence = sequence.saturating_add(1);
+            return Ok(Some(OverviewEvent::FocusChanged {
+                output_id,
+                window_id: *focused_window,
+                workspace_id: *focused_workspace,
+                sequence: *sequence,
+            }));
+        }
+    }
+    if let Some(closed) = value.get("WindowClosed") {
+        let window_id = closed.get("id").and_then(Value::as_u64).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Niri WindowClosed omitted id")
+        })?;
+        *sequence = sequence.saturating_add(1);
+        return Ok(Some(OverviewEvent::WindowClosed {
+            window_id,
+            sequence: *sequence,
+        }));
+    }
+    if let Some(focus) = value.get("WindowFocusChanged") {
+        *focused_window = focus.get("id").and_then(Value::as_u64);
+    }
+    if let Some(activated) = value.get("WorkspaceActivated") {
+        if activated.get("focused").and_then(Value::as_bool) == Some(true) {
+            *focused_workspace = activated.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "focused Niri workspace omitted id",
+                )
+            })?;
+        }
+    }
+    let Some(output_id) = workspaces.get(focused_workspace).cloned() else {
+        return Ok(None);
+    };
+    if value.get("WindowFocusChanged").is_some() || value.get("WorkspaceActivated").is_some() {
+        *sequence = sequence.saturating_add(1);
+        return Ok(Some(OverviewEvent::FocusChanged {
+            output_id,
+            window_id: *focused_window,
+            workspace_id: *focused_workspace,
+            sequence: *sequence,
+        }));
+    }
+    Ok(None)
 }
 
 async fn read_bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<u8>>> {
@@ -833,6 +958,69 @@ mod tests {
         assert_eq!(
             DbusSourceSpec::mpris().capability,
             RuntimeCapabilityId::Media
+        );
+    }
+
+    #[test]
+    fn ordered_niri_stream_maps_to_typed_overview_confirmations() {
+        let mut workspaces = HashMap::new();
+        let mut sequence = 0;
+        let mut workspace = 0;
+        let mut window = None;
+        let changed =
+            br#"{"WorkspacesChanged":{"workspaces":[{"id":7,"output":"DP-1","is_focused":true}]}}"#;
+        let event = parse_overview_event(
+            changed,
+            &workspaces,
+            &mut sequence,
+            &mut workspace,
+            &mut window,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            event,
+            OverviewEvent::FocusChanged {
+                workspace_id: 7,
+                sequence: 1,
+                ..
+            }
+        ));
+        parse_niri_event(changed, &mut workspaces).unwrap();
+        let focus = br#"{"WindowFocusChanged":{"id":42}}"#;
+        let event = parse_overview_event(
+            focus,
+            &workspaces,
+            &mut sequence,
+            &mut workspace,
+            &mut window,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            event,
+            OverviewEvent::FocusChanged {
+                window_id: Some(42),
+                sequence: 2,
+                ..
+            }
+        ));
+        let closed = br#"{"WindowClosed":{"id":42}}"#;
+        let event = parse_overview_event(
+            closed,
+            &workspaces,
+            &mut sequence,
+            &mut workspace,
+            &mut window,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            event,
+            OverviewEvent::WindowClosed {
+                window_id: 42,
+                sequence: 3
+            }
         );
     }
 

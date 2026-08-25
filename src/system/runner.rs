@@ -115,6 +115,7 @@ pub struct RunControl {
     deadline: Instant,
     generation: Option<u64>,
     latest_generation: Option<Arc<AtomicU64>>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl RunControl {
@@ -127,6 +128,7 @@ impl RunControl {
             deadline,
             generation: Some(generation),
             latest_generation: Some(latest_generation),
+            cancelled: None,
         }
     }
 
@@ -135,13 +137,27 @@ impl RunControl {
             deadline: Instant::now() + timeout,
             generation: None,
             latest_generation: None,
+            cancelled: None,
+        }
+    }
+
+    pub fn for_request(deadline: Instant, cancelled: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            deadline,
+            generation: None,
+            latest_generation: None,
+            cancelled: Some(cancelled),
         }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.generation
-            .zip(self.latest_generation.as_ref())
-            .is_some_and(|(generation, latest)| generation < latest.load(Ordering::SeqCst))
+        self.cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
+            || self
+                .generation
+                .zip(self.latest_generation.as_ref())
+                .is_some_and(|(generation, latest)| generation < latest.load(Ordering::SeqCst))
     }
 
     pub fn remaining(&self) -> Duration {

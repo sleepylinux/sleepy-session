@@ -7,6 +7,7 @@ use sleepy_session::notifications::{
     NotificationStore,
 };
 use sleepy_session::osd::{spawn_osd_runtime, OsdPublicationHub, OsdSocket};
+use sleepy_session::overview::overview_event_channel;
 use sleepy_session::sessiond::{
     full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority, ProductionSources,
     SessionSocket, ShutdownCoordinator,
@@ -31,7 +32,12 @@ async fn run() -> io::Result<()> {
     let osd_socket_path = runtime_dir.join("sleepy/osd.sock");
     let daily_socket_path = runtime_dir.join("sleepy/daily.sock");
     let generation_path = state_dir.join("sleepy/session-generation");
-    let daily_backend = Arc::new(ProductionDailyBackend::open(&state_dir, &cache_dir)?);
+    let (overview_sender, overview_events) = overview_event_channel(256);
+    let daily_backend = Arc::new(ProductionDailyBackend::open_with_overview(
+        &state_dir,
+        &cache_dir,
+        overview_events,
+    )?);
 
     let mut allocator = GenerationAllocator::open(generation_path, 1024)?;
     let generation = allocator.next_generation()?;
@@ -68,7 +74,7 @@ async fn run() -> io::Result<()> {
     let socket = SessionSocket::bind(&socket_path, expected_uid, hub.clone()).await?;
     let osd_socket = OsdSocket::bind(&osd_socket_path, expected_uid, osd_hub).await?;
     let daily_socket = DailySocket::bind(&daily_socket_path, expected_uid, daily_backend).await?;
-    let sources = ProductionSources::start(authority.clone());
+    let sources = ProductionSources::start_with_overview(authority.clone(), overview_sender);
     let shutdown = ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
     let result = {
         tokio::select! {

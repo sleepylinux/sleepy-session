@@ -2,12 +2,13 @@
 
 use std::{
     io,
+    sync::{mpsc, Mutex},
     time::{Duration, Instant},
 };
 
 use sleepy_sdk::DaemonCommand;
 
-use crate::system::{CommandRunner, CommandSpec, ProcessCommandRunner};
+use crate::system::{CommandRunner, CommandSpec, ProcessCommandRunner, RunControl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverviewEvent {
@@ -38,6 +39,16 @@ impl OverviewEvent {
 
 pub trait OverviewRunner: Clone + Send + Sync + 'static {
     fn run(&self, program: &str, args: &[String], timeout: Duration) -> io::Result<()>;
+
+    fn run_controlled(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+        _control: &RunControl,
+    ) -> io::Result<()> {
+        self.run(program, args, timeout)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -63,10 +74,102 @@ impl<R: CommandRunner> OverviewRunner for ProcessOverviewRunner<R> {
             )))
         }
     }
+
+    fn run_controlled(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+        control: &RunControl,
+    ) -> io::Result<()> {
+        if program != "niri" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "overview runner only permits niri",
+            ));
+        }
+        let mut command = CommandSpec::new(program, args.iter().cloned());
+        command.timeout = timeout;
+        let output = self
+            .0
+            .run_controlled(&command, control)
+            .map_err(io::Error::other)?;
+        if output.status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "Niri command exited with status {}",
+                output.status
+            )))
+        }
+    }
 }
 
 pub trait OverviewEventSource: Send + Sync + 'static {
     fn next_event(&self, timeout: Duration) -> io::Result<Option<OverviewEvent>>;
+
+    fn try_event(&self) -> io::Result<Option<OverviewEvent>> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone)]
+pub struct OverviewEventSender(mpsc::SyncSender<OverviewEvent>);
+
+pub struct ChannelOverviewEvents(Mutex<mpsc::Receiver<OverviewEvent>>);
+
+pub fn overview_event_channel(capacity: usize) -> (OverviewEventSender, ChannelOverviewEvents) {
+    let (sender, receiver) = mpsc::sync_channel(capacity.max(1));
+    (
+        OverviewEventSender(sender),
+        ChannelOverviewEvents(Mutex::new(receiver)),
+    )
+}
+
+impl OverviewEventSender {
+    pub fn publish(&self, event: OverviewEvent) -> io::Result<()> {
+        match self.0.try_send(event) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "overview event receiver stopped",
+            )),
+        }
+    }
+}
+
+impl OverviewEventSource for ChannelOverviewEvents {
+    fn next_event(&self, timeout: Duration) -> io::Result<Option<OverviewEvent>> {
+        match self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("overview event receiver lock poisoned"))?
+            .recv_timeout(timeout)
+        {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Niri overview event source stopped",
+            )),
+        }
+    }
+
+    fn try_event(&self) -> io::Result<Option<OverviewEvent>> {
+        match self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("overview event receiver lock poisoned"))?
+            .try_recv()
+        {
+            Ok(event) => Ok(Some(event)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Niri overview event source stopped",
+            )),
+        }
+    }
 }
 
 pub struct NiriOverview<R, E> {
@@ -106,6 +209,21 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
     }
 
     pub fn execute(&mut self, command: DaemonCommand) -> io::Result<OverviewEvent> {
+        let control = RunControl::for_request(
+            Instant::now() + self.timeout,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        self.execute_controlled(command, &control)
+    }
+
+    pub fn execute_controlled(
+        &mut self,
+        command: DaemonCommand,
+        control: &RunControl,
+    ) -> io::Result<OverviewEvent> {
+        while let Some(event) = self.events.try_event()? {
+            self.observe(event);
+        }
         if !self.online {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -116,9 +234,17 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
         let baseline = self.sequence;
         let routed_output = self.focused_output.clone();
         let deadline = Instant::now() + self.timeout;
-        self.runner.run("niri", &args, self.timeout)?;
+        self.runner
+            .run_controlled("niri", &args, self.timeout, control)?;
         loop {
+            if control.is_cancelled() || control.remaining().is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Niri confirmation cancelled",
+                ));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = remaining.min(control.remaining());
             if remaining.is_zero() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,

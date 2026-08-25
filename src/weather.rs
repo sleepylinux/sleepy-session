@@ -20,7 +20,7 @@ use sleepy_sdk::{
 
 use crate::{
     store::SecureDir,
-    system::{CommandRunner, CommandSpec, ProcessCommandRunner},
+    system::{CommandRunner, CommandSpec, ProcessCommandRunner, RunControl},
 };
 
 const MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
@@ -42,6 +42,20 @@ pub struct HttpResponse {
 
 pub trait HttpTransport: Clone + Send + Sync + 'static {
     fn execute(&self, request: HttpRequest) -> io::Result<HttpResponse>;
+
+    fn execute_controlled(
+        &self,
+        request: HttpRequest,
+        control: &RunControl,
+    ) -> io::Result<HttpResponse> {
+        if control.is_cancelled() || control.remaining().is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "HTTP request cancelled",
+            ));
+        }
+        self.execute(request)
+    }
 }
 
 pub trait Clock: Clone + Send + Sync + 'static {
@@ -96,6 +110,18 @@ pub struct CurlTransport;
 
 impl HttpTransport for CurlTransport {
     fn execute(&self, request: HttpRequest) -> io::Result<HttpResponse> {
+        let control = RunControl::for_request(
+            std::time::Instant::now() + request.timeout,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        self.execute_controlled(request, &control)
+    }
+
+    fn execute_controlled(
+        &self,
+        request: HttpRequest,
+        control: &RunControl,
+    ) -> io::Result<HttpResponse> {
         if !is_https(&request.url) {
             return Err(invalid("HTTP transport requires HTTPS"));
         }
@@ -114,7 +140,7 @@ impl HttpTransport for CurlTransport {
         command.timeout = request.timeout;
         command.max_output_bytes = MAX_HTTP_BODY + 64 * 1024;
         let output = ProcessCommandRunner
-            .run(&command)
+            .run_controlled(&command, control)
             .map_err(io::Error::other)?;
         if output.status != 0 {
             return Err(io::Error::other("curl request failed"));
@@ -205,6 +231,18 @@ impl<T: HttpTransport, C: Clock> MetNoProvider<T, C> {
     }
 
     pub fn snapshot(&self, location: &WeatherLocation) -> io::Result<WeatherSnapshot> {
+        let control = RunControl::for_request(
+            std::time::Instant::now() + Duration::from_secs(8),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        self.snapshot_controlled(location, &control)
+    }
+
+    pub fn snapshot_controlled(
+        &self,
+        location: &WeatherLocation,
+        control: &RunControl,
+    ) -> io::Result<WeatherSnapshot> {
         validate_location(location)?;
         let latitude = format_coordinate(location.latitude);
         let longitude = format_coordinate(location.longitude);
@@ -242,7 +280,7 @@ impl<T: HttpTransport, C: Clock> MetNoProvider<T, C> {
             headers,
             timeout: Duration::from_secs(6),
         };
-        let response = match self.transport.execute(request) {
+        let response = match self.transport.execute_controlled(request, control) {
             Ok(response) => response,
             Err(error) => {
                 return Ok(unavailable(
@@ -293,6 +331,14 @@ impl<T: HttpTransport, C: Clock> MetNoProvider<T, C> {
                     last_modified,
                     forecast: forecast.clone(),
                 };
+                if let Err(error) = validate_met_cache(&cache, now) {
+                    return Ok(unavailable(
+                        location,
+                        existing,
+                        ProviderStatus::Error,
+                        &error.to_string(),
+                    ));
+                }
                 write_json_private(&self.cache_path, &cache)?;
                 *self
                     .cache
@@ -320,6 +366,7 @@ impl<T: HttpTransport, C: Clock> MetNoProvider<T, C> {
                         ))
                     }
                 };
+                validate_met_cache(&cache, now)?;
                 write_json_private(&self.cache_path, &cache)?;
                 let forecast = cache.forecast.clone();
                 *self
@@ -384,6 +431,9 @@ fn parse_met(body: &[u8]) -> io::Result<Vec<ForecastPoint>> {
                 .get("time")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| invalid("MET point omitted time"))?;
+            if !at.ends_with('Z') {
+                return Err(invalid("MET point time is not canonical UTC"));
+            }
             DateTime::parse_from_rfc3339(at).map_err(|_| invalid("MET point time is invalid"))?;
             let temperature_c = point
                 .pointer("/data/instant/details/air_temperature")
@@ -459,16 +509,17 @@ pub struct NominatimProvider<T, C> {
     user_agent: String,
     cache_path: PathBuf,
     transport: T,
-    clock: C,
+    _clock: C,
     limiter: Arc<NominatimRateLimiter>,
     cache: Mutex<BTreeMap<String, Vec<GeocodingResult>>>,
 }
 
 static NOMINATIM_LAST_REQUEST: OnceLock<Arc<NominatimRateLimiter>> = OnceLock::new();
 
-pub struct NominatimRateLimiter(Mutex<Option<u64>>);
+struct NominatimRateLimiter(Mutex<Option<u64>>);
 impl NominatimRateLimiter {
-    pub fn isolated() -> Arc<Self> {
+    #[cfg(test)]
+    fn isolated() -> Arc<Self> {
         Arc::new(Self(Mutex::new(None)))
     }
 }
@@ -494,7 +545,7 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
         )
     }
 
-    pub fn new_with_limiter(
+    fn new_with_limiter(
         endpoint: &str,
         user_agent: &str,
         cache_path: PathBuf,
@@ -507,6 +558,7 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
             Ok(BTreeMap::new()),
             |document| {
                 if document.schema_version == CACHE_VERSION {
+                    validate_geocode_cache(&document.queries)?;
                     Ok(document.queries)
                 } else {
                     Err(invalid("unknown geocoding cache schema"))
@@ -518,7 +570,7 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
             user_agent: user_agent.into(),
             cache_path,
             transport,
-            clock,
+            _clock: clock,
             limiter,
             cache: Mutex::new(cache),
         })
@@ -532,6 +584,18 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
     }
 
     pub fn submit(&self, query: &str) -> io::Result<Vec<GeocodingResult>> {
+        let control = RunControl::for_request(
+            std::time::Instant::now() + Duration::from_secs(8),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        self.submit_controlled(query, &control)
+    }
+
+    pub fn submit_controlled(
+        &self,
+        query: &str,
+        control: &RunControl,
+    ) -> io::Result<Vec<GeocodingResult>> {
         let query = query.trim();
         if query.len() < 2 || query.len() > 200 || query.contains(['@', '\n', '\r', '\0']) {
             return Err(io::Error::new(
@@ -549,7 +613,10 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
         {
             return Ok(cached);
         }
-        let monotonic_now = self.clock.monotonic_millis();
+        // Rate limiting always uses the process-global real monotonic clock.
+        // The provider clock remains injectable for deterministic provider
+        // fixtures, but cannot weaken public Nominatim admission policy.
+        let monotonic_now = SystemClock.monotonic_millis();
         let mut last_request = self
             .limiter
             .0
@@ -575,7 +642,7 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
             ]),
             timeout: Duration::from_secs(6),
         };
-        let response = self.transport.execute(request)?;
+        let response = self.transport.execute_controlled(request, control)?;
         if response.status != 200 {
             return Err(io::Error::other(format!(
                 "Nominatim returned HTTP {}",
@@ -616,6 +683,7 @@ impl<T: HttpTransport, C: Clock> NominatimProvider<T, C> {
             .lock()
             .map_err(|_| io::Error::other("geocoding cache lock poisoned"))?;
         cache.insert(key, results.clone());
+        validate_geocode_cache(&cache)?;
         write_json_private(
             &self.cache_path,
             &GeocodeCache {
@@ -718,12 +786,26 @@ fn invalid_header_value(value: &str) -> bool {
 }
 
 fn validate_met_cache(cache: &MetCache, now: u64) -> io::Result<()> {
+    let Some((latitude, longitude)) = cache
+        .location_key
+        .split_once(',')
+        .and_then(|(lat, lon)| Some((lat.parse::<f64>().ok()?, lon.parse::<f64>().ok()?)))
+    else {
+        return Err(invalid("MET cache location key is invalid"));
+    };
+    let location = WeatherLocation {
+        display_name: "cached location".into(),
+        latitude,
+        longitude,
+    };
     if cache.location_key.len() > 64
-        || cache
-            .location_key
-            .split_once(',')
-            .and_then(|(lat, lon)| Some((lat.parse::<f64>().ok()?, lon.parse::<f64>().ok()?)))
-            .is_none()
+        || validate_location(&location).is_err()
+        || cache.location_key
+            != format!(
+                "{},{}",
+                format_coordinate(latitude),
+                format_coordinate(longitude)
+            )
     {
         return Err(invalid("MET cache location key is invalid"));
     }
@@ -739,13 +821,55 @@ fn validate_met_cache(cache: &MetCache, now: u64) -> io::Result<()> {
         return Err(invalid("MET cache has too many forecast points"));
     }
     for point in &cache.forecast {
-        if DateTime::parse_from_rfc3339(&point.at).is_err()
+        if !point.at.ends_with('Z')
+            || DateTime::parse_from_rfc3339(&point.at).is_err()
             || !point.temperature_c.is_finite()
             || point.symbol.is_empty()
             || point.symbol.len() > 128
             || point.symbol.chars().any(char::is_control)
         {
             return Err(invalid("MET cache forecast is invalid"));
+        }
+    }
+    let strict = weather(
+        &location,
+        ProviderStatus::Online,
+        CacheStatus::Fresh,
+        cache.forecast.clone(),
+        None,
+    );
+    let document = serde_json::to_string(&strict).map_err(io::Error::other)?;
+    sleepy_sdk::validate_weather_snapshot(&document)
+        .map_err(|_| invalid("MET cache violates the strict SDK weather contract"))?;
+    Ok(())
+}
+
+fn validate_geocode_cache(cache: &BTreeMap<String, Vec<GeocodingResult>>) -> io::Result<()> {
+    if cache.len() > 1024 {
+        return Err(invalid("geocoding cache query count exceeded limit"));
+    }
+    for (query, results) in cache {
+        if query.trim() != query
+            || query.to_lowercase() != *query
+            || query.len() < 2
+            || query.len() > 200
+            || query.contains(['@', '\n', '\r', '\0'])
+            || results.len() > 8
+        {
+            return Err(invalid("geocoding cache query is invalid"));
+        }
+        for result in results {
+            validate_location(&WeatherLocation {
+                display_name: result.display_name.clone(),
+                latitude: result.latitude,
+                longitude: result.longitude,
+            })?;
+            if result.attribution != "© OpenStreetMap contributors"
+                || result.display_name.len() > 1024
+                || result.display_name.chars().any(char::is_control)
+            {
+                return Err(invalid("geocoding cache result is invalid"));
+            }
         }
     }
     Ok(())
@@ -812,4 +936,51 @@ fn percent_encode(value: &str) -> String {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct EmptyTransport;
+    impl HttpTransport for EmptyTransport {
+        fn execute(&self, _request: HttpRequest) -> io::Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: b"[]".to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn injected_limiter_is_private_and_shared_by_test_instances() {
+        let root = tempfile::tempdir().unwrap();
+        let limiter = NominatimRateLimiter::isolated();
+        let clock = ManualClock::new(10);
+        let first = NominatimProvider::new_with_limiter(
+            "https://example.test/search",
+            "Sleepy/3 ops@example.test",
+            root.path().join("a"),
+            EmptyTransport,
+            clock.clone(),
+            Arc::clone(&limiter),
+        )
+        .unwrap();
+        let second = NominatimProvider::new_with_limiter(
+            "https://example.test/search",
+            "Sleepy/3 ops@example.test",
+            root.path().join("b"),
+            EmptyTransport,
+            clock,
+            limiter,
+        )
+        .unwrap();
+        first.submit("First place").unwrap();
+        assert_eq!(
+            second.submit("Second place").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 }
