@@ -12,10 +12,10 @@ fn dependency_contract_pins_the_reviewed_gpl_sdk_revision() {
     let lockfile = read_repository_file("Cargo.lock");
 
     assert!(
-        flake.contains("github:sleepylinux/sleepy-sdk/2edbe8310eee69c40e4f75924da67a57942bd1c3")
+        flake.contains("github:sleepylinux/sleepy-sdk/152173b470fa7d1e90c6d3d6be103a4a4d3529bc")
     );
-    assert!(manifest.contains("rev = \"2edbe8310eee69c40e4f75924da67a57942bd1c3\""));
-    assert!(lockfile.contains("#2edbe8310eee69c40e4f75924da67a57942bd1c3"));
+    assert!(manifest.contains("rev = \"152173b470fa7d1e90c6d3d6be103a4a4d3529bc\""));
+    assert!(lockfile.contains("#152173b470fa7d1e90c6d3d6be103a4a4d3529bc"));
     assert_eq!(flake.matches("github:sleepylinux/sleepy-sdk/").count(), 1);
     assert_eq!(manifest.matches("sleepy-sdk =").count(), 1);
     assert_eq!(lockfile.matches("name = \"sleepy-sdk\"").count(), 1);
@@ -28,4 +28,22 @@ fn flake_exposes_the_session_and_user_unit_packages() {
     assert!(flake.contains("allowBuiltinFetchGit = true"));
     assert!(flake.contains("sleepy-session = package"));
     assert!(flake.contains("sleepy-session-user-unit = userUnit"));
+}
+
+#[test]
+fn flake_exposes_a_mandatory_niri_26_04_bindings_check() {
+    let flake = read_repository_file("flake.nix");
+
+    assert!(flake.contains("niri-bindings = packageFor system true"));
+    assert!(flake.contains("assert pkgs.niri.version == \"26.04\""));
+    assert!(flake.contains("compiler_registry_validates_with_niri_26_04 -- --exact --ignored"));
+}
+
+#[test]
+fn flake_puts_the_dbus_daemon_on_the_native_check_path() {
+    let flake = read_repository_file("flake.nix");
+
+    assert!(flake.contains("nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ]"));
+    assert!(flake.contains("buildInputs = [ pkgs.dbus ]"));
+    assert!(flake.contains("SLEEPY_DBUS_SESSION_CONF = \"${pkgs.dbus}/share/dbus-1/session.conf\""));
 }

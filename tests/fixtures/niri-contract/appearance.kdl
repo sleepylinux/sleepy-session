@@ -1,0 +1,10 @@
+layout {
+    background-color "#181620"
+    gaps 12
+
+    focus-ring {
+        active-color "#b9a7ff"
+    }
+}
+
+prefer-no-csd
