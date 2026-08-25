@@ -24,12 +24,13 @@ pub use runner::{
 };
 use sleepy_sdk::{
     validate_session_action_result, validate_system_mutation_result, validate_system_snapshot,
-    AudioRuntimeState, AudioState, BluetoothState, BrightnessRuntimeState, CapabilityAvailability,
-    CapabilityDiagnostic, CapabilityErrorKind, CapabilityFailure, CapabilityId, CapabilityRecord,
-    CapabilityState, CapabilityValue, MediaRuntimeState, MediaState, MediaTransport, NetworkState,
-    PowerProfile, PowerProfileRuntimeState, PowerState, RuntimeCapabilityId, SessionAction,
-    SessionActionRequest, SessionActionResult, SessionActionStatus, SystemMutation,
-    SystemMutationResult, SystemSnapshot,
+    AudioRuntimeState, AudioState, BatteryRuntimeState, BluetoothRuntimeState, BluetoothState,
+    BrightnessRuntimeState, CapabilityAvailability, CapabilityDiagnostic, CapabilityErrorKind,
+    CapabilityFailure, CapabilityId, CapabilityRecord, CapabilityState, CapabilityValue,
+    Connectivity, MediaRuntimeState, MediaState, MediaTransport, NetworkRuntimeState, NetworkState,
+    NightLightRuntimeState, PowerProfile, PowerProfileRuntimeState, PowerState,
+    RuntimeCapabilityId, SessionAction, SessionActionRequest, SessionActionResult,
+    SessionActionStatus, SystemMutation, SystemMutationResult, SystemSnapshot,
 };
 
 const SNAPSHOT_DEADLINE: Duration = Duration::from_millis(1200);
@@ -182,6 +183,26 @@ impl<R: CommandRunner> SystemFacade<R> {
     /// adapters. Unlike `snapshot`, this never probes unrelated providers.
     pub(crate) fn runtime_capability(&self, id: RuntimeCapabilityId) -> CapabilityRecord {
         let value = match id {
+            RuntimeCapabilityId::Network => network::probe(&self.runner).map(|state| {
+                CapabilityValue::Network(NetworkRuntimeState {
+                    wifi_enabled: state.enabled,
+                    ethernet_connected: false,
+                    connectivity: if state.connected_name.is_some() {
+                        Connectivity::Full
+                    } else if state.enabled {
+                        Connectivity::None
+                    } else {
+                        Connectivity::Unknown
+                    },
+                    active_connection_id: state.connected_name,
+                })
+            }),
+            RuntimeCapabilityId::Bluetooth => bluetooth::probe(&self.runner).map(|state| {
+                CapabilityValue::Bluetooth(BluetoothRuntimeState {
+                    powered: state.enabled,
+                    connected_device_ids: state.connected_device.into_iter().collect(),
+                })
+            }),
             RuntimeCapabilityId::Audio => (|| {
                 let output = audio::probe_output(&self.runner)?;
                 let input = audio::probe_microphone(&self.runner)?;
@@ -196,6 +217,15 @@ impl<R: CommandRunner> SystemFacade<R> {
             })(),
             RuntimeCapabilityId::Brightness => display::probe_brightness(&self.runner)
                 .map(|level| CapabilityValue::Brightness(BrightnessRuntimeState { level })),
+            RuntimeCapabilityId::Battery => {
+                power::probe_battery(&self.runner).map(|(level, charging)| {
+                    CapabilityValue::Battery(BatteryRuntimeState {
+                        percentage: (level.unwrap_or(0.0) * 100.0).round() as u8,
+                        charging: charging.unwrap_or(false),
+                        seconds_remaining: None,
+                    })
+                })
+            }
             RuntimeCapabilityId::PowerProfile => {
                 power::probe_profiles(&self.runner).map(|(active, available)| {
                     CapabilityValue::PowerProfile(PowerProfileRuntimeState {
@@ -215,6 +245,8 @@ impl<R: CommandRunner> SystemFacade<R> {
                     playing: state.playing,
                 })
             }),
+            RuntimeCapabilityId::NightLight => night_light::probe(&self.runner)
+                .map(|enabled| CapabilityValue::NightLight(NightLightRuntimeState { enabled })),
             _ => {
                 return CapabilityRecord {
                     id,

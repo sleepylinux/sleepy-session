@@ -4,13 +4,14 @@ use sleepy_sdk::{EventCause, EventCauseKind, ProviderEvent, SessionEvent};
 use sleepy_session::daily::{DailySocket, ProductionDailyBackend};
 use sleepy_session::notifications::{
     FreedesktopNotificationProvider, NotificationDbusServer, NotificationEventService,
-    NotificationStore,
+    NotificationSocket, NotificationStore,
 };
 use sleepy_session::osd::{spawn_osd_runtime, OsdPublicationHub, OsdSocket};
 use sleepy_session::overview::overview_event_channel;
 use sleepy_session::sessiond::{
-    full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority, ProductionSources,
-    SessionSocket, ShutdownCoordinator,
+    full_snapshot_event, ControlSocket, EventHub, GenerationAllocator, GenerationAuthority,
+    MutationPipeline, ProductionMutationBackend, ProductionSources, SessionSocket,
+    ShutdownCoordinator,
 };
 use sleepy_session::{theme::ThemeManager, theme_socket::ThemeSocket};
 
@@ -31,9 +32,11 @@ async fn run() -> io::Result<()> {
     let config_dir = config_home()?;
     let cache_dir = cache_home()?;
     let socket_path = runtime_dir.join("sleepy/session.sock");
+    let control_socket_path = runtime_dir.join("sleepy/control.sock");
     let osd_socket_path = runtime_dir.join("sleepy/osd.sock");
     let daily_socket_path = runtime_dir.join("sleepy/daily.sock");
     let theme_socket_path = runtime_dir.join("sleepy/theme.sock");
+    let notification_socket_path = runtime_dir.join("sleepy/notification.sock");
     let generation_path = state_dir.join("sleepy/session-generation");
     let (overview_sender, overview_events) = overview_event_channel(256);
     let daily_backend = Arc::new(ProductionDailyBackend::open_with_overview(
@@ -73,8 +76,19 @@ async fn run() -> io::Result<()> {
         Arc::clone(&notification_service),
         tokio::runtime::Handle::current(),
     )?;
+    let notification_socket = NotificationSocket::bind(
+        &notification_socket_path,
+        unsafe { libc::geteuid() },
+        Arc::clone(&notification_service),
+    )
+    .await?
+    .with_action_dispatcher(notification_bus.action_dispatcher());
     let expected_uid = unsafe { libc::geteuid() };
     let socket = SessionSocket::bind(&socket_path, expected_uid, hub.clone()).await?;
+    let mutation_backend = Arc::new(ProductionMutationBackend::new(hub.clone()));
+    let mutation_pipeline = Arc::new(MutationPipeline::new(authority.clone(), mutation_backend));
+    let control_socket =
+        ControlSocket::bind(&control_socket_path, expected_uid, mutation_pipeline).await?;
     let osd_socket = OsdSocket::bind(&osd_socket_path, expected_uid, osd_hub).await?;
     let daily_socket = DailySocket::bind(&daily_socket_path, expected_uid, daily_backend).await?;
     let theme_manager = ThemeManager::open(&config_dir, &state_dir)
@@ -91,9 +105,11 @@ async fn run() -> io::Result<()> {
     let result = {
         tokio::select! {
             result = socket.serve() => result,
+            result = control_socket.serve() => result,
             result = osd_socket.serve() => result,
             result = daily_socket.serve() => result,
             result = theme_socket.serve() => result,
+            result = notification_socket.serve() => result,
             bridge = &mut osd_bridge => match bridge {
                 Ok(Ok(())) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "OSD publication bridge stopped")),
                 Ok(Err(error)) => Err(error),
@@ -124,6 +140,18 @@ async fn run() -> io::Result<()> {
         }
     };
     let mut cleanup_error = None;
+    if let Err(error) = control_socket
+        .shutdown_and_drain(std::time::Duration::from_secs(2))
+        .await
+    {
+        cleanup_error = Some(error);
+    }
+    if let Err(error) = notification_socket
+        .shutdown_and_drain(std::time::Duration::from_secs(2))
+        .await
+    {
+        cleanup_error.get_or_insert(error);
+    }
     if let Err(error) = theme_socket
         // Theme mutations can publish through the shared generation authority.
         // Cancel and join them before the terminal lifecycle barrier.

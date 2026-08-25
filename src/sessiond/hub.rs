@@ -59,6 +59,10 @@ impl EventHub {
         }
     }
 
+    pub async fn latest_snapshot(&self) -> EventEnvelope {
+        self.latest_snapshot.read().await.clone()
+    }
+
     pub async fn publish(&self, event: EventEnvelope) -> Result<usize, PublishError> {
         {
             let mut replay = self.latest_snapshot.write().await;

@@ -633,3 +633,31 @@ fn one_effects_policy_handles_portal_motion_and_opaque_fallback() {
     assert!(!policy.animations);
     assert!(policy.opaque);
 }
+
+#[test]
+fn theme_catalog_contains_all_immutable_builtins_and_imported_user_themes() {
+    let temp = TempDir::new().unwrap();
+    let store = manager(&temp);
+    let mut imported = ThemeManager::builtin("builtin.sleepy-dark").unwrap();
+    imported.id = uuid::Uuid::new_v4().to_string();
+    imported.name = "User dusk".into();
+    imported.origin = ThemeOrigin::User;
+    let imported = store
+        .import(&serde_json::to_string(&imported).unwrap())
+        .unwrap();
+    let catalog = store.list().unwrap();
+    assert_eq!(
+        &catalog[..3]
+            .iter()
+            .map(|theme| theme.id.as_str())
+            .collect::<Vec<_>>(),
+        &[
+            "builtin.sleepy-dark",
+            "builtin.sleepy-light",
+            "builtin.sleepy-system"
+        ]
+    );
+    assert!(catalog
+        .iter()
+        .any(|theme| theme.id == imported.id && theme.name == "User dusk"));
+}

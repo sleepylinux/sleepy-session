@@ -230,6 +230,25 @@ impl ThemeManager {
         }
     }
 
+    pub fn list(&self) -> Result<Vec<ThemeDocument>, ThemeError> {
+        let mut themes = [
+            "builtin.sleepy-dark",
+            "builtin.sleepy-light",
+            "builtin.sleepy-system",
+        ]
+        .into_iter()
+        .map(|id| Self::builtin(id).expect("static builtin"))
+        .collect::<Vec<_>>();
+        for name in self.documents.entries()? {
+            if std::path::Path::new(&name).extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            themes.push(parse_document(&self.documents.read(&name)?)?);
+        }
+        themes[3..].sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        Ok(themes)
+    }
+
     pub fn import(&self, input: &str) -> Result<ThemeDocument, ThemeError> {
         self.import_controlled(input, &default_control())
     }

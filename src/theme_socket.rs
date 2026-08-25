@@ -48,6 +48,7 @@ pub struct ThemeRequest {
 )]
 pub enum ThemeOperation {
     Get,
+    List,
     Import {
         document: String,
     },
@@ -66,7 +67,7 @@ pub enum ThemeOperation {
 
 impl ThemeOperation {
     fn is_mutation(&self) -> bool {
-        !matches!(self, Self::Get)
+        !matches!(self, Self::Get | Self::List)
     }
 }
 
@@ -92,6 +93,8 @@ pub enum ThemeMessage {
         generation: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         theme: Option<ThemeDocument>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        themes: Option<Vec<ThemeDocument>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -363,6 +366,16 @@ async fn serve_connection(
                 Some(error.to_string()),
             ),
         },
+        ThemeOperation::List => match manager.list() {
+            Ok(themes) => result_with_themes(&request.request_id, themes),
+            Err(error) => result(
+                &request.request_id,
+                ThemeStatus::Error,
+                None,
+                None,
+                Some(error.to_string()),
+            ),
+        },
         ThemeOperation::Import { document } => {
             match manager.import_async_controlled(&document, &control).await {
                 Ok(theme) => result(
@@ -450,6 +463,7 @@ fn validate_request(request: &ThemeRequest) -> io::Result<()> {
                 ));
             }
         }
+        ThemeOperation::Get | ThemeOperation::List => {}
         ThemeOperation::CopyForEdit { theme_id, name }
             if theme_id.trim().is_empty() || name.trim().is_empty() =>
         {
@@ -488,7 +502,20 @@ fn result(
         status,
         generation,
         theme,
+        themes: None,
         error,
+    }
+}
+
+fn result_with_themes(request_id: &str, themes: Vec<ThemeDocument>) -> ThemeMessage {
+    ThemeMessage::Result {
+        schema_version: WIRE_SCHEMA_VERSION,
+        request_id: request_id.into(),
+        status: ThemeStatus::Confirmed,
+        generation: None,
+        theme: None,
+        themes: Some(themes),
+        error: None,
     }
 }
 

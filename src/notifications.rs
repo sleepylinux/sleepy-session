@@ -22,7 +22,9 @@ use sleepy_sdk::{
 use crate::sessiond::GenerationAuthority;
 
 mod dbus_server;
-pub use dbus_server::NotificationDbusServer;
+mod socket;
+pub use dbus_server::{NotificationActionDispatcher, NotificationDbusServer};
+pub use socket::NotificationSocket;
 
 pub const DBUS_NOTIFICATIONS_NAME: &str = "org.freedesktop.Notifications";
 pub const MAX_NOTIFICATION_BYTES: usize = 64 * 1024;

@@ -41,7 +41,38 @@ pub struct NotificationDbusServer {
     failure: tokio::sync::watch::Receiver<Option<String>>,
 }
 
+#[derive(Clone)]
+pub struct NotificationActionDispatcher {
+    control: std::sync::mpsc::Sender<Control>,
+    service: Arc<tokio::sync::Mutex<NotificationEventService>>,
+}
+
+impl NotificationActionDispatcher {
+    pub async fn invoke(&self, id: u64, action: &str) -> io::Result<()> {
+        let wire_id = u32::try_from(id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "notification id exceeds D-Bus range",
+            )
+        })?;
+        self.service
+            .lock()
+            .await
+            .provider()
+            .invoke_action(id, action)?;
+        self.control
+            .send(Control::ActionInvoked(wire_id, action.to_owned()))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "D-Bus server stopped"))
+    }
+}
+
 impl NotificationDbusServer {
+    pub fn action_dispatcher(&self) -> NotificationActionDispatcher {
+        NotificationActionDispatcher {
+            control: self.control.clone(),
+            service: Arc::clone(&self.service),
+        }
+    }
     pub fn start_session(
         service: Arc<tokio::sync::Mutex<NotificationEventService>>,
         runtime: tokio::runtime::Handle,

@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+use super::{
+    private_socket::{peer_uid, PrivateSocketEndpoint},
+    MutationBackend, MutationPipeline,
+};
+use std::{
+    io,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
+};
+
+const MAX_LINE: usize = 256 * 1024;
+
+pub struct ControlSocket<B: MutationBackend> {
+    endpoint: PrivateSocketEndpoint,
+    pipeline: Arc<MutationPipeline<B>>,
+    shutdown: tokio::sync::broadcast::Sender<()>,
+    connections: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
+    serving: AtomicBool,
+    stopped: tokio::sync::Notify,
+}
+
+impl<B: MutationBackend> ControlSocket<B> {
+    pub async fn bind(
+        path: impl AsRef<Path>,
+        expected_uid: libc::uid_t,
+        pipeline: Arc<MutationPipeline<B>>,
+    ) -> io::Result<Self> {
+        let (shutdown, _) = tokio::sync::broadcast::channel(1);
+        Ok(Self {
+            endpoint: PrivateSocketEndpoint::bind(path, expected_uid).await?,
+            pipeline,
+            shutdown,
+            connections: tokio::sync::Mutex::new(Vec::new()),
+            serving: AtomicBool::new(false),
+            stopped: tokio::sync::Notify::new(),
+        })
+    }
+    pub async fn serve_one(&self) -> io::Result<()> {
+        let stream = self.endpoint.accept().await?;
+        serve_stream(
+            stream,
+            self.endpoint.expected_uid(),
+            Arc::clone(&self.pipeline),
+        )
+        .await
+    }
+    pub async fn serve(&self) -> io::Result<()> {
+        if self.serving.swap(true, Ordering::AcqRel) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "control socket already serving",
+            ));
+        }
+        let _guard = Serving {
+            flag: &self.serving,
+            stopped: &self.stopped,
+        };
+        let mut shutdown = self.shutdown.subscribe();
+        loop {
+            let stream = tokio::select! {
+                stream = self.endpoint.accept() => stream?,
+                _ = shutdown.recv() => return Ok(()),
+            };
+            let expected_uid = self.endpoint.expected_uid();
+            let pipeline = Arc::clone(&self.pipeline);
+            self.connections.lock().await.push(tokio::spawn(async move {
+                serve_stream(stream, expected_uid, pipeline).await
+            }));
+        }
+    }
+    pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<usize> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let _ = self.shutdown.send(());
+        if self.serving.load(Ordering::Acquire) {
+            tokio::time::timeout_at(deadline, async {
+                while self.serving.load(Ordering::Acquire) {
+                    let notified = self.stopped.notified();
+                    if !self.serving.load(Ordering::Acquire) {
+                        break;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "control accept loop did not stop")
+            })?;
+        }
+        let handles = std::mem::take(&mut *self.connections.lock().await);
+        let count = handles.len();
+        for mut handle in handles {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+        Ok(count)
+    }
+    pub fn path(&self) -> &Path {
+        self.endpoint.path()
+    }
+}
+
+struct Serving<'a> {
+    flag: &'a AtomicBool,
+    stopped: &'a tokio::sync::Notify,
+}
+impl Drop for Serving<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+        self.stopped.notify_waiters();
+    }
+}
+
+async fn serve_stream<B: MutationBackend>(
+    stream: UnixStream,
+    expected_uid: libc::uid_t,
+    pipeline: Arc<MutationPipeline<B>>,
+) -> io::Result<()> {
+    if peer_uid(&stream)? != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "control socket peer UID mismatch",
+        ));
+    }
+    let (read, mut write) = stream.into_split();
+    let mut bytes = Vec::new();
+    let count = BufReader::new(read).read_until(b'\n', &mut bytes).await?;
+    if count == 0 || count > MAX_LINE || bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid bounded control request",
+        ));
+    }
+    bytes.pop();
+    let input = std::str::from_utf8(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let result = pipeline
+        .handle_json(input)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut response = serde_json::to_vec(&result)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    response.push(b'\n');
+    write.write_all(&response).await?;
+    write.shutdown().await
+}

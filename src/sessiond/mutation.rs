@@ -1,9 +1,11 @@
 use std::{error::Error, fmt, future::Future, io, pin::Pin, sync::Arc, time::Duration};
 
-use super::GenerationAuthority;
+use super::{EventHub, GenerationAuthority};
+use crate::system::{mutation_command, CommandRunner, ProcessCommandRunner, SystemFacade};
 use sleepy_sdk::{
-    validate_mutation_request, DaemonCommand, EventCause, EventCauseKind, MutationFailure,
-    MutationResult, MutationStatus, RuntimeSnapshot, SessionEvent, WIRE_SCHEMA_VERSION,
+    validate_mutation_request, CapabilityValue, DaemonCommand, EventCause, EventCauseKind,
+    MutationFailure, MutationResult, MutationStatus, RuntimeCapabilityId, RuntimeSnapshot,
+    SessionEvent, SystemMutation, WIRE_SCHEMA_VERSION,
 };
 
 pub trait MutationBackend: Send + Sync + 'static {
@@ -21,6 +23,160 @@ pub struct MutationPipeline<B: MutationBackend> {
     authority: GenerationAuthority,
     backend: Arc<B>,
     operation_timeout: Duration,
+}
+
+pub struct ProductionMutationBackend {
+    runner: ProcessCommandRunner,
+    facade: SystemFacade<ProcessCommandRunner>,
+    hub: EventHub,
+    pending: std::sync::Mutex<Option<SystemMutation>>,
+}
+
+impl ProductionMutationBackend {
+    pub fn new(hub: EventHub) -> Self {
+        Self {
+            runner: ProcessCommandRunner,
+            facade: SystemFacade::new(ProcessCommandRunner),
+            hub,
+            pending: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl MutationBackend for ProductionMutationBackend {
+    fn execute<'a>(
+        &'a self,
+        command: &'a DaemonCommand,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        let mutation = match command {
+            DaemonCommand::SetCapability { mutation } => mutation.clone(),
+            _ => {
+                return Box::pin(async {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "control socket accepts only setCapability",
+                    ))
+                })
+            }
+        };
+        Box::pin(async move {
+            let spec = mutation_command(&mutation).map_err(io::Error::other)?;
+            let runner = self.runner;
+            let output = tokio::task::spawn_blocking(move || runner.run(&spec))
+                .await
+                .map_err(|error| io::Error::other(format!("mutation task failed: {error}")))?
+                .map_err(io::Error::other)?;
+            if output.status != 0 {
+                return Err(io::Error::other(format!(
+                    "mutation command exited {}",
+                    output.status
+                )));
+            }
+            *self
+                .pending
+                .lock()
+                .map_err(|_| io::Error::other("mutation state poisoned"))? = Some(mutation);
+            Ok(())
+        })
+    }
+
+    fn readback(&self) -> Pin<Box<dyn Future<Output = io::Result<RuntimeSnapshot>> + Send + '_>> {
+        Box::pin(async move {
+            let mutation = self
+                .pending
+                .lock()
+                .map_err(|_| io::Error::other("mutation state poisoned"))?
+                .clone()
+                .ok_or_else(|| io::Error::other("mutation readback has no command"))?;
+            let id = runtime_capability(&mutation);
+            let facade = self.facade.clone();
+            let record = tokio::task::spawn_blocking(move || facade.runtime_capability(id))
+                .await
+                .map_err(|error| io::Error::other(format!("readback task failed: {error}")))?;
+            let envelope = self.hub.latest_snapshot().await;
+            let SessionEvent::FullSnapshot(mut snapshot) = envelope.payload else {
+                return Err(io::Error::other("event hub replay is not a full snapshot"));
+            };
+            let current = snapshot
+                .capabilities
+                .iter_mut()
+                .find(|current| current.id == id)
+                .ok_or_else(|| io::Error::other("runtime snapshot omitted capability"))?;
+            *current = record;
+            Ok(snapshot)
+        })
+    }
+
+    fn confirms(&self, command: &DaemonCommand, snapshot: &RuntimeSnapshot) -> bool {
+        let DaemonCommand::SetCapability { mutation } = command else {
+            return false;
+        };
+        let value = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == runtime_capability(mutation))
+            .and_then(|item| item.value.as_ref());
+        runtime_confirms(mutation, value)
+    }
+}
+
+fn runtime_capability(mutation: &SystemMutation) -> RuntimeCapabilityId {
+    match mutation {
+        SystemMutation::NetworkEnabled(_) => RuntimeCapabilityId::Network,
+        SystemMutation::BluetoothEnabled(_) => RuntimeCapabilityId::Bluetooth,
+        SystemMutation::AudioVolume(_)
+        | SystemMutation::AudioMuted(_)
+        | SystemMutation::AudioMicrophoneLevel(_)
+        | SystemMutation::AudioMicrophoneMuted(_)
+        | SystemMutation::AudioOutputDevice(_) => RuntimeCapabilityId::Audio,
+        SystemMutation::DisplayBrightness(_) => RuntimeCapabilityId::Brightness,
+        SystemMutation::DisplayNightLightEnabled(_) => RuntimeCapabilityId::NightLight,
+        SystemMutation::PowerProfile(_) => RuntimeCapabilityId::PowerProfile,
+        SystemMutation::MediaTransport(_) => RuntimeCapabilityId::Media,
+    }
+}
+
+fn runtime_confirms(mutation: &SystemMutation, value: Option<&CapabilityValue>) -> bool {
+    match (mutation, value) {
+        (SystemMutation::NetworkEnabled(expected), Some(CapabilityValue::Network(value))) => {
+            value.wifi_enabled == *expected
+        }
+        (SystemMutation::BluetoothEnabled(expected), Some(CapabilityValue::Bluetooth(value))) => {
+            value.powered == *expected
+        }
+        (SystemMutation::AudioVolume(expected), Some(CapabilityValue::Audio(value))) => {
+            (value.output_level - expected).abs() < 0.001
+        }
+        (SystemMutation::AudioMuted(expected), Some(CapabilityValue::Audio(value))) => {
+            value.output_muted == *expected
+        }
+        (SystemMutation::AudioMicrophoneLevel(expected), Some(CapabilityValue::Audio(value))) => {
+            (value.input_level - expected).abs() < 0.001
+        }
+        (SystemMutation::AudioMicrophoneMuted(expected), Some(CapabilityValue::Audio(value))) => {
+            value.input_muted == *expected
+        }
+        (SystemMutation::AudioOutputDevice(expected), Some(CapabilityValue::Audio(value))) => {
+            value.default_output_id.as_deref() == Some(expected)
+        }
+        (SystemMutation::DisplayBrightness(expected), Some(CapabilityValue::Brightness(value))) => {
+            (value.level - expected).abs() < 0.001
+        }
+        (
+            SystemMutation::DisplayNightLightEnabled(expected),
+            Some(CapabilityValue::NightLight(value)),
+        ) => value.enabled == *expected,
+        (SystemMutation::PowerProfile(expected), Some(CapabilityValue::PowerProfile(value))) => {
+            value.active
+                == match expected {
+                    sleepy_sdk::PowerProfile::PowerSaver => "power-saver",
+                    sleepy_sdk::PowerProfile::Balanced => "balanced",
+                    sleepy_sdk::PowerProfile::Performance => "performance",
+                }
+        }
+        (SystemMutation::MediaTransport(_), Some(CapabilityValue::Media(_))) => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug)]
