@@ -39,7 +39,7 @@ impl OverviewEvent {
 }
 
 pub trait OverviewRunner: Clone + Send + Sync + 'static {
-    fn run(&self, program: &str, args: &[String], timeout: Duration) -> io::Result<()>;
+    fn run(&self, program: &str, args: &[String], timeout: Duration) -> io::Result<Instant>;
 
     fn run_controlled(
         &self,
@@ -47,7 +47,7 @@ pub trait OverviewRunner: Clone + Send + Sync + 'static {
         args: &[String],
         timeout: Duration,
         _control: &RunControl,
-    ) -> io::Result<()> {
+    ) -> io::Result<Instant> {
         self.run(program, args, timeout)
     }
 }
@@ -56,7 +56,7 @@ pub trait OverviewRunner: Clone + Send + Sync + 'static {
 pub struct ProcessOverviewRunner<R = ProcessCommandRunner>(pub R);
 
 impl<R: CommandRunner> OverviewRunner for ProcessOverviewRunner<R> {
-    fn run(&self, program: &str, args: &[String], timeout: Duration) -> io::Result<()> {
+    fn run(&self, program: &str, args: &[String], timeout: Duration) -> io::Result<Instant> {
         if program != "niri" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -65,9 +65,10 @@ impl<R: CommandRunner> OverviewRunner for ProcessOverviewRunner<R> {
         }
         let mut command = CommandSpec::new(program, args.iter().cloned());
         command.timeout = timeout;
+        let started_at = Instant::now();
         let output = self.0.run(&command).map_err(io::Error::other)?;
         if output.status == 0 {
-            Ok(())
+            Ok(started_at)
         } else {
             Err(io::Error::other(format!(
                 "Niri command exited with status {}",
@@ -82,7 +83,7 @@ impl<R: CommandRunner> OverviewRunner for ProcessOverviewRunner<R> {
         args: &[String],
         timeout: Duration,
         control: &RunControl,
-    ) -> io::Result<()> {
+    ) -> io::Result<Instant> {
         if program != "niri" {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -91,12 +92,12 @@ impl<R: CommandRunner> OverviewRunner for ProcessOverviewRunner<R> {
         }
         let mut command = CommandSpec::new(program, args.iter().cloned());
         command.timeout = timeout;
-        let output = self
+        let (output, started_at) = self
             .0
-            .run_controlled(&command, control)
+            .run_controlled_started(&command, control)
             .map_err(io::Error::other)?;
         if output.status == 0 {
-            Ok(())
+            Ok(started_at)
         } else {
             Err(io::Error::other(format!(
                 "Niri command exited with status {}",
@@ -106,15 +107,37 @@ impl<R: CommandRunner> OverviewRunner for ProcessOverviewRunner<R> {
     }
 }
 
-pub trait OverviewEventSource: Send + Sync + 'static {
-    fn next_event(&self, timeout: Duration) -> io::Result<Option<OverviewEvent>>;
+#[derive(Debug, Clone)]
+pub struct ObservedOverviewEvent {
+    event: OverviewEvent,
+    observed_at: Instant,
+}
 
-    fn try_event(&self) -> io::Result<Option<OverviewEvent>> {
+impl ObservedOverviewEvent {
+    pub fn now(event: OverviewEvent) -> Self {
+        Self {
+            event,
+            observed_at: Instant::now(),
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        self.event.sequence()
+    }
+}
+
+pub trait OverviewEventSource: Send + Sync + 'static {
+    fn next_event(&self, timeout: Duration) -> io::Result<Option<ObservedOverviewEvent>>;
+
+    fn try_event(&self) -> io::Result<Option<ObservedOverviewEvent>> {
         Ok(None)
     }
 
-    fn prepare_request(&self, current_sequence: u64) -> io::Result<(u64, Option<OverviewEvent>)> {
-        Ok((current_sequence, None))
+    fn prepare_request(
+        &self,
+        current_sequence: u64,
+    ) -> io::Result<(u64, Vec<ObservedOverviewEvent>)> {
+        Ok((current_sequence, Vec::new()))
     }
 }
 
@@ -132,7 +155,7 @@ struct OverviewChannel {
 }
 
 struct OverviewChannelState {
-    events: VecDeque<OverviewEvent>,
+    events: VecDeque<ObservedOverviewEvent>,
     capacity: usize,
     latest_sequence: u64,
     dropped_through: u64,
@@ -159,12 +182,13 @@ pub fn overview_event_channel(capacity: usize) -> (OverviewEventSender, ChannelO
 
 impl OverviewEventSender {
     pub fn publish(&self, event: OverviewEvent) -> io::Result<()> {
+        let observed = ObservedOverviewEvent::now(event);
         let mut state = self
             .0
             .state
             .lock()
             .map_err(|_| io::Error::other("overview event channel lock poisoned"))?;
-        if event.sequence() <= state.latest_sequence {
+        if observed.sequence() <= state.latest_sequence {
             return Ok(());
         }
         if state.events.len() == state.capacity {
@@ -172,15 +196,15 @@ impl OverviewEventSender {
                 state.dropped_through = dropped.sequence();
             }
         }
-        state.latest_sequence = event.sequence();
-        state.events.push_back(event);
+        state.latest_sequence = observed.sequence();
+        state.events.push_back(observed);
         self.0.changed.notify_all();
         Ok(())
     }
 }
 
 impl OverviewEventSource for ChannelOverviewEvents {
-    fn next_event(&self, timeout: Duration) -> io::Result<Option<OverviewEvent>> {
+    fn next_event(&self, timeout: Duration) -> io::Result<Option<ObservedOverviewEvent>> {
         let mut cursor = self
             .cursor
             .lock()
@@ -200,7 +224,7 @@ impl OverviewEventSource for ChannelOverviewEvents {
         next_channel_event(&state, &mut cursor)
     }
 
-    fn try_event(&self) -> io::Result<Option<OverviewEvent>> {
+    fn try_event(&self) -> io::Result<Option<ObservedOverviewEvent>> {
         let mut cursor = self
             .cursor
             .lock()
@@ -213,7 +237,10 @@ impl OverviewEventSource for ChannelOverviewEvents {
         next_channel_event(&state, &mut cursor)
     }
 
-    fn prepare_request(&self, current_sequence: u64) -> io::Result<(u64, Option<OverviewEvent>)> {
+    fn prepare_request(
+        &self,
+        current_sequence: u64,
+    ) -> io::Result<(u64, Vec<ObservedOverviewEvent>)> {
         let mut cursor = self
             .cursor
             .lock()
@@ -227,16 +254,21 @@ impl OverviewEventSource for ChannelOverviewEvents {
             *cursor = state.dropped_through;
             return Err(lagged_error());
         }
+        let retained = state
+            .events
+            .iter()
+            .filter(|event| event.sequence() > *cursor)
+            .cloned()
+            .collect();
         *cursor = state.latest_sequence;
-        let latest = state.events.back().cloned();
-        Ok((current_sequence.max(state.latest_sequence), latest))
+        Ok((current_sequence.max(state.latest_sequence), retained))
     }
 }
 
 fn next_channel_event(
     state: &OverviewChannelState,
     cursor: &mut u64,
-) -> io::Result<Option<OverviewEvent>> {
+) -> io::Result<Option<ObservedOverviewEvent>> {
     if *cursor < state.dropped_through {
         *cursor = state.dropped_through;
         return Err(lagged_error());
@@ -308,9 +340,9 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
         command: DaemonCommand,
         control: &RunControl,
     ) -> io::Result<OverviewEvent> {
-        let (baseline, current) = self.events.prepare_request(self.sequence)?;
-        if let Some(event) = current {
-            self.observe(event);
+        let (baseline, retained) = self.events.prepare_request(self.sequence)?;
+        for observed in retained {
+            self.observe(observed.event);
         }
         if !self.online {
             return Err(io::Error::new(
@@ -322,8 +354,9 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
         let baseline = baseline.max(self.sequence);
         let routed_output = self.focused_output.clone();
         let deadline = Instant::now() + self.timeout;
-        self.runner
-            .run_controlled("niri", &args, self.timeout, control)?;
+        let command_started_at =
+            self.runner
+                .run_controlled("niri", &args, self.timeout, control)?;
         loop {
             if control.is_cancelled() || control.remaining().is_zero() {
                 return Err(io::Error::new(
@@ -339,9 +372,10 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
                     "Niri did not confirm the command",
                 ));
             }
-            let event = self.events.next_event(remaining)?.ok_or_else(|| {
+            let observed = self.events.next_event(remaining)?.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::TimedOut, "Niri did not confirm the command")
             })?;
+            let event = observed.event;
             if event.sequence() <= baseline {
                 continue;
             }
@@ -352,7 +386,9 @@ impl<R: OverviewRunner, E: OverviewEventSource> NiriOverview<R, E> {
                     "Niri went offline before confirmation",
                 ));
             }
-            if confirms(&command, &event, routed_output.as_deref()) {
+            if observed.observed_at >= command_started_at
+                && confirms(&command, &event, routed_output.as_deref())
+            {
                 self.observe(event.clone());
                 return Ok(event);
             }

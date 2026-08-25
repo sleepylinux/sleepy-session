@@ -20,6 +20,8 @@ const MAX_UNFOLDED_LINES: usize = 65_536;
 const MAX_CALENDAR_SOURCES: usize = 1024;
 const MAX_TOTAL_EVENTS: usize = 8192;
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOURCE_ERROR_MESSAGE_BYTES: usize = 512;
+const SOURCE_ERROR_BUDGET: usize = 2048;
 
 pub struct IcsCalendarProvider {
     sources: Vec<PathBuf>,
@@ -62,10 +64,16 @@ impl IcsCalendarProvider {
         }
         let mut events = Vec::new();
         let mut source_errors = Vec::new();
-        let mut bytes_used = window_start
-            .len()
-            .saturating_add(window_end.len())
-            .saturating_add(256);
+        let mut bytes_used = serde_json::to_vec(&CalendarSnapshot {
+            schema_version: WIRE_SCHEMA_VERSION,
+            provider_id: "local-ics".into(),
+            window_start: window_start.into(),
+            window_end: window_end.into(),
+            events: Vec::new(),
+            source_errors: Vec::new(),
+        })
+        .map_err(io::Error::other)?
+        .len();
         for source in &self.sources {
             check_control(control)?;
             let source_id = source
@@ -79,7 +87,9 @@ impl IcsCalendarProvider {
                 start,
                 end,
                 self.max_occurrences,
-                MAX_SNAPSHOT_BYTES.saturating_sub(bytes_used),
+                MAX_SNAPSHOT_BYTES
+                    .saturating_sub(bytes_used)
+                    .saturating_sub(SOURCE_ERROR_BUDGET),
                 control,
             ) {
                 Ok((mut parsed, parsed_bytes)) => {
@@ -92,17 +102,11 @@ impl IcsCalendarProvider {
                         .ok_or_else(budget_error)?;
                     events.append(&mut parsed)
                 }
-                Err(error) if error.kind() == io::ErrorKind::FileTooLarge => return Err(error),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error),
                 Err(error) => {
-                    let source_error = CalendarSourceError {
-                        source_id,
-                        message: error.to_string(),
-                    };
-                    let error_bytes = serde_json::to_vec(&source_error)
-                        .map_err(io::Error::other)?
-                        .len();
+                    let (source_error, error_bytes) = bounded_source_error(source_id, &error)?;
                     bytes_used = bytes_used
-                        .checked_add(error_bytes)
+                        .checked_add(error_bytes.saturating_add(1))
                         .filter(|used| *used <= MAX_SNAPSHOT_BYTES)
                         .ok_or_else(budget_error)?;
                     source_errors.push(source_error);
@@ -487,7 +491,10 @@ fn expand(
                 source_id: source_id.to_owned(),
                 location: raw.location.clone(),
             };
-            let serialized = serde_json::to_vec(&event).map_err(io::Error::other)?.len();
+            let serialized = serde_json::to_vec(&event)
+                .map_err(io::Error::other)?
+                .len()
+                .saturating_add(1);
             event_bytes = event_bytes
                 .checked_add(serialized)
                 .filter(|used| *used <= byte_budget)
@@ -514,6 +521,40 @@ fn budget_error() -> io::Error {
         io::ErrorKind::FileTooLarge,
         "calendar aggregate byte budget exceeded",
     )
+}
+
+fn bounded_error_message(message: &str) -> String {
+    if message.len() <= MAX_SOURCE_ERROR_MESSAGE_BYTES {
+        return message.to_owned();
+    }
+    let mut boundary = MAX_SOURCE_ERROR_MESSAGE_BYTES;
+    while !message.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    message[..boundary].to_owned()
+}
+
+fn bounded_source_error(
+    source_id: String,
+    error: &io::Error,
+) -> io::Result<(CalendarSourceError, usize)> {
+    let mut source_error = CalendarSourceError {
+        source_id,
+        message: bounded_error_message(&error.to_string()),
+    };
+    let mut bytes = serde_json::to_vec(&source_error)
+        .map_err(io::Error::other)?
+        .len();
+    if bytes > SOURCE_ERROR_BUDGET {
+        source_error = CalendarSourceError {
+            source_id: "unknown".into(),
+            message: "calendar source failed within its bounded budget".into(),
+        };
+        bytes = serde_json::to_vec(&source_error)
+            .map_err(io::Error::other)?
+            .len();
+    }
+    Ok((source_error, bytes))
 }
 
 fn parse_utc(value: &str) -> io::Result<DateTime<Utc>> {

@@ -550,6 +550,7 @@ async fn serve_client<B: DailyBackend>(
         let Some(line) = line else {
             return Ok(());
         };
+        let response_deadline = Instant::now() + request_timeout;
         let response = match serde_json::from_slice::<DailyRequest>(&line) {
             Ok(request)
                 if request.schema_version == WIRE_SCHEMA_VERSION
@@ -561,10 +562,7 @@ async fn serve_client<B: DailyBackend>(
                     permit = Arc::clone(&workers).acquire_owned() => permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "daily worker pool closed"))?,
                 };
                 let cancelled = Arc::new(AtomicBool::new(false));
-                let control = RunControl::for_request(
-                    Instant::now() + request_timeout,
-                    Arc::clone(&cancelled),
-                );
+                let control = RunControl::for_request(response_deadline, Arc::clone(&cancelled));
                 let worker_backend = Arc::clone(&backend);
                 let operation = request.operation;
                 let mut worker = tokio::task::spawn_blocking(move || {
@@ -575,9 +573,10 @@ async fn serve_client<B: DailyBackend>(
                     biased;
                     _ = shutdown.recv() => {
                         cancelled.store(true, Ordering::SeqCst);
-                        worker.await.map_err(|error| io::Error::other(format!("daily worker failed: {error}")))?
+                        let _ = worker.await.map_err(|error| io::Error::other(format!("daily worker failed: {error}")))?;
+                        return Ok(());
                     }
-                    _ = tokio::time::sleep(request_timeout) => {
+                    _ = tokio::time::sleep(response_deadline.saturating_duration_since(Instant::now())) => {
                         cancelled.store(true, Ordering::SeqCst);
                         let _ = worker.await.map_err(|error| io::Error::other(format!("daily worker failed: {error}")))?;
                         Err(io::Error::new(io::ErrorKind::TimedOut, "daily request exceeded deadline"))
@@ -598,9 +597,26 @@ async fn serve_client<B: DailyBackend>(
             Ok(request) => error_response(&request.request_id, "invalid daily request contract"),
             Err(error) => error_response("unknown", &format!("invalid daily request: {error}")),
         };
+        if stopping.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let mut bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
         bytes.push(b'\n');
-        write.write_all(&bytes).await?;
+        let remaining = response_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "daily response exceeded request deadline",
+            ));
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.recv() => return Ok(()),
+            written = tokio::time::timeout(remaining, write.write_all(&bytes)) => {
+                written
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daily response write exceeded request deadline"))??;
+            }
+        }
     }
 }
 

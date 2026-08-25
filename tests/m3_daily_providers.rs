@@ -11,9 +11,10 @@ use sleepy_session::{
     daily::{DailyBackend, DailyOperation, DailyResponse, DailySocket, DailyStatus},
     launcher::{DesktopEntryIndex, LaunchResources, LauncherMetrics},
     overview::{
-        overview_event_channel, NiriOverview, OverviewEvent, OverviewEventSender,
-        OverviewEventSource, OverviewRunner,
+        overview_event_channel, NiriOverview, ObservedOverviewEvent, OverviewEvent,
+        OverviewEventSender, OverviewEventSource, OverviewRunner, ProcessOverviewRunner,
     },
+    system::{CommandOutput, CommandRunner, CommandSpec, RunControl},
     weather::{
         HttpRequest, HttpResponse, HttpTransport, ManualClock, MetNoProvider, NominatimProvider,
     },
@@ -177,18 +178,29 @@ fn launcher_metrics_are_private_persistent_and_ranking_is_deterministic() {
 struct FakeOverviewRunner(Arc<Mutex<Vec<Vec<String>>>>);
 
 impl OverviewRunner for FakeOverviewRunner {
-    fn run(&self, program: &str, args: &[String], _timeout: Duration) -> io::Result<()> {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        _timeout: Duration,
+    ) -> io::Result<std::time::Instant> {
+        let started_at = std::time::Instant::now();
         assert_eq!(program, "niri");
         self.0.lock().unwrap().push(args.to_vec());
-        Ok(())
+        Ok(started_at)
     }
 }
 
 struct FakeOverviewEvents(Mutex<VecDeque<OverviewEvent>>);
 
 impl OverviewEventSource for FakeOverviewEvents {
-    fn next_event(&self, _timeout: Duration) -> io::Result<Option<OverviewEvent>> {
-        Ok(self.0.lock().unwrap().pop_front())
+    fn next_event(&self, _timeout: Duration) -> io::Result<Option<ObservedOverviewEvent>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(ObservedOverviewEvent::now))
     }
 }
 
@@ -311,14 +323,153 @@ fn focus_window_can_confirm_on_the_windows_actual_new_output() {
 struct PublishingOverviewRunner(OverviewEventSender);
 
 impl OverviewRunner for PublishingOverviewRunner {
-    fn run(&self, _program: &str, _args: &[String], _timeout: Duration) -> io::Result<()> {
+    fn run(
+        &self,
+        _program: &str,
+        _args: &[String],
+        _timeout: Duration,
+    ) -> io::Result<std::time::Instant> {
+        let started_at = std::time::Instant::now();
         self.0.publish(OverviewEvent::FocusChanged {
             output_id: "DP-2".into(),
             window_id: Some(42),
             workspace_id: 9,
             sequence: 2,
-        })
+        })?;
+        Ok(started_at)
     }
+}
+
+#[derive(Clone)]
+struct CausalCommandRunner(OverviewEventSender);
+
+impl CommandRunner for CausalCommandRunner {
+    fn run(
+        &self,
+        _command: &CommandSpec,
+    ) -> Result<CommandOutput, sleepy_session::system::RunnerError> {
+        unreachable!("causal overview must use the controlled start-reporting seam")
+    }
+
+    fn run_controlled_started(
+        &self,
+        command: &CommandSpec,
+        _control: &RunControl,
+    ) -> Result<(CommandOutput, std::time::Instant), sleepy_session::system::RunnerError> {
+        assert_eq!(command.program, "niri");
+        assert_eq!(
+            command.args,
+            ["msg", "action", "focus-window", "--id", "42"]
+        );
+        self.0
+            .publish(OverviewEvent::FocusChanged {
+                output_id: "DP-1".into(),
+                window_id: Some(42),
+                workspace_id: 1,
+                sequence: 2,
+            })
+            .unwrap();
+        let command_started = std::time::Instant::now();
+        self.0
+            .publish(OverviewEvent::FocusChanged {
+                output_id: "DP-1".into(),
+                window_id: Some(42),
+                workspace_id: 1,
+                sequence: 3,
+            })
+            .unwrap();
+        Ok((
+            CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+            command_started,
+        ))
+    }
+}
+
+#[test]
+fn overview_rejects_matching_event_observed_before_actual_command_start() {
+    let (sender, events) = overview_event_channel(8);
+    sender
+        .publish(OverviewEvent::FocusChanged {
+            output_id: "DP-1".into(),
+            window_id: Some(1),
+            workspace_id: 1,
+            sequence: 1,
+        })
+        .unwrap();
+    let mut overview = NiriOverview::new(
+        ProcessOverviewRunner(CausalCommandRunner(sender)),
+        events,
+        Duration::from_millis(50),
+    );
+    assert_eq!(
+        overview
+            .execute(DaemonCommand::FocusWindow { window_id: 42 })
+            .unwrap()
+            .sequence(),
+        3
+    );
+}
+
+#[derive(Clone)]
+struct MultiOutputPublishingRunner(OverviewEventSender);
+
+impl OverviewRunner for MultiOutputPublishingRunner {
+    fn run(
+        &self,
+        _program: &str,
+        _args: &[String],
+        _timeout: Duration,
+    ) -> io::Result<std::time::Instant> {
+        let started_at = std::time::Instant::now();
+        self.0.publish(OverviewEvent::FocusChanged {
+            output_id: "DP-2".into(),
+            window_id: Some(9),
+            workspace_id: 7,
+            sequence: 3,
+        })?;
+        self.0.publish(OverviewEvent::FocusChanged {
+            output_id: "DP-1".into(),
+            window_id: Some(9),
+            workspace_id: 7,
+            sequence: 4,
+        })?;
+        Ok(started_at)
+    }
+}
+
+#[test]
+fn overview_folds_all_retained_events_before_routing_command() {
+    let (sender, events) = overview_event_channel(8);
+    sender
+        .publish(OverviewEvent::FocusChanged {
+            output_id: "DP-1".into(),
+            window_id: Some(9),
+            workspace_id: 1,
+            sequence: 1,
+        })
+        .unwrap();
+    sender
+        .publish(OverviewEvent::WindowClosed {
+            window_id: 100,
+            sequence: 2,
+        })
+        .unwrap();
+    let mut overview = NiriOverview::new(
+        MultiOutputPublishingRunner(sender),
+        events,
+        Duration::from_millis(50),
+    );
+    assert_eq!(
+        overview
+            .execute(DaemonCommand::FocusWorkspace { workspace_id: 7 })
+            .unwrap()
+            .sequence(),
+        4
+    );
 }
 
 #[test]
@@ -785,14 +936,41 @@ fn calendar_honors_request_cancellation_and_stops_incremental_expansion() {
 }
 
 #[test]
-fn calendar_rejects_serialized_budget_during_not_after_event_accumulation() {
+fn calendar_enforces_serialized_budget_during_not_after_event_accumulation() {
     let root = tempdir().unwrap();
     let summary = "x".repeat(100_000);
     fs::write(root.path().join("large.ics"), format!("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:x\nSUMMARY:{summary}\nDTSTART:20260801T000000Z\nDTEND:20260801T010000Z\nRRULE:FREQ=DAILY;COUNT=30\nEND:VEVENT\nEND:VCALENDAR\n")).unwrap();
-    let error = IcsCalendarProvider::new(vec![root.path().join("large.ics")], 64)
+    let snapshot = IcsCalendarProvider::new(vec![root.path().join("large.ics")], 64)
         .snapshot("2026-08-01T00:00:00Z", "2026-09-15T00:00:00Z")
-        .unwrap_err();
-    assert_eq!(error.to_string(), "calendar aggregate byte budget exceeded");
+        .unwrap();
+    assert!(snapshot.events.is_empty());
+    assert_eq!(snapshot.source_errors.len(), 1);
+    assert_eq!(
+        snapshot.source_errors[0].message,
+        "calendar aggregate byte budget exceeded"
+    );
+    assert!(serde_json::to_vec(&snapshot).unwrap().len() <= 2 * 1024 * 1024);
+}
+
+#[test]
+fn calendar_isolates_oversized_source_and_keeps_later_valid_events() {
+    let root = tempdir().unwrap();
+    let summary = "x".repeat(100_000);
+    fs::write(root.path().join("a-large.ics"), format!("BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:large\nSUMMARY:{summary}\nDTSTART:20260801T000000Z\nDTEND:20260801T010000Z\nRRULE:FREQ=DAILY;COUNT=30\nEND:VEVENT\nEND:VCALENDAR\n")).unwrap();
+    fs::write(root.path().join("b-valid.ics"), "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:valid\nSUMMARY:Visible\nDTSTART:20260802T000000Z\nDTEND:20260802T010000Z\nEND:VEVENT\nEND:VCALENDAR\n").unwrap();
+    let snapshot = IcsCalendarProvider::new(
+        vec![
+            root.path().join("a-large.ics"),
+            root.path().join("b-valid.ics"),
+        ],
+        64,
+    )
+    .snapshot("2026-08-01T00:00:00Z", "2026-09-15T00:00:00Z")
+    .unwrap();
+    assert_eq!(snapshot.events.len(), 1);
+    assert_eq!(snapshot.events[0].summary, "Visible");
+    assert_eq!(snapshot.source_errors.len(), 1);
+    assert_eq!(snapshot.source_errors[0].source_id, "a-large.ics");
 }
 
 fn entry(name: &str, exec: &str, extra: &str) -> String {
@@ -816,6 +994,22 @@ impl DailyBackend for FakeDaily {
 struct ControlledDaily {
     active: std::sync::atomic::AtomicUsize,
     peak: std::sync::atomic::AtomicUsize,
+}
+
+struct LargeDaily {
+    completed: std::sync::atomic::AtomicBool,
+}
+
+impl DailyBackend for LargeDaily {
+    fn handle_controlled(
+        &self,
+        _operation: DailyOperation,
+        _control: &sleepy_session::system::RunControl,
+    ) -> io::Result<serde_json::Value> {
+        self.completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::Value::String("x".repeat(4 * 1024 * 1024)))
+    }
 }
 
 impl DailyBackend for ControlledDaily {
@@ -970,4 +1164,57 @@ async fn daily_socket_rejects_excess_connections_before_spawning_queued_tasks() 
         .await
         .unwrap();
     serve.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daily_shutdown_does_not_wait_for_non_reading_clients_response_write() {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+    let root = tempdir().unwrap();
+    let path = root.path().join("sleepy/daily.sock");
+    let backend = Arc::new(LargeDaily {
+        completed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let socket = Arc::new(
+        DailySocket::bind_with_limits(
+            &path,
+            unsafe { libc::geteuid() },
+            Arc::clone(&backend),
+            1,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap(),
+    );
+    let serving = Arc::clone(&socket);
+    let serve = tokio::spawn(async move { serving.serve().await });
+    let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+    client.write_all(b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e65\",\"operation\":{\"type\":\"launcherSearch\",\"data\":{\"query\":\"term\"}}}\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !backend.completed.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let draining = Arc::clone(&socket);
+    let mut drain = tokio::spawn(async move {
+        draining
+            .shutdown_and_drain(Duration::from_millis(150))
+            .await
+    });
+    let completed = tokio::time::timeout(Duration::from_millis(400), &mut drain).await;
+    let finished_while_client_was_not_reading = completed.is_ok();
+    drop(client);
+    let drain_result = match completed {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => drain.await.unwrap(),
+    };
+    serve.await.unwrap().unwrap();
+    assert!(
+        finished_while_client_was_not_reading,
+        "daily drain remained stuck in an unbounded response write"
+    );
+    drain_result.unwrap();
 }

@@ -108,6 +108,16 @@ pub trait CommandRunner: Clone + Send + Sync + 'static {
         }
         self.run(command)
     }
+
+    fn run_controlled_started(
+        &self,
+        command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<(CommandOutput, Instant), RunnerError> {
+        let started_at = Instant::now();
+        self.run_controlled(command, control)
+            .map(|output| (output, started_at))
+    }
 }
 
 #[derive(Clone)]
@@ -171,6 +181,7 @@ pub struct ProcessCommandRunner;
 impl CommandRunner for ProcessCommandRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, RunnerError> {
         self.execute(spec, &RunControl::for_timeout(spec.timeout))
+            .map(|(output, _)| output)
     }
 
     fn run_controlled(
@@ -178,6 +189,14 @@ impl CommandRunner for ProcessCommandRunner {
         spec: &CommandSpec,
         control: &RunControl,
     ) -> Result<CommandOutput, RunnerError> {
+        self.execute(spec, control).map(|(output, _)| output)
+    }
+
+    fn run_controlled_started(
+        &self,
+        spec: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<(CommandOutput, Instant), RunnerError> {
         self.execute(spec, control)
     }
 }
@@ -187,7 +206,7 @@ impl ProcessCommandRunner {
         &self,
         spec: &CommandSpec,
         control: &RunControl,
-    ) -> Result<CommandOutput, RunnerError> {
+    ) -> Result<(CommandOutput, Instant), RunnerError> {
         if control.is_cancelled() {
             return Err(RunnerError::cancelled());
         }
@@ -200,6 +219,7 @@ impl ProcessCommandRunner {
         for (key, value) in &spec.env {
             command.env(key, value);
         }
+        let started = Instant::now();
         let mut child = command.spawn().map_err(|error| {
             RunnerError::new(
                 RunnerErrorKind::Spawn,
@@ -211,7 +231,6 @@ impl ProcessCommandRunner {
         let capture_limit = spec.max_output_bytes;
         let stdout_reader = thread::spawn(move || read_capped(stdout, capture_limit));
         let stderr_reader = thread::spawn(move || read_capped(stderr, capture_limit));
-        let started = Instant::now();
         let status = loop {
             if control.is_cancelled() {
                 terminate_and_reap(&mut child, stdout_reader, stderr_reader);
@@ -243,11 +262,14 @@ impl ProcessCommandRunner {
         let stderr = stderr_reader
             .join()
             .map_err(|_| RunnerError::new(RunnerErrorKind::Io, "stderr reader failed"))??;
-        Ok(CommandOutput {
-            status: status.code().unwrap_or(128),
-            stdout,
-            stderr,
-        })
+        Ok((
+            CommandOutput {
+                status: status.code().unwrap_or(128),
+                stdout,
+                stderr,
+            },
+            started,
+        ))
     }
 }
 
