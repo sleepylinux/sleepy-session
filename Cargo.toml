@@ -12,7 +12,7 @@ libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "7abd3194055b4cbeef2a021b73ba7f4ce3923d02" }
+sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "152173b470fa7d1e90c6d3d6be103a4a4d3529bc" }
 tokio = { version = "=1.43.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1.24", features = ["v4"] }
 
