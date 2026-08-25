@@ -11,6 +11,7 @@ pub mod overview;
 pub mod sessiond;
 mod store;
 pub mod system;
+pub mod theme;
 pub mod weather;
 
 pub use store::{

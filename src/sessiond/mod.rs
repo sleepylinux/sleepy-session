@@ -8,7 +8,7 @@ pub(crate) mod private_socket;
 mod socket;
 mod sources;
 
-pub use authority::GenerationAuthority;
+pub use authority::{GenerationAuthority, GenerationGuard};
 pub use generation::GenerationAllocator;
 pub use hub::{EventHub, EventSubscriber, PublishError};
 pub use lifecycle::{LifecycleReconciler, ReconciliationReport, ShutdownCoordinator};
