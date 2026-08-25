@@ -2,6 +2,8 @@
 
 pub mod bindings;
 pub mod cli;
+pub mod notifications;
+pub mod osd;
 pub mod sessiond;
 mod store;
 pub mod system;
