@@ -26,11 +26,11 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
       - name: Check Rust formatting
-        run: cargo fmt --check
+        run: nix develop --no-write-lock-file --command cargo fmt --check
       - name: Lint every Rust target
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: nix develop --no-write-lock-file --command cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test locked Rust graph
-        run: cargo test --locked --all-targets --all-features
+        run: nix develop --no-write-lock-file --command cargo test --locked --all-targets --all-features
       - name: Evaluate every supported system
         run: nix flake check --no-write-lock-file --all-systems --no-build --show-trace
       - name: Assert tracked source is unchanged
