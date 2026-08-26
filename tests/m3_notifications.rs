@@ -15,6 +15,16 @@ struct FreedesktopNotificationProvider {
     _generation: tempfile::TempDir,
 }
 
+struct StoreGuard<'a>(std::sync::MutexGuard<'a, RealNotificationProvider>);
+
+impl std::ops::Deref for StoreGuard<'_> {
+    type Target = NotificationStore;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.store()
+    }
+}
+
 impl FreedesktopNotificationProvider {
     fn new(store: NotificationStore) -> io::Result<Self> {
         let provider = RealNotificationProvider::new(store)?;
@@ -49,8 +59,8 @@ impl FreedesktopNotificationProvider {
         self.runtime.block_on(self.service.origin_lost(origin))
     }
 
-    fn store(&self) -> &NotificationStore {
-        self.service.provider().store()
+    fn store(&self) -> StoreGuard<'_> {
+        StoreGuard(self.service.provider())
     }
 
     fn bus_name(&self) -> &'static str {
@@ -102,6 +112,61 @@ fn fresh_notification(urgency: NotificationUrgency) -> NotificationDocument {
     let mut document = notification(1, urgency);
     document.id = 0;
     document
+}
+
+#[test]
+fn legacy_archive_migrates_lazily_and_mutations_append_without_rewriting_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive_path = temp.path().join("archive.json");
+    let mut archive = Vec::with_capacity(600);
+    for id in 1..=600 {
+        let mut item = notification(id, NotificationUrgency::Normal);
+        item.body = "x".repeat(60_000);
+        item.archived = true;
+        item.actions[0].state = NotificationActionState::Expired;
+        archive.push(item);
+    }
+    let mut legacy_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "notifications": archive,
+    }))
+    .unwrap();
+    legacy_bytes.push(b'\n');
+    std::fs::write(&archive_path, &legacy_bytes).unwrap();
+    std::fs::set_permissions(&archive_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let store = NotificationStore::open(temp.path(), 500).unwrap();
+    assert_eq!(store.archive().len(), 600);
+    drop(store);
+    assert_eq!(std::fs::read(&archive_path).unwrap(), legacy_bytes);
+    assert!(!temp.path().join("checkpoint-v2.json").exists());
+
+    let store = NotificationStore::open(temp.path(), 500).unwrap();
+    let mut provider = FreedesktopNotificationProvider::new(store).unwrap();
+    for _ in 0..100 {
+        provider
+            .notify(NotifyRequest {
+                origin: ":1.700".into(),
+                notification: fresh_notification(NotificationUrgency::Normal),
+            })
+            .unwrap();
+    }
+    drop(provider);
+
+    assert_eq!(std::fs::read(&archive_path).unwrap(), legacy_bytes);
+    assert_eq!(
+        std::fs::read(temp.path().join("legacy-archive.json")).unwrap(),
+        legacy_bytes
+    );
+    assert!(
+        std::fs::metadata(temp.path().join("segment-v2.ndjson"))
+            .unwrap()
+            .len()
+            < 512 * 1024
+    );
+    let reopened = NotificationStore::open(temp.path(), 500).unwrap();
+    assert_eq!(reopened.archive().len(), 600);
+    assert_eq!(reopened.active().len(), 100);
 }
 
 #[test]
@@ -296,7 +361,8 @@ fn notification_writes_stay_on_the_retained_directory_after_path_swap() {
         })
         .unwrap();
 
-    assert!(retained.join("active.json").is_file());
+    assert!(retained.join("checkpoint-v2.json").is_file());
+    assert!(retained.join("segment-v2.ndjson").is_file());
     assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
 }
 
@@ -375,6 +441,152 @@ fn every_notification_commit_fault_reconciles_to_one_complete_transaction() {
         );
         assert!(!temp.path().join("transaction.json").exists());
     }
+}
+
+#[test]
+fn v2_migration_checkpoint_rotation_and_append_faults_recover_at_record_boundaries() {
+    for stage in NotificationCommitStage::V2_ALL {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NotificationStore::open(temp.path(), 500)
+            .unwrap()
+            .with_commit_observer(Arc::new(FailOnceAt {
+                target: stage,
+                failed: Mutex::new(false),
+            }));
+        let mut provider = FreedesktopNotificationProvider::new(store).unwrap();
+        assert!(provider
+            .notify(NotifyRequest {
+                origin: ":1.801".into(),
+                notification: fresh_notification(NotificationUrgency::Normal),
+            })
+            .is_err());
+        drop(provider);
+
+        let recovered = NotificationStore::open(temp.path(), 500).unwrap();
+        let expected = usize::from(matches!(
+            stage,
+            NotificationCommitStage::AppendWritten
+                | NotificationCommitStage::AppendFileSynced
+                | NotificationCommitStage::AppendDirectorySynced
+                | NotificationCommitStage::RecordAppended
+        ));
+        assert_eq!(
+            recovered.active().len(),
+            expected,
+            "unexpected recovery boundary for {stage:?}"
+        );
+    }
+}
+
+#[test]
+fn ambiguous_append_failure_poisons_live_store_until_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = NotificationStore::open(temp.path(), 500)
+        .unwrap()
+        .with_commit_observer(Arc::new(FailOnceAt {
+            target: NotificationCommitStage::RecordAppended,
+            failed: Mutex::new(false),
+        }));
+    let mut provider = FreedesktopNotificationProvider::new(store).unwrap();
+    assert!(provider
+        .notify(NotifyRequest {
+            origin: ":1.803".into(),
+            notification: fresh_notification(NotificationUrgency::Normal),
+        })
+        .is_err());
+    let retry = provider.notify(NotifyRequest {
+        origin: ":1.803".into(),
+        notification: fresh_notification(NotificationUrgency::Normal),
+    });
+    assert!(retry.is_err(), "ambiguous append must require a reopen");
+    drop(provider);
+
+    let recovered = NotificationStore::open(temp.path(), 500).unwrap();
+    assert_eq!(recovered.active().len(), 1);
+}
+
+#[test]
+fn partial_segment_tail_is_truncated_before_later_appends() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = NotificationStore::open(temp.path(), 500).unwrap();
+    let mut provider = FreedesktopNotificationProvider::new(store).unwrap();
+    provider
+        .notify(NotifyRequest {
+            origin: ":1.802".into(),
+            notification: fresh_notification(NotificationUrgency::Normal),
+        })
+        .unwrap();
+    drop(provider);
+
+    let segment = temp.path().join("segment-v2.ndjson");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .unwrap()
+        .write_all(b"{\"schemaVersion\":1")
+        .unwrap();
+    let partial_bytes = std::fs::read(&segment).unwrap();
+    let store = NotificationStore::open(temp.path(), 500).unwrap();
+    assert_eq!(
+        std::fs::read(&segment).unwrap(),
+        partial_bytes,
+        "read-only recovery must defer tail repair until mutation"
+    );
+    let mut provider = FreedesktopNotificationProvider::new(store).unwrap();
+    provider
+        .notify(NotifyRequest {
+            origin: ":1.803".into(),
+            notification: fresh_notification(NotificationUrgency::Critical),
+        })
+        .unwrap();
+    drop(provider);
+
+    let recovered = NotificationStore::open(temp.path(), 500).unwrap();
+    assert_eq!(
+        recovered
+            .active()
+            .iter()
+            .map(|notification| notification.id)
+            .collect::<Vec<_>>(),
+        [1, 2]
+    );
+}
+
+#[test]
+fn notification_log_rotates_bounded_segments_without_checkpointing_at_four_mib() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = NotificationStore::open(temp.path(), 500).unwrap();
+    let mut provider = FreedesktopNotificationProvider::new(store).unwrap();
+    for _ in 0..75 {
+        let mut notification = fresh_notification(NotificationUrgency::Normal);
+        notification.body = "x".repeat(60_000);
+        provider
+            .notify(NotifyRequest {
+                origin: ":1.804".into(),
+                notification,
+            })
+            .unwrap();
+    }
+    drop(provider);
+
+    let first = std::fs::metadata(temp.path().join("segment-v2.ndjson"))
+        .unwrap()
+        .len();
+    let second = std::fs::metadata(temp.path().join("segment-v2-1.ndjson"))
+        .unwrap()
+        .len();
+    assert!(first <= 4 * 1024 * 1024);
+    assert!(second <= 4 * 1024 * 1024);
+    assert!(first > 0 && second > 0);
+    assert_eq!(
+        NotificationStore::open(temp.path(), 500)
+            .unwrap()
+            .active()
+            .len(),
+        75
+    );
 }
 
 #[test]
@@ -775,12 +987,8 @@ fn interrupted_restart_expiry_reconciles_before_actions_can_be_used() {
 
     let store = NotificationStore::open(temp.path(), 500).unwrap();
     let provider = FreedesktopNotificationProvider::new(store).unwrap();
-    for notification in provider
-        .store()
-        .active()
-        .iter()
-        .chain(provider.store().archive())
-    {
+    let store = provider.store();
+    for notification in store.active().iter().chain(store.archive()) {
         assert!(notification
             .actions
             .iter()

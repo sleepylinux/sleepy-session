@@ -59,6 +59,7 @@ pub(crate) fn probe_battery<R: CommandRunner>(
             return Err(ProbeFailure {
                 kind: sleepy_sdk::CapabilityErrorKind::Command,
                 message: format!("upower exited with status {}", output.status),
+                availability: None,
             })
         }
         Err(error) => {
@@ -71,6 +72,7 @@ pub(crate) fn probe_battery<R: CommandRunner>(
                     super::RunnerErrorKind::Io => sleepy_sdk::CapabilityErrorKind::Command,
                 },
                 message: error.message().to_owned(),
+                availability: None,
             })
         }
     };

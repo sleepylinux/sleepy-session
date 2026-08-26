@@ -7,6 +7,10 @@ use std::{
     io::{self, Read},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +34,7 @@ pub struct DesktopAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DesktopEntry {
     pub desktop_id: String,
     pub name: String,
@@ -57,70 +62,32 @@ impl DesktopEntryIndex {
     where
         F: Fn(&str) -> bool,
     {
-        let data_home = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-            })
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "XDG data home is unavailable")
-            })?;
-        let data_dirs = std::env::var_os("XDG_DATA_DIRS")
-            .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
-            .unwrap_or_else(|| {
-                vec![
-                    PathBuf::from("/usr/local/share"),
-                    PathBuf::from("/usr/share"),
-                ]
-            });
-        let mut roots = vec![data_home.join("applications")];
-        roots.extend(data_dirs.into_iter().map(|root| root.join("applications")));
-        if roots.iter().any(|root| !root.is_absolute()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "XDG application roots must be absolute",
-            ));
-        }
+        let roots = xdg_application_roots()?;
         let desktops = std::env::var("XDG_CURRENT_DESKTOP")
             .unwrap_or_default()
             .split(':')
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        Self::scan(&roots, &desktops, try_exec)
+        Self::scan_with_cancel(&roots, &desktops, try_exec, &AtomicBool::new(false))
     }
 
-    pub fn scan<F>(roots: &[PathBuf], desktops: &[String], try_exec: F) -> io::Result<Self>
+    pub(crate) fn scan_xdg_cancelled<F>(try_exec: F, cancelled: &AtomicBool) -> io::Result<Self>
     where
         F: Fn(&str) -> bool,
     {
-        let mut shadowed = BTreeSet::new();
-        let mut entries = BTreeMap::new();
-        for root in roots {
-            if !root.is_dir() {
-                continue;
-            }
-            let mut paths = Vec::new();
-            collect_desktop_files(root, root, &mut paths)?;
-            paths.sort();
-            for path in paths {
-                if shadowed.len() >= MAX_ENTRIES {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "too many Desktop Entries",
-                    ));
-                }
-                let relative = path.strip_prefix(root).map_err(io::Error::other)?;
-                let desktop_id = relative.to_string_lossy().replace('/', "-");
-                if !shadowed.insert(desktop_id.clone()) {
-                    continue;
-                }
-                if let Ok(Some(entry)) = parse_entry(&path, desktop_id, desktops, &try_exec) {
-                    entries.insert(entry.desktop_id.clone(), entry);
-                }
-            }
-        }
-        Ok(Self { entries })
+        let roots = xdg_application_roots()?;
+        let desktops = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        Self::scan_with_cancel(&roots, &desktops, try_exec, cancelled)
+    }
+
+    pub fn empty() -> Self {
+        Self::default()
     }
 
     pub fn entries(&self) -> Vec<&DesktopEntry> {
@@ -158,14 +125,179 @@ impl DesktopEntryIndex {
     }
 }
 
+pub(crate) fn xdg_application_roots() -> io::Result<Vec<PathBuf>> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG data home is unavailable"))?;
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        });
+    let mut roots = vec![data_home.join("applications")];
+    roots.extend(data_dirs.into_iter().map(|root| root.join("applications")));
+    if roots.iter().any(|root| !root.is_absolute()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XDG application roots must be absolute",
+        ));
+    }
+    Ok(roots)
+}
+
+pub(crate) fn wait_for_application_change(
+    roots: &[PathBuf],
+    cancelled: Arc<AtomicBool>,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> io::Result<()> {
+    let descriptor = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mask = libc::IN_CLOSE_WRITE
+            | libc::IN_CREATE
+            | libc::IN_DELETE
+            | libc::IN_MOVED_FROM
+            | libc::IN_MOVED_TO;
+        let mut watched = 0usize;
+        for root in roots {
+            let candidate = if root.is_dir() {
+                root.clone()
+            } else if let Some(parent) = root.parent().filter(|parent| parent.is_dir()) {
+                parent.to_owned()
+            } else {
+                continue;
+            };
+            let mut pending = vec![candidate];
+            let mut visited = 0usize;
+            while let Some(directory) = pending.pop() {
+                visited += 1;
+                if visited > MAX_DIRECTORIES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "XDG application watch directory count exceeded limit",
+                    ));
+                }
+                let path = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes())
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "XDG path contains NUL")
+                    })?;
+                if unsafe { libc::inotify_add_watch(descriptor, path.as_ptr(), mask) } >= 0 {
+                    watched += 1;
+                }
+                if directory.starts_with(root) {
+                    for entry in fs::read_dir(&directory)? {
+                        let entry = entry?;
+                        if entry.file_type()?.is_dir() {
+                            pending.push(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+        if watched == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no XDG application directory can be watched",
+            ));
+        }
+        let _ = ready.send(());
+        let mut buffer = [0_u8; 4096];
+        while !cancelled.load(Ordering::Acquire) {
+            let mut poll = libc::pollfd {
+                fd: descriptor,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+            if ready < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if ready > 0
+                && unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) } > 0
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
+    })();
+    unsafe { libc::close(descriptor) };
+    result
+}
+
+impl DesktopEntryIndex {
+    pub fn scan<F>(roots: &[PathBuf], desktops: &[String], try_exec: F) -> io::Result<Self>
+    where
+        F: Fn(&str) -> bool,
+    {
+        Self::scan_with_cancel(roots, desktops, try_exec, &AtomicBool::new(false))
+    }
+
+    fn scan_with_cancel<F>(
+        roots: &[PathBuf],
+        desktops: &[String],
+        try_exec: F,
+        cancelled: &AtomicBool,
+    ) -> io::Result<Self>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut shadowed = BTreeSet::new();
+        let mut entries = BTreeMap::new();
+        for root in roots {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Desktop Entry scan cancelled",
+                ));
+            }
+            if !root.is_dir() {
+                continue;
+            }
+            let mut paths = Vec::new();
+            collect_desktop_files(root, root, &mut paths, cancelled)?;
+            paths.sort();
+            for path in paths {
+                if shadowed.len() >= MAX_ENTRIES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many Desktop Entries",
+                    ));
+                }
+                let relative = path.strip_prefix(root).map_err(io::Error::other)?;
+                let desktop_id = relative.to_string_lossy().replace('/', "-");
+                if !shadowed.insert(desktop_id.clone()) {
+                    continue;
+                }
+                if let Ok(Some(entry)) = parse_entry(&path, desktop_id, desktops, &try_exec) {
+                    entries.insert(entry.desktop_id.clone(), entry);
+                }
+            }
+        }
+        Ok(Self { entries })
+    }
+}
+
 fn collect_desktop_files(
     root: &Path,
     directory: &Path,
     output: &mut Vec<PathBuf>,
+    cancelled: &AtomicBool,
 ) -> io::Result<()> {
     let mut pending = vec![(directory.to_owned(), 0usize)];
     let mut directory_count = 0usize;
     while let Some((directory, depth)) = pending.pop() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Desktop Entry scan cancelled",
+            ));
+        }
         directory_count += 1;
         if directory_count > MAX_DIRECTORIES || depth > MAX_DEPTH {
             return Err(io::Error::new(

@@ -640,3 +640,53 @@ async fn osd_socket_replays_latest_then_monotonic_live_publications() {
         .unwrap();
     server.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn osd_socket_caps_stream_clients_and_rejects_the_thirty_third() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("runtime/sleepy/osd.sock");
+    let hub = OsdPublicationHub::new(8);
+    hub.publish(OsdPublication {
+        sequence: 1,
+        visible: Vec::new(),
+        overflow_by_output: Default::default(),
+    })
+    .unwrap();
+    let socket = std::sync::Arc::new(
+        OsdSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub)
+            .await
+            .unwrap(),
+    );
+    let server = tokio::spawn({
+        let socket = std::sync::Arc::clone(&socket);
+        async move { socket.serve().await }
+    });
+    let mut clients = Vec::new();
+    for _ in 0..32 {
+        let mut lines = BufReader::new(UnixStream::connect(&socket_path).await.unwrap()).lines();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
+        clients.push(lines);
+    }
+
+    let mut rejected = BufReader::new(UnixStream::connect(&socket_path).await.unwrap()).lines();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(200), rejected.next_line())
+            .await
+            .expect("the over-limit OSD connection must not queue")
+            .unwrap(),
+        None
+    );
+
+    drop(clients);
+    socket
+        .shutdown_and_drain(Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap().unwrap();
+}

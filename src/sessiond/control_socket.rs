@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::UnixStream};
 
+use crate::socket_supervisor::ConnectionSupervisor;
+
 const MAX_LINE: usize = 256 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -23,8 +25,7 @@ pub struct ControlSocket<B: MutationBackend> {
     endpoint: PrivateSocketEndpoint,
     pipeline: Arc<MutationPipeline<B>>,
     shutdown: tokio::sync::broadcast::Sender<()>,
-    connections: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
-    permits: Arc<tokio::sync::Semaphore>,
+    connections: ConnectionSupervisor,
     serving: AtomicBool,
     stopped: tokio::sync::Notify,
 }
@@ -40,8 +41,7 @@ impl<B: MutationBackend> ControlSocket<B> {
             endpoint: PrivateSocketEndpoint::bind(path, expected_uid).await?,
             pipeline,
             shutdown,
-            connections: tokio::sync::Mutex::new(Vec::new()),
-            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            connections: ConnectionSupervisor::new(MAX_CONNECTIONS),
             serving: AtomicBool::new(false),
             stopped: tokio::sync::Notify::new(),
         })
@@ -74,24 +74,16 @@ impl<B: MutationBackend> ControlSocket<B> {
             };
             let expected_uid = self.endpoint.expected_uid();
             let pipeline = Arc::clone(&self.pipeline);
-            let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            let Some(permit) = self.connections.try_admit() else {
+                eprintln!("event=rejected_connection endpoint=control reason=limit");
                 drop(stream);
                 continue;
             };
-            let mut connections = self.connections.lock().await;
-            let mut index = 0;
-            while index < connections.len() {
-                if connections[index].is_finished() {
-                    let finished = connections.remove(index);
-                    let _ = finished.await;
-                } else {
-                    index += 1;
-                }
-            }
-            connections.push(tokio::spawn(async move {
-                let _permit = permit;
-                serve_stream(stream, expected_uid, pipeline).await
-            }));
+            self.connections
+                .spawn(permit, async move {
+                    serve_stream(stream, expected_uid, pipeline).await
+                })
+                .await;
         }
     }
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<usize> {
@@ -112,18 +104,8 @@ impl<B: MutationBackend> ControlSocket<B> {
                 io::Error::new(io::ErrorKind::TimedOut, "control accept loop did not stop")
             })?;
         }
-        let handles = std::mem::take(&mut *self.connections.lock().await);
-        let count = handles.len();
-        for mut handle in handles {
-            if tokio::time::timeout_at(deadline, &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-                let _ = handle.await;
-            }
-        }
-        Ok(count)
+        let report = self.connections.drain(deadline).await;
+        Ok(report.completed + report.aborted)
     }
     pub fn path(&self) -> &Path {
         self.endpoint.path()

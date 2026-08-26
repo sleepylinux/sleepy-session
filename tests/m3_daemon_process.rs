@@ -12,7 +12,8 @@ use std::{
 
 use fs2::FileExt;
 use sleepy_sdk::{
-    validate_event_envelope, EventCauseKind, LifecycleEvent, LifecycleState, OsdKind, SessionEvent,
+    validate_event_envelope, CapabilityAvailability, EventCauseKind, LifecycleEvent,
+    LifecycleState, OsdKind, SessionEvent,
 };
 use sleepy_session::osd::OsdPublication;
 use sleepy_session::theme_socket::{ThemeMessage, ThemeStatus};
@@ -91,6 +92,192 @@ fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
 }
 
 #[test]
+fn daemon_notifies_systemd_only_after_every_socket_is_bound() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let notify_path = temp.path().join("notify.sock");
+    let notify = std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();
+    notify
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("NOTIFY_SOCKET", &notify_path)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut daemon = ChildGuard(Some(daemon));
+    let started = Instant::now();
+    loop {
+        let mut message = [0_u8; 256];
+        let length = notify.recv(&mut message).unwrap();
+        if std::str::from_utf8(&message[..length])
+            .unwrap()
+            .lines()
+            .any(|line| line == "READY=1")
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "daemon did not publish READY=1"
+        );
+    }
+    for name in [
+        "session.sock",
+        "control.sock",
+        "osd.sock",
+        "daily.sock",
+        "theme.sock",
+        "notification.sock",
+    ] {
+        assert!(runtime.join("sleepy").join(name).exists(), "missing {name}");
+    }
+
+    daemon.kill_and_wait();
+}
+
+#[test]
+fn daemon_reconciles_every_runtime_capability_before_the_startup_deadline() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut daemon = ChildGuard(Some(daemon));
+    let socket = runtime.join("sleepy/session.sock");
+    wait_for_path(&socket, Duration::from_secs(2));
+
+    thread::sleep(Duration::from_millis(1_800));
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let replay = validate_event_envelope(line.trim()).unwrap();
+    let SessionEvent::FullSnapshot(snapshot) = replay.payload else {
+        panic!("a reconnect must replay the folded full snapshot");
+    };
+
+    assert_eq!(snapshot.capabilities.len(), 10);
+    for capability in snapshot.capabilities {
+        assert_ne!(
+            capability
+                .diagnostic
+                .as_ref()
+                .map(|value| value.message.as_str()),
+            Some("capability has not reported yet"),
+            "{:?} missed the two-second startup reconciliation deadline",
+            capability.id
+        );
+        assert!(matches!(
+            capability.status,
+            CapabilityAvailability::Available
+                | CapabilityAvailability::Unavailable
+                | CapabilityAvailability::Unsupported
+                | CapabilityAvailability::PermissionDenied
+                | CapabilityAvailability::Timeout
+                | CapabilityAvailability::Parse
+                | CapabilityAvailability::Error
+        ));
+    }
+
+    daemon.kill_and_wait();
+}
+
+#[test]
+fn silent_niri_stream_reports_a_terminal_timeout_before_the_startup_deadline() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    let bin = temp.path().join("bin");
+    let niri_hold = temp.path().join("niri-hold");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let fifo = CString::new(niri_hold.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let _niri_hold = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&niri_hold)
+        .unwrap();
+    write_executable(
+        &bin.join("niri"),
+        "#!/bin/sh\n[ \"$1|$2|$3|$#\" = 'msg|--json|event-stream|3' ] || exit 64\nIFS= read -r ignored < \"$SLEEPY_NIRI_HOLD\"\n",
+    );
+
+    let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_DATA_HOME", temp.path().join("data"))
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("SLEEPY_NIRI_HOLD", &niri_hold)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut daemon = ChildGuard(Some(daemon));
+    let socket = runtime.join("sleepy/session.sock");
+    wait_for_path(&socket, Duration::from_secs(2));
+
+    thread::sleep(Duration::from_millis(1_800));
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let replay = validate_event_envelope(line.trim()).unwrap();
+    let SessionEvent::FullSnapshot(snapshot) = replay.payload else {
+        panic!("a reconnect must replay the folded full snapshot");
+    };
+    let niri = snapshot
+        .capabilities
+        .into_iter()
+        .find(|capability| capability.id == sleepy_sdk::RuntimeCapabilityId::Niri)
+        .unwrap();
+    assert_eq!(niri.status, CapabilityAvailability::Timeout);
+    assert_ne!(
+        niri.diagnostic.unwrap().message,
+        "capability has not reported yet"
+    );
+
+    let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);
+    assert!(daemon.0.take().unwrap().wait().unwrap().success());
+}
+
+#[test]
 fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();
@@ -118,6 +305,9 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     wait_for_path(&socket, Duration::from_secs(2));
     wait_for_path(&osd_socket, Duration::from_secs(2));
     wait_for_path(&theme_socket, Duration::from_secs(2));
+    // The lifecycle assertion below needs a stable expected generation. Let
+    // the bounded startup producers publish their initial records first.
+    thread::sleep(Duration::from_millis(1_800));
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_sleepyctl"))
         .args(["events", "watch", "--format", "ndjson"])
@@ -131,24 +321,43 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let replay = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
     assert!(matches!(replay.payload, SessionEvent::FullSnapshot(_)));
 
-    let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
-    theme
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    theme
-        .write_all(
-            format!(
-                "{{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{{\"type\":\"apply\",\"data\":{{\"themeId\":\"builtin.sleepy-light\",\"expectedGeneration\":{}}}}}}}\n",
-                replay.generation
+    let mut expected_generation = replay.generation;
+    let mut candidate_connection = None;
+    for _ in 0..32 {
+        let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
+        theme
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        theme
+            .write_all(
+                format!(
+                    "{{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{{\"type\":\"apply\",\"data\":{{\"themeId\":\"builtin.sleepy-light\",\"expectedGeneration\":{expected_generation}}}}}}}\n"
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .unwrap();
-    let mut theme_lines = BufReader::new(theme).lines();
-    assert!(matches!(
-        serde_json::from_str::<ThemeMessage>(&theme_lines.next().unwrap().unwrap()).unwrap(),
-        ThemeMessage::Candidate { .. }
-    ));
+            .unwrap();
+        let mut theme_lines = BufReader::new(theme).lines();
+        let theme_message =
+            serde_json::from_str::<ThemeMessage>(&theme_lines.next().unwrap().unwrap()).unwrap();
+        match theme_message {
+            ThemeMessage::Candidate { .. } => {
+                candidate_connection = Some(theme_lines);
+                break;
+            }
+            ThemeMessage::Result {
+                status: ThemeStatus::Error,
+                error: Some(error),
+                ..
+            } if error.contains("stale theme generation") => {
+                let event = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
+                assert!(event.generation > expected_generation);
+                expected_generation = event.generation;
+            }
+            other => panic!("expected a theme candidate or stale result, received {other:?}"),
+        }
+    }
+    let _candidate_connection =
+        candidate_connection.expect("theme apply never caught up to daemon generation");
 
     let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);
@@ -411,6 +620,48 @@ fn malformed_provider_state_degrades_locally_without_blocking_daily_startup() {
     daemon.kill_and_wait();
 }
 
+#[test]
+fn launcher_index_tracks_desktop_entry_install_and_removal_without_daemon_restart() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    let state = temp.path().join("state");
+    let data = temp.path().join("data");
+    let applications = data.join("applications");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&applications).unwrap();
+
+    let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_DATA_DIRS", &data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut daemon = ChildGuard(Some(daemon));
+    let socket = runtime.join("sleepy/daily.sock");
+    wait_for_path(&socket, Duration::from_secs(2));
+
+    let desktop = applications.join("sleepy-refresh.desktop");
+    std::fs::write(
+        &desktop,
+        "[Desktop Entry]\nType=Application\nName=Refresh Probe\nExec=/bin/true\n",
+    )
+    .unwrap();
+    wait_for_launcher_entry(&socket, "sleepy-refresh.desktop", true);
+    std::fs::remove_file(&desktop).unwrap();
+    wait_for_launcher_entry(&socket, "sleepy-refresh.desktop", false);
+
+    daemon.kill_and_wait();
+}
+
 struct ChildGuard(Option<std::process::Child>);
 
 struct IsolatedBus {
@@ -485,5 +736,37 @@ fn wait_for_path(path: &Path, deadline: Duration) {
     while !path.exists() {
         assert!(start.elapsed() < deadline, "daemon socket did not appear");
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_launcher_entry(socket: &Path, desktop_id: &str, present: bool) {
+    let started = Instant::now();
+    loop {
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(b"{\"schemaVersion\":2,\"requestId\":\"018f3f4c-8af1-7f6b-bf42-1bd472868e67\",\"operation\":{\"type\":\"launcherSearch\",\"data\":{\"query\":\"refresh\"}}}\n").unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let response: sleepy_session::daily::DailyResponse = serde_json::from_str(&line).unwrap();
+        let diagnostic = format!(
+            "status={:?} data={:?} error={:?}",
+            response.status, response.data, response.error
+        );
+        let found = response
+            .data
+            .and_then(|data| data.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .any(|entry| entry["desktopId"] == desktop_id);
+        if found == present {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "launcher index did not converge to present={present} after a desktop entry change: {diagnostic}"
+        );
+        thread::sleep(Duration::from_millis(25));
     }
 }

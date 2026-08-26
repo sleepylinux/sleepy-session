@@ -30,7 +30,9 @@ use crate::{
     system::{ProcessCommandRunner, SystemFacade},
 };
 
-const RESTART_DELAY: Duration = Duration::from_millis(250);
+const RESTART_DELAY: Duration = Duration::from_secs(5);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const STARTUP_REPORT_DEADLINE: Duration = Duration::from_millis(1_500);
 const MAX_EVENT_LINE: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
@@ -45,6 +47,61 @@ enum DbusBus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProducerKind {
+    Reconciled,
+    Niri,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProducerSpec {
+    capability: RuntimeCapabilityId,
+    kind: ProducerKind,
+}
+
+const PRODUCER_REGISTRY: [ProducerSpec; 10] = [
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Network,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Bluetooth,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Audio,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Battery,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Brightness,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::PowerProfile,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Media,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::NightLight,
+        kind: ProducerKind::Reconciled,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Niri,
+        kind: ProducerKind::Niri,
+    },
+    ProducerSpec {
+        capability: RuntimeCapabilityId::Resources,
+        kind: ProducerKind::Reconciled,
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DbusSourceSpec {
     capability: RuntimeCapabilityId,
     bus: DbusBus,
@@ -52,6 +109,30 @@ struct DbusSourceSpec {
 }
 
 impl DbusSourceSpec {
+    const fn network() -> Self {
+        Self {
+            capability: RuntimeCapabilityId::Network,
+            bus: DbusBus::System,
+            path_fragment: "/org/freedesktop/NetworkManager",
+        }
+    }
+
+    const fn bluetooth() -> Self {
+        Self {
+            capability: RuntimeCapabilityId::Bluetooth,
+            bus: DbusBus::System,
+            path_fragment: "/org/bluez",
+        }
+    }
+
+    const fn battery() -> Self {
+        Self {
+            capability: RuntimeCapabilityId::Battery,
+            bus: DbusBus::System,
+            path_fragment: "/org/freedesktop/UPower",
+        }
+    }
+
     const fn power_profile() -> Self {
         Self {
             capability: RuntimeCapabilityId::PowerProfile,
@@ -65,6 +146,14 @@ impl DbusSourceSpec {
             capability: RuntimeCapabilityId::Media,
             bus: DbusBus::Session,
             path_fragment: "MediaPlayer2",
+        }
+    }
+
+    const fn night_light() -> Self {
+        Self {
+            capability: RuntimeCapabilityId::NightLight,
+            bus: DbusBus::Session,
+            path_fragment: "gammastep_2eservice",
         }
     }
 }
@@ -96,12 +185,11 @@ impl ProductionSources {
         let mut tasks = Vec::new();
         let mut triggers = BTreeMap::new();
 
-        for id in [
-            RuntimeCapabilityId::Audio,
-            RuntimeCapabilityId::Brightness,
-            RuntimeCapabilityId::PowerProfile,
-            RuntimeCapabilityId::Media,
-        ] {
+        for spec in PRODUCER_REGISTRY
+            .iter()
+            .filter(|spec| spec.kind == ProducerKind::Reconciled)
+        {
+            let id = spec.capability;
             let (sender, receiver) = mpsc::channel(1);
             triggers.insert(id, sender.clone());
             tasks.push(tokio::spawn(run_capability_actor(
@@ -119,8 +207,6 @@ impl ProductionSources {
             "pw-mon",
             &[],
             triggers[&RuntimeCapabilityId::Audio].clone(),
-            authority.clone(),
-            RuntimeCapabilityId::Audio,
             shutdown_receiver.clone(),
         )));
         tasks.push(tokio::spawn(run_niri_source(
@@ -130,25 +216,35 @@ impl ProductionSources {
             shutdown_receiver.clone(),
         )));
 
+        for spec in [
+            DbusSourceSpec::network(),
+            DbusSourceSpec::bluetooth(),
+            DbusSourceSpec::battery(),
+            DbusSourceSpec::night_light(),
+        ] {
+            tasks.push(tokio::spawn(run_dbus_source(
+                spec,
+                triggers[&spec.capability].clone(),
+                shutdown_receiver.clone(),
+            )));
+        }
+
         let brightness_path = std::env::var_os("SLEEPY_BACKLIGHT_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/sys/class/backlight"));
         tasks.push(tokio::spawn(run_brightness_source(
             brightness_path,
             triggers[&RuntimeCapabilityId::Brightness].clone(),
-            authority.clone(),
             shutdown_receiver.clone(),
         )));
         tasks.push(tokio::spawn(run_dbus_source(
             DbusSourceSpec::power_profile(),
             triggers[&RuntimeCapabilityId::PowerProfile].clone(),
-            authority.clone(),
             shutdown_receiver.clone(),
         )));
         tasks.push(tokio::spawn(run_dbus_source(
             DbusSourceSpec::mpris(),
             triggers[&RuntimeCapabilityId::Media].clone(),
-            authority,
             shutdown_receiver,
         )));
 
@@ -208,7 +304,15 @@ async fn run_capability_actor(
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut retry_not_before = None;
+    let mut reconciliation = tokio::time::interval_at(
+        tokio::time::Instant::now() + RECONCILE_INTERVAL,
+        RECONCILE_INTERVAL,
+    );
+    reconciliation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -216,50 +320,111 @@ async fn run_capability_actor(
             }
             trigger = triggers.recv() => {
                 if trigger.is_none() { return Ok(()); }
-                if let Some(deadline) = retry_not_before.take() {
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(deadline) => {}
-                        _ = shutdown.changed() => return Ok(()),
-                    }
-                }
-                let (record, stop_after_join) = joined_readback(
-                    facade.clone(),
+                reconcile_capability(
                     id,
+                    &facade,
+                    &authority,
+                    &focused_output,
                     &mut shutdown,
+                    &mut retry_not_before,
                 ).await?;
-                if stop_after_join {
-                    return Ok(());
-                }
-                let focus = focused_output
-                    .read()
-                    .map_err(|_| io::Error::other("Niri focus cache was poisoned"))?
-                    .clone();
-                if let Some(output_id) = focus {
-                    publish(
-                        &authority,
-                        SessionEvent::Niri(NiriEvent {
-                            focused_output_id: Some(output_id),
-                        }),
-                    )
-                    .await?;
-                }
-                retry_not_before = (record.status != CapabilityAvailability::Available)
-                    .then(|| tokio::time::Instant::now() + RESTART_DELAY);
-                publish(&authority, SessionEvent::CapabilityUpdate(record)).await?;
+            }
+            _ = reconciliation.tick() => {
+                reconcile_capability(
+                    id,
+                    &facade,
+                    &authority,
+                    &focused_output,
+                    &mut shutdown,
+                    &mut retry_not_before,
+                ).await?;
             }
         }
     }
 }
 
-async fn joined_readback(
-    facade: SystemFacade<ProcessCommandRunner>,
+async fn reconcile_capability(
     id: RuntimeCapabilityId,
+    facade: &SystemFacade<ProcessCommandRunner>,
+    authority: &GenerationAuthority,
+    focused_output: &RwLock<Option<String>>,
     shutdown: &mut watch::Receiver<bool>,
-) -> io::Result<(CapabilityRecord, bool)> {
-    let task = tokio::task::spawn_blocking(move || facade.runtime_capability(id));
-    await_joined_readback(task, id, shutdown).await
+    retry_not_before: &mut Option<tokio::time::Instant>,
+) -> io::Result<()> {
+    if let Some(deadline) = retry_not_before.take() {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {}
+            _ = shutdown.changed() => return Ok(()),
+        }
+    }
+    let mut task = tokio::task::spawn_blocking({
+        let facade = facade.clone();
+        move || facade.runtime_capability(id)
+    });
+    let (record, stop_after_join) = tokio::select! {
+        biased;
+        result = &mut task => {
+            let record = result.map_err(|error| {
+                io::Error::other(format!("{id:?} readback task failed: {error}"))
+            })?;
+            (record, false)
+        }
+        changed = shutdown.changed() => {
+            let stop = changed.is_err() || *shutdown.borrow();
+            let record = task.await.map_err(|error| {
+                io::Error::other(format!("{id:?} readback task failed: {error}"))
+            })?;
+            (record, stop)
+        }
+        _ = tokio::time::sleep(STARTUP_REPORT_DEADLINE) => {
+            publish_degraded(
+                authority,
+                id,
+                io::ErrorKind::TimedOut,
+                "capability readback exceeded the reporting deadline",
+            ).await?;
+            // Command probes have their own bounded deadlines. Join the worker
+            // before accepting another trigger so timed-out reads never pile up.
+            tokio::select! {
+                result = &mut task => {
+                    result.map_err(|error| {
+                        io::Error::other(format!("{id:?} readback task failed: {error}"))
+                    })?;
+                }
+                changed = shutdown.changed() => {
+                    let _stop = changed.is_err() || *shutdown.borrow();
+                    task.await.map_err(|error| {
+                        io::Error::other(format!("{id:?} readback task failed: {error}"))
+                    })?;
+                }
+            };
+            *retry_not_before = Some(tokio::time::Instant::now() + RECONCILE_INTERVAL);
+            return Ok(());
+        }
+    };
+    if stop_after_join {
+        return Ok(());
+    }
+    let focus = focused_output
+        .read()
+        .map_err(|_| io::Error::other("Niri focus cache was poisoned"))?
+        .clone();
+    if let Some(output_id) = focus {
+        publish(
+            authority,
+            SessionEvent::Niri(NiriEvent {
+                focused_output_id: Some(output_id),
+            }),
+        )
+        .await?;
+    }
+    *retry_not_before = (record.status != CapabilityAvailability::Available)
+        .then(|| tokio::time::Instant::now() + RECONCILE_INTERVAL);
+    publish(authority, SessionEvent::CapabilityUpdate(record)).await?;
+    Ok(())
 }
 
+#[cfg(test)]
 async fn await_joined_readback(
     mut task: JoinHandle<CapabilityRecord>,
     id: RuntimeCapabilityId,
@@ -287,8 +452,6 @@ async fn run_process_event_source(
     program: &'static str,
     args: &'static [&'static str],
     trigger: mpsc::Sender<Trigger>,
-    authority: GenerationAuthority,
-    capability: RuntimeCapabilityId,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     'supervisor: loop {
@@ -297,8 +460,7 @@ async fn run_process_event_source(
         }
         let mut child = match spawn_monitor(program, args) {
             Ok(child) => child,
-            Err(error) => {
-                publish_degraded(&authority, capability, error.kind(), &error.to_string()).await?;
+            Err(_) => {
                 if wait_backoff(&mut shutdown).await {
                     return Ok(());
                 }
@@ -328,13 +490,7 @@ async fn run_process_event_source(
                 }
                 Ok(None) => {
                     stop_child(&mut child).await;
-                    publish_degraded(
-                        &authority,
-                        capability,
-                        io::ErrorKind::BrokenPipe,
-                        &format!("{program} event stream reached EOF"),
-                    )
-                    .await?;
+                    let _ = trigger.try_send(Trigger::Read);
                     if wait_backoff(&mut shutdown).await {
                         return Ok(());
                     }
@@ -342,13 +498,8 @@ async fn run_process_event_source(
                 }
                 Err(error) => {
                     stop_child(&mut child).await;
-                    publish_degraded(
-                        &authority,
-                        capability,
-                        error.kind(),
-                        &format!("{program} event stream read failed: {error}"),
-                    )
-                    .await?;
+                    let _ = error;
+                    let _ = trigger.try_send(Trigger::Read);
                     if wait_backoff(&mut shutdown).await {
                         return Ok(());
                     }
@@ -401,6 +552,9 @@ async fn run_niri_source(
         let mut focused_window = None;
         let mut lines = BufReader::with_capacity(4096, stdout);
         let mut workspaces = HashMap::<u64, String>::new();
+        let startup_deadline = tokio::time::sleep(STARTUP_REPORT_DEADLINE);
+        tokio::pin!(startup_deadline);
+        let mut reported = false;
         loop {
             let read = tokio::select! {
                 biased;
@@ -409,6 +563,17 @@ async fn run_niri_source(
                         stop_child(&mut child).await;
                         return Ok(());
                     }
+                    continue;
+                }
+                _ = &mut startup_deadline, if !reported => {
+                    publish_degraded(
+                        &authority,
+                        RuntimeCapabilityId::Niri,
+                        io::ErrorKind::TimedOut,
+                        "Niri did not publish an initial state before the startup deadline",
+                    )
+                    .await?;
+                    reported = true;
                     continue;
                 }
                 read = read_bounded_line(&mut lines) => read,
@@ -475,6 +640,7 @@ async fn run_niri_source(
                                 SessionEvent::CapabilityUpdate(niri_record(&workspaces)),
                             )
                             .await?;
+                            reported = true;
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -739,7 +905,6 @@ fn niri_record(workspaces: &HashMap<u64, String>) -> CapabilityRecord {
 async fn run_brightness_source(
     path: PathBuf,
     trigger: mpsc::Sender<Trigger>,
-    authority: GenerationAuthority,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     loop {
@@ -758,15 +923,7 @@ async fn run_brightness_source(
                     .map_err(|error| io::Error::other(format!("brightness watcher task failed: {error}")))?;
             }
         };
-        if let Err(error) = result {
-            publish_degraded(
-                &authority,
-                RuntimeCapabilityId::Brightness,
-                error.kind(),
-                &error.to_string(),
-            )
-            .await?;
-        }
+        let _ = result;
         if wait_backoff(&mut shutdown).await {
             return Ok(());
         }
@@ -840,15 +997,15 @@ fn add_inotify_watch(fd: libc::c_int, path: &Path, mask: u32) -> io::Result<()> 
 async fn run_dbus_source(
     spec: DbusSourceSpec,
     trigger: mpsc::Sender<Trigger>,
-    authority: GenerationAuthority,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     loop {
         let cancelled = Arc::new(AtomicBool::new(false));
         let thread_cancelled = Arc::clone(&cancelled);
-        let trigger = trigger.clone();
-        let mut task =
-            tokio::task::spawn_blocking(move || watch_dbus(spec, &trigger, &thread_cancelled));
+        let watch_trigger = trigger.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            watch_dbus(spec, &watch_trigger, &thread_cancelled)
+        });
         let result = tokio::select! {
             result = &mut task => result.map_err(|error| io::Error::other(format!("D-Bus watcher task failed: {error}")))?,
             _ = shutdown.changed() => {
@@ -857,14 +1014,8 @@ async fn run_dbus_source(
                     .map_err(|error| io::Error::other(format!("D-Bus watcher task failed: {error}")))?;
             }
         };
-        if let Err(error) = result {
-            publish_degraded(
-                &authority,
-                spec.capability,
-                error.kind(),
-                &error.to_string(),
-            )
-            .await?;
+        if result.is_err() {
+            let _ = trigger.try_send(Trigger::Read);
         }
         if wait_backoff(&mut shutdown).await {
             return Ok(());
@@ -932,9 +1083,17 @@ async fn wait_backoff(shutdown: &mut watch::Receiver<bool>) -> bool {
 }
 
 async fn publish(authority: &GenerationAuthority, event: SessionEvent) -> io::Result<()> {
+    let mut authority = authority.lock().await;
+    if let SessionEvent::CapabilityUpdate(update) = &event {
+        if authority.current_capability(update.id).await.as_ref() == Some(update) {
+            return Ok(());
+        }
+        eprintln!(
+            "event=producer_transition capability={:?} status={:?}",
+            update.id, update.status
+        );
+    }
     authority
-        .lock()
-        .await
         .publish(
             EventCause {
                 kind: EventCauseKind::External,

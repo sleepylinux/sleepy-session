@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787360063,
+        "narHash": "sha256-dt4WdcvsA8/RCe+VZZwqU0X+XMM3wBbGCWA0/sFWzGo=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "2c423e03bbafcff28bfadc6781a4a8257f205cb5",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "sleepy-sdk": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1787694778,
+        "narHash": "sha256-L4sIoAeazn5GqVS0k9aAyhAirWi3pMxIoqFLpP7T7n8=",
+        "owner": "sleepylinux",
+        "repo": "sleepy-sdk",
+        "rev": "152173b470fa7d1e90c6d3d6be103a4a4d3529bc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "sleepylinux",
+        "repo": "sleepy-sdk",
+        "rev": "152173b470fa7d1e90c6d3d6be103a4a4d3529bc",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "sleepy-sdk": "sleepy-sdk"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

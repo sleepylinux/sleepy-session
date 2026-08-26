@@ -74,5 +74,16 @@
         build = packageFor system false;
         niri-bindings = packageFor system true;
       });
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in {
+          default = pkgs.mkShell {
+            packages = with pkgs; [ cargo clippy dbus pkg-config rustc rustfmt ];
+            SLEEPY_DBUS_SESSION_CONF = "${pkgs.dbus}/share/dbus-1/session.conf";
+            TZDIR = "${pkgs.tzdata}/share/zoneinfo";
+          };
+        });
     };
 }

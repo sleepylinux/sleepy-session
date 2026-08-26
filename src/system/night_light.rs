@@ -8,6 +8,7 @@ pub(crate) fn probe<R: CommandRunner>(runner: &R) -> Result<bool, ProbeFailure> 
             return Err(ProbeFailure {
                 kind: sleepy_sdk::CapabilityErrorKind::Command,
                 message: format!("systemctl exited with status {}", output.status),
+                availability: None,
             })
         }
         Err(error) => {
@@ -20,6 +21,7 @@ pub(crate) fn probe<R: CommandRunner>(runner: &R) -> Result<bool, ProbeFailure> 
                     RunnerErrorKind::Io => sleepy_sdk::CapabilityErrorKind::Command,
                 },
                 message: error.message().to_owned(),
+                availability: None,
             })
         }
     };

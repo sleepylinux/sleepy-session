@@ -1,6 +1,9 @@
 use std::{io, sync::Arc};
 
-use sleepy_sdk::{EventCause, EventEnvelope, SessionEvent, WIRE_SCHEMA_VERSION};
+use sleepy_sdk::{
+    CapabilityRecord, EventCause, EventEnvelope, RuntimeCapabilityId, SessionEvent,
+    WIRE_SCHEMA_VERSION,
+};
 use tokio::sync::{Mutex, MutexGuard};
 
 use super::{utc_now, EventHub, GenerationAllocator, PublishError};
@@ -43,6 +46,20 @@ impl GenerationAuthority {
 impl GenerationGuard<'_> {
     pub fn current_generation(&self) -> u64 {
         self.state.current_generation
+    }
+
+    pub(crate) async fn current_capability(
+        &self,
+        id: RuntimeCapabilityId,
+    ) -> Option<CapabilityRecord> {
+        let snapshot = self.hub.latest_snapshot().await;
+        let SessionEvent::FullSnapshot(snapshot) = snapshot.payload else {
+            return None;
+        };
+        snapshot
+            .capabilities
+            .into_iter()
+            .find(|capability| capability.id == id)
     }
 
     pub async fn publish(

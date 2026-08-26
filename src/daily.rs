@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -21,7 +21,10 @@ use tokio::{
 
 use crate::{
     calendar::IcsCalendarProvider,
-    launcher::{DesktopEntryIndex, LaunchResources, LauncherMetrics},
+    launcher::{
+        wait_for_application_change, xdg_application_roots, DesktopEntryIndex, LaunchResources,
+        LauncherMetrics,
+    },
     overview::{
         overview_event_channel, ChannelOverviewEvents, NiriOverview, ProcessOverviewRunner,
     },
@@ -99,7 +102,7 @@ pub trait DailyBackend: Send + Sync + 'static {
 }
 
 pub struct ProductionDailyBackend {
-    launcher: DesktopEntryIndex,
+    launcher: RwLock<LauncherIndexSnapshot>,
     metrics: Mutex<LauncherMetrics>,
     calendar: ProviderSlot<IcsCalendarProvider>,
     weather: ProviderSlot<MetNoProvider<CurlTransport, SystemClock>>,
@@ -107,6 +110,24 @@ pub struct ProductionDailyBackend {
     runner: ProcessCommandRunner,
     overview: Mutex<NiriOverview<ProcessOverviewRunner, ChannelOverviewEvents>>,
     fallback_overview_sender: Option<crate::overview::OverviewEventSender>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LauncherIndexStatus {
+    Loading,
+    Ready,
+    Error(String),
+}
+
+struct LauncherIndexSnapshot {
+    status: LauncherIndexStatus,
+    index: DesktopEntryIndex,
+}
+
+pub struct LauncherIndexRuntime {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    cancelled: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 enum ProviderSlot<T> {
@@ -140,6 +161,39 @@ impl ProductionDailyBackend {
         overview_events: ChannelOverviewEvents,
     ) -> io::Result<Self> {
         let launcher = DesktopEntryIndex::scan_xdg(executable_available)?;
+        Self::open_with_launcher(
+            state_dir,
+            cache_dir,
+            overview_events,
+            LauncherIndexSnapshot {
+                status: LauncherIndexStatus::Ready,
+                index: launcher,
+            },
+        )
+    }
+
+    pub fn open_deferred_with_overview(
+        state_dir: &Path,
+        cache_dir: &Path,
+        overview_events: ChannelOverviewEvents,
+    ) -> io::Result<Self> {
+        Self::open_with_launcher(
+            state_dir,
+            cache_dir,
+            overview_events,
+            LauncherIndexSnapshot {
+                status: LauncherIndexStatus::Loading,
+                index: DesktopEntryIndex::empty(),
+            },
+        )
+    }
+
+    fn open_with_launcher(
+        state_dir: &Path,
+        cache_dir: &Path,
+        overview_events: ChannelOverviewEvents,
+        launcher: LauncherIndexSnapshot,
+    ) -> io::Result<Self> {
         let metrics = LauncherMetrics::open(&state_dir.join("sleepy/launcher.json"))?;
         let calendar_dir = std::env::var_os("SLEEPY_CALENDAR_DIR").map(PathBuf::from);
         let calendar = match calendar_dir.map(enumerate_calendar_sources).transpose() {
@@ -156,7 +210,7 @@ impl ProductionDailyBackend {
         let nominatim_endpoint = std::env::var("SLEEPY_NOMINATIM_ENDPOINT")
             .unwrap_or_else(|_| "https://nominatim.openstreetmap.org/search".into());
         Ok(Self {
-            launcher,
+            launcher: RwLock::new(launcher),
             metrics: Mutex::new(metrics),
             calendar,
             weather: provider_slot(MetNoProvider::new(
@@ -181,6 +235,166 @@ impl ProductionDailyBackend {
             )),
             fallback_overview_sender: None,
         })
+    }
+
+    pub fn launcher_status(&self) -> LauncherIndexStatus {
+        self.launcher
+            .read()
+            .map(|snapshot| snapshot.status.clone())
+            .unwrap_or_else(|_| LauncherIndexStatus::Error("launcher index lock poisoned".into()))
+    }
+
+    pub fn start_launcher_index(self: &Arc<Self>) -> LauncherIndexRuntime {
+        let (shutdown, mut shutdown_receiver) = tokio::sync::watch::channel(false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let backend = Arc::clone(self);
+        let task_cancelled = Arc::clone(&cancelled);
+        let task = tokio::spawn(async move {
+            loop {
+                if *shutdown_receiver.borrow() {
+                    return Ok(());
+                }
+                let scan_cancelled = Arc::clone(&task_cancelled);
+                let refreshed = tokio::task::spawn_blocking(move || {
+                    DesktopEntryIndex::scan_xdg_cancelled(executable_available, &scan_cancelled)
+                })
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("launcher index worker failed: {error}"))
+                })?;
+                {
+                    let mut snapshot = backend
+                        .launcher
+                        .write()
+                        .map_err(|_| io::Error::other("launcher index lock poisoned"))?;
+                    match refreshed {
+                        Ok(index) => {
+                            snapshot.index = index;
+                            snapshot.status = LauncherIndexStatus::Ready;
+                        }
+                        Err(error) => {
+                            snapshot.status = LauncherIndexStatus::Error(error.to_string())
+                        }
+                    }
+                }
+
+                let roots = xdg_application_roots()?;
+                task_cancelled.store(false, Ordering::Release);
+                let watcher_cancelled = Arc::clone(&task_cancelled);
+                let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+                let mut watcher = tokio::task::spawn_blocking(move || {
+                    wait_for_application_change(&roots, watcher_cancelled, ready_sender)
+                });
+                let watcher_ready = tokio::select! {
+                    ready = ready_receiver => {
+                        Some(ready)
+                    }
+                    changed = shutdown_receiver.changed() => {
+                        task_cancelled.store(true, Ordering::Release);
+                        let _ = (&mut watcher).await;
+                        if changed.is_err() || *shutdown_receiver.borrow() { return Ok(()); }
+                        None
+                    }
+                };
+                let Some(watcher_ready) = watcher_ready else {
+                    continue;
+                };
+                if watcher_ready.is_err() {
+                    let watcher_error = (&mut watcher)
+                        .await
+                        .map_err(|error| {
+                            io::Error::other(format!("launcher watcher failed: {error}"))
+                        })?
+                        .err()
+                        .map(|error| error.to_string())
+                        .unwrap_or_else(|| "launcher watcher stopped before readiness".to_owned());
+                    if let Ok(mut snapshot) = backend.launcher.write() {
+                        snapshot.status = LauncherIndexStatus::Error(watcher_error);
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                        changed = shutdown_receiver.changed() => {
+                            if changed.is_err() || *shutdown_receiver.borrow() { return Ok(()); }
+                        }
+                    }
+                    continue;
+                }
+                // Close the scan/watch registration race atomically from the
+                // consumer's point of view: any change after this scan is
+                // already queued in the inotify descriptor.
+                let scan_cancelled = Arc::clone(&task_cancelled);
+                let post_watch_scan = tokio::task::spawn_blocking(move || {
+                    DesktopEntryIndex::scan_xdg_cancelled(executable_available, &scan_cancelled)
+                })
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("launcher index worker failed: {error}"))
+                })?;
+                {
+                    let mut snapshot = backend
+                        .launcher
+                        .write()
+                        .map_err(|_| io::Error::other("launcher index lock poisoned"))?;
+                    match post_watch_scan {
+                        Ok(index) => {
+                            snapshot.index = index;
+                            snapshot.status = LauncherIndexStatus::Ready;
+                        }
+                        Err(error) => {
+                            snapshot.status = LauncherIndexStatus::Error(error.to_string())
+                        }
+                    }
+                }
+                let watcher_result = tokio::select! {
+                    result = &mut watcher => result
+                        .map_err(|error| io::Error::other(format!("launcher watcher failed: {error}")))?,
+                    changed = shutdown_receiver.changed() => {
+                        task_cancelled.store(true, Ordering::Release);
+                        let _ = watcher.await;
+                        if changed.is_err() || *shutdown_receiver.borrow() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                let delay = if watcher_result.is_ok() {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(30)
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    changed = shutdown_receiver.changed() => {
+                        if changed.is_err() || *shutdown_receiver.borrow() { return Ok(()); }
+                    }
+                }
+            }
+        });
+        LauncherIndexRuntime {
+            shutdown,
+            cancelled,
+            task,
+        }
+    }
+}
+
+impl LauncherIndexRuntime {
+    pub async fn shutdown_and_join(mut self, timeout: Duration) -> io::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.shutdown.send(true);
+        match tokio::time::timeout(timeout, &mut self.task).await {
+            Ok(result) => result.map_err(|error| {
+                io::Error::other(format!("launcher index task failed: {error}"))
+            })?,
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "launcher index did not stop",
+                ))
+            }
+        }
     }
 }
 
@@ -221,7 +435,23 @@ impl ProductionDailyBackend {
                 if query.len() > 512 || query.contains('\0') {
                     return Err(invalid("launcher query is invalid"));
                 }
-                let entries = self.launcher.entries();
+                let launcher = self
+                    .launcher
+                    .read()
+                    .map_err(|_| io::Error::other("launcher index lock poisoned"))?;
+                match &launcher.status {
+                    // Preserve the existing search response while the first
+                    // background snapshot is loading. The explicit status is
+                    // observable internally without changing the v2 socket.
+                    LauncherIndexStatus::Loading => return Ok(serde_json::json!([])),
+                    LauncherIndexStatus::Error(error) => {
+                        return Err(io::Error::other(format!(
+                            "launcher index is degraded: {error}"
+                        )));
+                    }
+                    LauncherIndexStatus::Ready => {}
+                }
+                let entries = launcher.index.entries();
                 let ids = entries
                     .iter()
                     .map(|entry| entry.desktop_id.as_str())
@@ -233,7 +463,7 @@ impl ProductionDailyBackend {
                     .rank(&query, &ids);
                 let result = ranked
                     .into_iter()
-                    .filter_map(|id| self.launcher.get(&id))
+                    .filter_map(|id| launcher.index.get(&id))
                     .take(100)
                     .collect::<Vec<_>>();
                 serde_json::to_value(result).map_err(io::Error::other)
@@ -243,7 +473,11 @@ impl ProductionDailyBackend {
                     return Err(invalid("unsupported launch schema"));
                 }
                 let resources = classify_launch_resources(&request.resources)?;
-                let argv = self.launcher.launch_argv(
+                let launcher = self
+                    .launcher
+                    .read()
+                    .map_err(|_| io::Error::other("launcher index lock poisoned"))?;
+                let argv = launcher.index.launch_argv(
                     &request.desktop_id,
                     request.action_id.as_deref(),
                     &resources,
@@ -590,6 +824,13 @@ async fn serve_client<B: DailyBackend>(
                         status: DailyStatus::Confirmed,
                         data: Some(data),
                         error: None,
+                    },
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => DailyResponse {
+                        schema_version: WIRE_SCHEMA_VERSION,
+                        request_id: request.request_id,
+                        status: DailyStatus::Busy,
+                        data: None,
+                        error: Some(error.to_string()),
                     },
                     Err(error) => error_response(&request.request_id, &error.to_string()),
                 }

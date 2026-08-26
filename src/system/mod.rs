@@ -5,6 +5,7 @@ mod media;
 mod network;
 mod night_light;
 mod power;
+mod resources;
 mod runner;
 mod session;
 
@@ -27,7 +28,7 @@ use sleepy_sdk::{
     AudioRuntimeState, AudioState, BatteryRuntimeState, BluetoothRuntimeState, BluetoothState,
     BrightnessRuntimeState, CapabilityAvailability, CapabilityDiagnostic, CapabilityErrorKind,
     CapabilityFailure, CapabilityId, CapabilityRecord, CapabilityState, CapabilityValue,
-    Connectivity, MediaRuntimeState, MediaState, MediaTransport, NetworkRuntimeState, NetworkState,
+    MediaRuntimeState, MediaState, MediaTransport, NetworkRuntimeState, NetworkState,
     NightLightRuntimeState, PowerProfile, PowerProfileRuntimeState, PowerState,
     RuntimeCapabilityId, SessionAction, SessionActionRequest, SessionActionResult,
     SessionActionStatus, SystemMutation, SystemMutationResult, SystemSnapshot,
@@ -98,6 +99,7 @@ impl std::error::Error for SystemError {}
 pub(crate) struct ProbeFailure {
     kind: CapabilityErrorKind,
     message: String,
+    availability: Option<CapabilityAvailability>,
 }
 
 impl ProbeFailure {
@@ -105,6 +107,7 @@ impl ProbeFailure {
         Self {
             kind: CapabilityErrorKind::Parse,
             message: message.into(),
+            availability: None,
         }
     }
 
@@ -112,6 +115,23 @@ impl ProbeFailure {
         Self {
             kind: CapabilityErrorKind::Unsupported,
             message: message.into(),
+            availability: None,
+        }
+    }
+
+    fn permission_denied(message: impl Into<String>) -> Self {
+        Self {
+            kind: CapabilityErrorKind::Command,
+            message: format!("permission denied: {}", message.into()),
+            availability: Some(CapabilityAvailability::PermissionDenied),
+        }
+    }
+
+    fn command(message: impl Into<String>) -> Self {
+        Self {
+            kind: CapabilityErrorKind::Command,
+            message: message.into(),
+            availability: None,
         }
     }
 
@@ -119,6 +139,7 @@ impl ProbeFailure {
         Self {
             kind: CapabilityErrorKind::Timeout,
             message: "adapter probe exceeded the snapshot deadline".to_owned(),
+            availability: None,
         }
     }
 
@@ -139,10 +160,12 @@ pub(crate) fn run_checked<R: CommandRunner>(
         Ok(output) if output.status == 75 => Err(ProbeFailure {
             kind: CapabilityErrorKind::Busy,
             message: "adapter command reported a busy resource".to_owned(),
+            availability: None,
         }),
         Ok(output) => Err(ProbeFailure {
             kind: CapabilityErrorKind::Command,
             message: format!("adapter command exited with status {}", output.status),
+            availability: None,
         }),
         Err(error) => Err(ProbeFailure {
             kind: match error.kind() {
@@ -153,6 +176,7 @@ pub(crate) fn run_checked<R: CommandRunner>(
                 RunnerErrorKind::Io => CapabilityErrorKind::Command,
             },
             message: error.message().to_owned(),
+            availability: None,
         }),
     }
 }
@@ -183,20 +207,17 @@ impl<R: CommandRunner> SystemFacade<R> {
     /// adapters. Unlike `snapshot`, this never probes unrelated providers.
     pub(crate) fn runtime_capability(&self, id: RuntimeCapabilityId) -> CapabilityRecord {
         let value = match id {
-            RuntimeCapabilityId::Network => network::probe(&self.runner).map(|state| {
-                CapabilityValue::Network(NetworkRuntimeState {
+            RuntimeCapabilityId::Network => (|| {
+                let state = network::probe(&self.runner)?;
+                let ethernet_connected = network::ethernet_connected(&self.runner)?;
+                let connectivity = network::connectivity(&self.runner)?;
+                Ok(CapabilityValue::Network(NetworkRuntimeState {
                     wifi_enabled: state.enabled,
-                    ethernet_connected: false,
-                    connectivity: if state.connected_name.is_some() {
-                        Connectivity::Full
-                    } else if state.enabled {
-                        Connectivity::None
-                    } else {
-                        Connectivity::Unknown
-                    },
+                    ethernet_connected,
+                    connectivity,
                     active_connection_id: state.connected_name,
-                })
-            }),
+                }))
+            })(),
             RuntimeCapabilityId::Bluetooth => bluetooth::probe(&self.runner).map(|state| {
                 CapabilityValue::Bluetooth(BluetoothRuntimeState {
                     powered: state.enabled,
@@ -247,6 +268,9 @@ impl<R: CommandRunner> SystemFacade<R> {
             }),
             RuntimeCapabilityId::NightLight => night_light::probe(&self.runner)
                 .map(|enabled| CapabilityValue::NightLight(NightLightRuntimeState { enabled })),
+            RuntimeCapabilityId::Resources => {
+                resources::probe(std::path::Path::new("/proc")).map(CapabilityValue::Resources)
+            }
             _ => {
                 return CapabilityRecord {
                     id,
@@ -267,7 +291,9 @@ impl<R: CommandRunner> SystemFacade<R> {
             },
             Err(error) => CapabilityRecord {
                 id,
-                status: availability(error.kind),
+                status: error
+                    .availability
+                    .unwrap_or_else(|| availability(error.kind)),
                 value: None,
                 diagnostic: Some(CapabilityFailure {
                     message: error.message,
