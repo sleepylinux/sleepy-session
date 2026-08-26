@@ -321,26 +321,43 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let replay = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
     assert!(matches!(replay.payload, SessionEvent::FullSnapshot(_)));
 
-    let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
-    theme
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    theme
-        .write_all(
-            format!(
-                "{{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{{\"type\":\"apply\",\"data\":{{\"themeId\":\"builtin.sleepy-light\",\"expectedGeneration\":{}}}}}}}\n",
-                replay.generation
+    let mut expected_generation = replay.generation;
+    let mut candidate_connection = None;
+    for _ in 0..32 {
+        let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
+        theme
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        theme
+            .write_all(
+                format!(
+                    "{{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{{\"type\":\"apply\",\"data\":{{\"themeId\":\"builtin.sleepy-light\",\"expectedGeneration\":{expected_generation}}}}}}}\n"
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        )
-        .unwrap();
-    let mut theme_lines = BufReader::new(theme).lines();
-    let theme_message =
-        serde_json::from_str::<ThemeMessage>(&theme_lines.next().unwrap().unwrap()).unwrap();
-    assert!(
-        matches!(theme_message, ThemeMessage::Candidate { .. }),
-        "expected a theme candidate, received {theme_message:?}"
-    );
+            .unwrap();
+        let mut theme_lines = BufReader::new(theme).lines();
+        let theme_message =
+            serde_json::from_str::<ThemeMessage>(&theme_lines.next().unwrap().unwrap()).unwrap();
+        match theme_message {
+            ThemeMessage::Candidate { .. } => {
+                candidate_connection = Some(theme_lines);
+                break;
+            }
+            ThemeMessage::Result {
+                status: ThemeStatus::Error,
+                error: Some(error),
+                ..
+            } if error.contains("stale theme generation") => {
+                let event = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
+                assert!(event.generation > expected_generation);
+                expected_generation = event.generation;
+            }
+            other => panic!("expected a theme candidate or stale result, received {other:?}"),
+        }
+    }
+    let _candidate_connection =
+        candidate_connection.expect("theme apply never caught up to daemon generation");
 
     let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);
