@@ -21,6 +21,7 @@ use tokio::{
 use crate::{
     sessiond::private_socket::{NoopBindObserver, PrivateSocketEndpoint},
     sessiond::{private_socket::peer_uid, GenerationAuthority},
+    socket_supervisor::ConnectionSupervisor,
     system::RunControl,
     theme::{DesktopThemeSink, ThemeError, ThemeErrorKind, ThemeManager},
 };
@@ -169,10 +170,9 @@ pub struct ThemeSocket {
     manager: Arc<Mutex<ThemeManager>>,
     authority: GenerationAuthority,
     shutdown: broadcast::Sender<()>,
-    connections: Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
+    connections: ConnectionSupervisor,
     serving: AtomicBool,
     stopped: tokio::sync::Notify,
-    permits: Arc<tokio::sync::Semaphore>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -195,10 +195,9 @@ impl ThemeSocket {
             manager: Arc::new(Mutex::new(manager)),
             authority,
             shutdown,
-            connections: Mutex::new(Vec::new()),
+            connections: ConnectionSupervisor::new(MAX_CONNECTIONS),
             serving: AtomicBool::new(false),
             stopped: tokio::sync::Notify::new(),
-            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
             cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -222,32 +221,24 @@ impl ThemeSocket {
             let expected_uid = self.endpoint.expected_uid();
             let connection_shutdown = self.shutdown.subscribe();
             let cancelled = Arc::clone(&self.cancelled);
-            let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            let Some(permit) = self.connections.try_admit() else {
+                eprintln!("event=rejected_connection endpoint=theme reason=limit");
                 drop(stream);
                 continue;
             };
-            let mut connections = self.connections.lock().await;
-            let mut index = 0;
-            while index < connections.len() {
-                if connections[index].is_finished() {
-                    let finished = connections.remove(index);
-                    let _ = finished.await;
-                } else {
-                    index += 1;
-                }
-            }
-            connections.push(tokio::spawn(async move {
-                let _permit = permit;
-                serve_connection(
-                    stream,
-                    expected_uid,
-                    manager,
-                    authority,
-                    connection_shutdown,
-                    cancelled,
-                )
-                .await
-            }));
+            self.connections
+                .spawn(permit, async move {
+                    serve_connection(
+                        stream,
+                        expected_uid,
+                        manager,
+                        authority,
+                        connection_shutdown,
+                        cancelled,
+                    )
+                    .await
+                })
+                .await;
         }
     }
 
@@ -270,18 +261,8 @@ impl ThemeSocket {
                 io::Error::new(io::ErrorKind::TimedOut, "theme accept loop did not stop")
             })?;
         }
-        let handles = std::mem::take(&mut *self.connections.lock().await);
-        let count = handles.len();
-        for mut handle in handles {
-            if tokio::time::timeout_at(deadline, &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-                let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
-            }
-        }
-        Ok(count)
+        let report = self.connections.drain(deadline).await;
+        Ok(report.completed + report.aborted)
     }
 
     pub fn path(&self) -> &Path {

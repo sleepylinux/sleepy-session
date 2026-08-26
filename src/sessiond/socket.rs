@@ -10,6 +10,9 @@ use std::{
 
 use tokio::{io::AsyncWriteExt, net::UnixStream};
 
+pub use crate::socket_supervisor::ConnectionDrainReport as SocketDrainReport;
+use crate::socket_supervisor::ConnectionSupervisor;
+
 use super::{
     private_socket::{peer_uid, NoopBindObserver, PrivateSocketEndpoint},
     EventHub, SessionSocketBindObserver,
@@ -19,15 +22,9 @@ pub struct SessionSocket {
     endpoint: PrivateSocketEndpoint,
     hub: EventHub,
     shutdown: tokio::sync::broadcast::Sender<()>,
-    connections: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
+    connections: ConnectionSupervisor,
     serving: AtomicBool,
     serve_stopped: tokio::sync::Notify,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SocketDrainReport {
-    pub completed: usize,
-    pub aborted: usize,
 }
 
 impl SessionSocket {
@@ -52,7 +49,7 @@ impl SessionSocket {
             endpoint,
             hub,
             shutdown,
-            connections: tokio::sync::Mutex::new(Vec::new()),
+            connections: ConnectionSupervisor::new(32),
             serving: AtomicBool::new(false),
             serve_stopped: tokio::sync::Notify::new(),
         })
@@ -90,9 +87,16 @@ impl SessionSocket {
             let expected_uid = self.endpoint.expected_uid();
             let hub = self.hub.clone();
             let shutdown = self.shutdown.subscribe();
-            self.connections.lock().await.push(tokio::spawn(async move {
-                serve_stream(stream, expected_uid, hub, shutdown).await
-            }));
+            let Some(permit) = self.connections.try_admit() else {
+                eprintln!("event=rejected_connection endpoint=session reason=limit");
+                drop(stream);
+                continue;
+            };
+            self.connections
+                .spawn(permit, async move {
+                    serve_stream(stream, expected_uid, hub, shutdown).await
+                })
+                .await;
         }
     }
 
@@ -115,26 +119,7 @@ impl SessionSocket {
             })?;
         }
 
-        let mut handles = std::mem::take(&mut *self.connections.lock().await);
-        let mut report = SocketDrainReport::default();
-        while !handles.is_empty() {
-            let mut handle = handles.remove(0);
-            match tokio::time::timeout_at(deadline, &mut handle).await {
-                Ok(_) => report.completed += 1,
-                Err(_) => {
-                    handle.abort();
-                    let _ = handle.await;
-                    report.aborted += 1;
-                    for handle in handles {
-                        handle.abort();
-                        let _ = handle.await;
-                        report.aborted += 1;
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(report)
+        Ok(self.connections.drain(deadline).await)
     }
 
     pub fn path(&self) -> &Path {
@@ -192,6 +177,10 @@ async fn serve_stream(
         let mut line = serde_json::to_vec(&event)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         line.push(b'\n');
-        stream.write_all(&line).await?;
+        tokio::time::timeout(Duration::from_secs(1), stream.write_all(&line))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "session event write timed out")
+            })??;
     }
 }

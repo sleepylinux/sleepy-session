@@ -127,8 +127,11 @@ impl SecureDir {
             ) {
                 Ok(descriptor) => descriptor,
                 Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-                    mkdirat(descriptor.as_raw_fd(), &name, 0o700)
-                        .map_err(|error| map_open_error(&opened, error))?;
+                    if let Err(error) = mkdirat(descriptor.as_raw_fd(), &name, 0o700) {
+                        if error.kind() != io::ErrorKind::AlreadyExists {
+                            return Err(map_open_error(&opened, error));
+                        }
+                    }
                     openat_owned(
                         descriptor.as_raw_fd(),
                         &name,
@@ -161,8 +164,11 @@ impl SecureDir {
         ) {
             Ok(descriptor) => descriptor,
             Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-                mkdirat(self.as_raw_fd(), &name, 0o700)
-                    .map_err(|error| map_open_error(&path, error))?;
+                if let Err(error) = mkdirat(self.as_raw_fd(), &name, 0o700) {
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(map_open_error(&path, error));
+                    }
+                }
                 openat_owned(
                     self.as_raw_fd(),
                     &name,

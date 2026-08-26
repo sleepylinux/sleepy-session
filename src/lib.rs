@@ -9,11 +9,15 @@ pub mod notifications;
 pub mod osd;
 pub mod overview;
 pub mod sessiond;
+mod socket_supervisor;
 mod store;
 pub mod system;
+mod systemd_notify;
 pub mod theme;
 pub mod theme_socket;
 pub mod weather;
+
+pub use systemd_notify::ready as notify_ready;
 
 pub use store::{
     Defaults, ImportMode, InspectionDocumentReport, InspectionIssue, InspectionReport,

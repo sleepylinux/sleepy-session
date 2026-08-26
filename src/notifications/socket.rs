@@ -15,6 +15,8 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Mutex};
 
+use crate::socket_supervisor::ConnectionSupervisor;
+
 const MAX_LINE: usize = 256 * 1024;
 const MAX_CONNECTIONS: usize = 16;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -99,8 +101,7 @@ pub struct NotificationSocket {
     service: Arc<Mutex<NotificationEventService>>,
     actions: Option<NotificationActionDispatcher>,
     shutdown: tokio::sync::broadcast::Sender<()>,
-    connections: Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
-    permits: Arc<tokio::sync::Semaphore>,
+    connections: ConnectionSupervisor,
     serving: AtomicBool,
     stopped: tokio::sync::Notify,
 }
@@ -117,8 +118,7 @@ impl NotificationSocket {
             service,
             actions: None,
             shutdown,
-            connections: Mutex::new(Vec::new()),
-            permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            connections: ConnectionSupervisor::new(MAX_CONNECTIONS),
             serving: AtomicBool::new(false),
             stopped: tokio::sync::Notify::new(),
         })
@@ -160,24 +160,16 @@ impl NotificationSocket {
             let expected_uid = self.endpoint.expected_uid();
             let service = Arc::clone(&self.service);
             let actions = self.actions.clone();
-            let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+            let Some(permit) = self.connections.try_admit() else {
+                eprintln!("event=rejected_connection endpoint=notification reason=limit");
                 drop(stream);
                 continue;
             };
-            let mut connections = self.connections.lock().await;
-            let mut index = 0;
-            while index < connections.len() {
-                if connections[index].is_finished() {
-                    let finished = connections.remove(index);
-                    let _ = finished.await;
-                } else {
-                    index += 1;
-                }
-            }
-            connections.push(tokio::spawn(async move {
-                let _permit = permit;
-                serve(stream, expected_uid, service, actions).await
-            }));
+            self.connections
+                .spawn(permit, async move {
+                    serve(stream, expected_uid, service, actions).await
+                })
+                .await;
         }
     }
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<usize> {
@@ -201,18 +193,8 @@ impl NotificationSocket {
                 )
             })?;
         }
-        let handles = std::mem::take(&mut *self.connections.lock().await);
-        let count = handles.len();
-        for mut handle in handles {
-            if tokio::time::timeout_at(deadline, &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-                let _ = handle.await;
-            }
-        }
-        Ok(count)
+        let report = self.connections.drain(deadline).await;
+        Ok(report.completed + report.aborted)
     }
     pub fn path(&self) -> &Path {
         self.endpoint.path()
@@ -366,7 +348,8 @@ async fn serve(
 }
 
 fn snapshot(service: &NotificationEventService) -> Data {
-    let store = service.provider().store();
+    let provider = service.provider();
+    let store = provider.store();
     Data::Snapshot(Snapshot {
         active: store.active().to_vec(),
         archive: store.archive().to_vec(),
@@ -387,7 +370,7 @@ fn snapshot(service: &NotificationEventService) -> Data {
         popup_ids: store
             .active()
             .iter()
-            .filter(|item| service.provider().popup_visible(item.id))
+            .filter(|item| provider.popup_visible(item.id))
             .map(|item| item.id)
             .collect(),
     })

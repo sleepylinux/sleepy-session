@@ -15,6 +15,7 @@ pub(crate) fn probe_brightness<R: CommandRunner>(runner: &R) -> Result<f64, Prob
             return Err(ProbeFailure {
                 kind: sleepy_sdk::CapabilityErrorKind::Command,
                 message: format!("brightnessctl exited with status {}", output.status),
+                availability: None,
             })
         }
         Err(error) => {
@@ -27,6 +28,7 @@ pub(crate) fn probe_brightness<R: CommandRunner>(runner: &R) -> Result<f64, Prob
                     RunnerErrorKind::Io => sleepy_sdk::CapabilityErrorKind::Command,
                 },
                 message: error.message().to_owned(),
+                availability: None,
             })
         }
     };

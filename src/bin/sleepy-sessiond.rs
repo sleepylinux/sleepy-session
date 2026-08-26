@@ -27,6 +27,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> io::Result<()> {
+    eprintln!("event=startup phase=begin");
     let runtime_dir = required_path("XDG_RUNTIME_DIR")?;
     let state_dir = state_home()?;
     let config_dir = config_home()?;
@@ -38,8 +39,13 @@ async fn run() -> io::Result<()> {
     let theme_socket_path = runtime_dir.join("sleepy/theme.sock");
     let notification_socket_path = runtime_dir.join("sleepy/notification.sock");
     let generation_path = state_dir.join("sleepy/session-generation");
+    let notification_state_dir = state_dir.join("sleepy/notifications");
+    let notification_provider = tokio::task::spawn_blocking(move || {
+        NotificationStore::open_default(notification_state_dir)
+            .and_then(FreedesktopNotificationProvider::new)
+    });
     let (overview_sender, overview_events) = overview_event_channel(256);
-    let daily_backend = Arc::new(ProductionDailyBackend::open_with_overview(
+    let daily_backend = Arc::new(ProductionDailyBackend::open_deferred_with_overview(
         &state_dir,
         &cache_dir,
         overview_events,
@@ -65,9 +71,27 @@ async fn run() -> io::Result<()> {
             publication_hub.publish(publication)?;
         }
     });
-    let notification_store =
-        NotificationStore::open_default(state_dir.join("sleepy/notifications"))?;
-    let notification_provider = FreedesktopNotificationProvider::new(notification_store)?;
+    let expected_uid = unsafe { libc::geteuid() };
+    let socket = SessionSocket::bind(&socket_path, expected_uid, hub.clone()).await?;
+    let mutation_backend = Arc::new(ProductionMutationBackend::new(hub.clone()));
+    let mutation_pipeline = Arc::new(MutationPipeline::new(authority.clone(), mutation_backend));
+    let control_socket =
+        ControlSocket::bind(&control_socket_path, expected_uid, mutation_pipeline).await?;
+    let osd_socket = OsdSocket::bind(&osd_socket_path, expected_uid, osd_hub).await?;
+    let daily_socket =
+        DailySocket::bind(&daily_socket_path, expected_uid, Arc::clone(&daily_backend)).await?;
+    let theme_manager = ThemeManager::open(&config_dir, &state_dir)
+        .map_err(|error| io::Error::other(format!("theme provider: {error}")))?;
+    let theme_socket = ThemeSocket::bind(
+        &theme_socket_path,
+        expected_uid,
+        theme_manager,
+        authority.clone(),
+    )
+    .await?;
+    let notification_provider = notification_provider.await.map_err(|error| {
+        io::Error::other(format!("notification store worker failed: {error}"))
+    })??;
     let notification_service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
         notification_provider,
         authority.clone(),
@@ -78,29 +102,15 @@ async fn run() -> io::Result<()> {
     )?;
     let notification_socket = NotificationSocket::bind(
         &notification_socket_path,
-        unsafe { libc::geteuid() },
+        expected_uid,
         Arc::clone(&notification_service),
     )
     .await?
     .with_action_dispatcher(notification_bus.action_dispatcher());
-    let expected_uid = unsafe { libc::geteuid() };
-    let socket = SessionSocket::bind(&socket_path, expected_uid, hub.clone()).await?;
-    let mutation_backend = Arc::new(ProductionMutationBackend::new(hub.clone()));
-    let mutation_pipeline = Arc::new(MutationPipeline::new(authority.clone(), mutation_backend));
-    let control_socket =
-        ControlSocket::bind(&control_socket_path, expected_uid, mutation_pipeline).await?;
-    let osd_socket = OsdSocket::bind(&osd_socket_path, expected_uid, osd_hub).await?;
-    let daily_socket = DailySocket::bind(&daily_socket_path, expected_uid, daily_backend).await?;
-    let theme_manager = ThemeManager::open(&config_dir, &state_dir)
-        .map_err(|error| io::Error::other(format!("theme provider: {error}")))?;
-    let theme_socket = ThemeSocket::bind(
-        &theme_socket_path,
-        expected_uid,
-        theme_manager,
-        authority.clone(),
-    )
-    .await?;
+    let launcher_index = daily_backend.start_launcher_index();
     let sources = ProductionSources::start_with_overview(authority.clone(), overview_sender);
+    sleepy_session::notify_ready()?;
+    eprintln!("event=startup phase=ready");
     let shutdown = ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
     let result = {
         tokio::select! {
@@ -189,10 +199,17 @@ async fn run() -> io::Result<()> {
     {
         cleanup_error.get_or_insert(error);
     }
+    if let Err(error) = launcher_index
+        .shutdown_and_join(std::time::Duration::from_secs(2))
+        .await
+    {
+        cleanup_error.get_or_insert(error);
+    }
     osd_bridge.abort();
     let _ = osd_bridge.await;
     osd_task.abort();
     let _ = osd_task.await;
+    eprintln!("event=shutdown phase=complete");
     result.and_then(|_| cleanup_error.map_or(Ok(()), Err))
 }
 

@@ -352,6 +352,57 @@ async fn session_socket_shutdown_waits_for_queued_client_output_and_connection_t
 }
 
 #[tokio::test]
+async fn session_socket_caps_stream_clients_and_rejects_the_thirty_third() {
+    use tokio::io::AsyncBufReadExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("sleepy/session.sock");
+    let hub = EventHub::new(lifecycle(1, LifecycleState::Ready), 8);
+    let socket = Arc::new(
+        SessionSocket::bind(&socket_path, unsafe { libc::geteuid() }, hub)
+            .await
+            .unwrap(),
+    );
+    let server_socket = Arc::clone(&socket);
+    let server = tokio::spawn(async move { server_socket.serve().await });
+    let mut clients = Vec::new();
+
+    for _ in 0..32 {
+        let stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!line.is_empty());
+        clients.push(reader);
+    }
+
+    let rejected = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+    let mut rejected = tokio::io::BufReader::new(rejected);
+    let mut line = String::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        rejected.read_line(&mut line),
+    )
+    .await
+    .expect("the over-limit connection must be rejected without queueing")
+    .unwrap();
+    assert_eq!(read, 0);
+
+    drop(clients);
+    socket
+        .shutdown_and_drain(std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+    assert!(server.await.unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn session_socket_rejects_a_symlinked_parent_directory() {
     use std::os::unix::fs::symlink;
 

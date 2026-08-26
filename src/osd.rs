@@ -25,6 +25,7 @@ use crate::sessiond::{
     private_socket::{peer_uid, PrivateSocketEndpoint},
     EventSubscriber, SocketDrainReport,
 };
+use crate::socket_supervisor::ConnectionSupervisor;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FocusedOsdRequest {
@@ -66,7 +67,7 @@ pub struct OsdSocket {
     endpoint: PrivateSocketEndpoint,
     hub: OsdPublicationHub,
     shutdown: broadcast::Sender<()>,
-    connections: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
+    connections: ConnectionSupervisor,
     serving: AtomicBool,
     serve_stopped: tokio::sync::Notify,
 }
@@ -513,7 +514,7 @@ impl OsdSocket {
             endpoint,
             hub,
             shutdown,
-            connections: tokio::sync::Mutex::new(Vec::new()),
+            connections: ConnectionSupervisor::new(32),
             serving: AtomicBool::new(false),
             serve_stopped: tokio::sync::Notify::new(),
         })
@@ -539,9 +540,16 @@ impl OsdSocket {
             let expected_uid = self.endpoint.expected_uid();
             let subscriber = self.hub.subscribe()?;
             let shutdown = self.shutdown.subscribe();
-            self.connections.lock().await.push(tokio::spawn(async move {
-                serve_osd_stream(stream, expected_uid, subscriber, shutdown).await
-            }));
+            let Some(permit) = self.connections.try_admit() else {
+                eprintln!("event=rejected_connection endpoint=osd reason=limit");
+                drop(stream);
+                continue;
+            };
+            self.connections
+                .spawn(permit, async move {
+                    serve_osd_stream(stream, expected_uid, subscriber, shutdown).await
+                })
+                .await;
         }
     }
 
@@ -561,26 +569,7 @@ impl OsdSocket {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OSD accept loop did not stop"))?;
         }
-        let mut handles = std::mem::take(&mut *self.connections.lock().await);
-        let mut report = SocketDrainReport::default();
-        while !handles.is_empty() {
-            let mut handle = handles.remove(0);
-            match tokio::time::timeout_at(deadline, &mut handle).await {
-                Ok(_) => report.completed += 1,
-                Err(_) => {
-                    handle.abort();
-                    let _ = handle.await;
-                    report.aborted += 1;
-                    for handle in handles {
-                        handle.abort();
-                        let _ = handle.await;
-                        report.aborted += 1;
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(report)
+        Ok(self.connections.drain(deadline).await)
     }
 
     pub fn path(&self) -> &Path {
@@ -627,7 +616,9 @@ async fn serve_osd_stream(
         let mut line = serde_json::to_vec(&publication)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         line.push(b'\n');
-        stream.write_all(&line).await?;
+        tokio::time::timeout(Duration::from_secs(1), stream.write_all(&line))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "OSD write timed out"))??;
     }
 }
 
