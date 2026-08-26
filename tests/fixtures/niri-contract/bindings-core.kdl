@@ -1,0 +1,5 @@
+binds {
+    // Immutable escape hatch. All normal bindings are generated from the
+    // active preset into sleepy-user-bindings.kdl by sleepy-session.
+    Mod+Shift+Escape { spawn "ghostty"; }
+}

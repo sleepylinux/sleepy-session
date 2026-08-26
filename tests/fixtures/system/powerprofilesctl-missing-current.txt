@@ -1,0 +1,4 @@
+  performance:
+    Driver: platform_profile
+  power-saver:
+    Driver: platform_profile

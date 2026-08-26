@@ -1,0 +1,4 @@
+window-rule {
+    geometry-corner-radius 10.0
+    clip-to-geometry true
+}

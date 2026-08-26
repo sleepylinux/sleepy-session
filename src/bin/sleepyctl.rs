@@ -1,10 +1,26 @@
-use std::process::ExitCode;
+use std::{
+    io::{self, BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
+    path::PathBuf,
+    process::ExitCode,
+};
 
-use serde_json::{json, Value};
-use sleepy_session::{Defaults, StateStore, StoreError, StorePaths};
+use serde_json::json;
+use sleepy_session::cli;
 
 fn main() -> ExitCode {
-    match run(std::env::args().skip(1).collect()) {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments == ["events", "watch"] || arguments == ["events", "watch", "--format", "ndjson"] {
+        return match watch_events() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("sleepyctl events watch: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    match cli::run(arguments) {
         Ok(output) => {
             println!(
                 "{}",
@@ -13,67 +29,35 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
+            let mut output = json!({
+                "error": { "code": error.code(), "message": error.message() }
+            });
+            if let Some(details) = error.details() {
+                output["error"]["details"] = details.clone();
+            }
             eprintln!(
                 "{}",
-                serde_json::to_string(&json!({
-                    "error": { "code": error.code(), "message": error.message() }
-                }))
-                .expect("JSON errors serialize")
+                serde_json::to_string(&output).expect("JSON errors serialize")
             );
             ExitCode::from(1)
         }
     }
 }
 
-fn run(arguments: Vec<String>) -> Result<Value, StoreError> {
-    match arguments.as_slice() {
-        [command, action] if command == "settings" && action == "show" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?.settings_json()
+fn watch_events() -> io::Result<()> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    let stream = UnixStream::connect(runtime_dir.join("sleepy/session.sock"))?;
+    let mut reader = BufReader::new(stream);
+    let mut stdout = io::stdout().lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
         }
-        [command, action] if command == "presets" && action == "list" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?.presets_json()
-        }
-        [command, action, source, name] if command == "presets" && action == "duplicate" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?
-                .duplicate_preset(source, name)
-        }
-        [command, action, id, name] if command == "presets" && action == "rename" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?
-                .rename_preset(id, name)
-        }
-        [command, action, id] if command == "presets" && action == "activate" => {
-            StateStore::open(StorePaths::from_environment(), default_state()?)?.activate_preset(id)
-        }
-        _ => Err(invalid_command()),
+        stdout.write_all(line.as_bytes())?;
+        stdout.flush()?;
     }
-}
-
-fn default_state() -> Result<Defaults, StoreError> {
-    Defaults::from_json(
-        json!({
-            "schemaVersion": 1,
-            "activePresetId": "builtin.sleepy",
-            "appearanceMode": "dark",
-            "paletteSource": "sleepy",
-            "reducedMotion": false,
-            "effectsProfile": "full",
-            "panelVisibility": "always",
-            "webSearchEnabled": true
-        }),
-        vec![json!({
-            "schemaVersion": 1,
-            "id": "builtin.sleepy",
-            "name": "Sleepy",
-            "origin": "builtin",
-            "basePresetId": null,
-            "layouts": {},
-            "drawers": { "leftQuickSettings": {} },
-            "keybindings": {},
-            "pluginRequirements": []
-        })],
-    )
-}
-
-fn invalid_command() -> StoreError {
-    StoreError::invalid_command()
 }

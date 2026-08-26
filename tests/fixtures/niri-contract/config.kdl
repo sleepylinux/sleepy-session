@@ -1,0 +1,6 @@
+include "input.kdl"
+include "appearance.kdl"
+include "bindings-core.kdl"
+include optional=true "sleepy-user-bindings.kdl"
+include "rules.kdl"
+include "startup.kdl"

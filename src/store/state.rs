@@ -1,21 +1,15 @@
-use std::{
-    collections::BTreeSet,
-    fmt,
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, ffi::OsStr, fmt, io, sync::Arc};
 
 use fs2::FileExt;
+use serde::Serialize;
 use serde_json::{json, Value};
 use sleepy_sdk::{
-    validate_preset, validate_settings, PresetDocument, PresetOrigin, SettingsDocument,
-    BUILTIN_PRESET_ID,
+    packaged_reserved_keybindings, validate_keybindings_with_reserved, validate_preset,
+    validate_settings, PresetDocument, PresetOrigin, SettingsDocument, BUILTIN_PRESET_ID,
 };
 use uuid::Uuid;
 
-use super::{Defaults, StoreError, StorePaths};
+use super::{Defaults, SecureDir, StoreError, StoreHandles, StorePaths};
 
 /// Observable replacement boundary used by callers that need explicit fault injection.
 pub trait ReplacementObserver: Send + Sync {
@@ -29,11 +23,266 @@ pub enum ReplacementStage {
     RenamedBeforeParentSync,
 }
 
+/// Observable preset-mutation boundary used for deterministic concurrency tests.
+pub trait PresetMutationObserver: Send + Sync {
+    fn reached(&self, stage: PresetMutationStage) -> io::Result<()>;
+}
+
+/// A preset-mutation point at which an observer may pause or fail an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetMutationStage {
+    KeybindingTargetEligible,
+}
+
 #[derive(Clone)]
 pub struct StateStore {
     paths: StorePaths,
+    handles: Arc<StoreHandles>,
     defaults: Defaults,
     replacement_observer: Option<Arc<dyn ReplacementObserver>>,
+    mutation_observer: Option<Arc<dyn PresetMutationObserver>>,
+}
+
+pub struct StateInspector;
+
+pub(crate) struct StateCandidate {
+    pub settings: SettingsDocument,
+    pub user_presets: Vec<PresetDocument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionReport {
+    pub clean: bool,
+    pub settings: InspectionDocumentReport,
+    pub presets: InspectionDocumentReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionDocumentReport {
+    pub exists: bool,
+    pub byte_length: usize,
+    pub valid: bool,
+    pub issues: Vec<InspectionIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InspectionIssue {
+    pub record_index: Option<usize>,
+    pub record_id: Option<String>,
+    pub actions: Vec<String>,
+    pub code: String,
+    pub message: String,
+}
+
+impl StateInspector {
+    pub fn inspect(paths: StorePaths) -> InspectionReport {
+        let handles = match StoreHandles::open(&paths, false) {
+            Ok(handles) => handles,
+            Err(error) => {
+                let issue = inspection_issue(None, None, Vec::new(), &error);
+                let document = InspectionDocumentReport {
+                    exists: false,
+                    byte_length: 0,
+                    valid: false,
+                    issues: vec![issue],
+                };
+                return InspectionReport {
+                    clean: false,
+                    settings: document.clone(),
+                    presets: document,
+                };
+            }
+        };
+
+        let (mut settings, active_id) = inspect_settings(&handles);
+        let (presets, preset_ids) = inspect_presets(&handles);
+        if settings.valid {
+            if let Some(active_id) = active_id {
+                if active_id != BUILTIN_PRESET_ID && !preset_ids.contains(&active_id) {
+                    let error = StoreError::invalid("settings activePresetId does not exist");
+                    settings.valid = false;
+                    settings
+                        .issues
+                        .push(inspection_issue(None, None, Vec::new(), &error));
+                }
+            }
+        }
+        InspectionReport {
+            clean: settings.valid && presets.valid,
+            settings,
+            presets,
+        }
+    }
+}
+
+fn inspect_settings(handles: &StoreHandles) -> (InspectionDocumentReport, Option<String>) {
+    let bytes = match handles.settings.read_optional(OsStr::new("settings.json")) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return (
+                unreadable_document(io::Error::from(io::ErrorKind::NotFound)),
+                None,
+            )
+        }
+        Err(error) => return (unreadable_store_document(error), None),
+    };
+    let byte_length = bytes.len();
+    let input = match std::str::from_utf8(&bytes) {
+        Ok(input) => input,
+        Err(error) => {
+            return (
+                invalid_document_report(
+                    byte_length,
+                    StoreError::invalid(format!("settings are not UTF-8: {error}")),
+                ),
+                None,
+            )
+        }
+    };
+    match validate_settings(input) {
+        Ok(settings) => (
+            InspectionDocumentReport {
+                exists: true,
+                byte_length,
+                valid: true,
+                issues: Vec::new(),
+            },
+            Some(settings.active_preset_id),
+        ),
+        Err(error) => (
+            invalid_document_report(byte_length, StoreError::invalid(error.to_string())),
+            None,
+        ),
+    }
+}
+
+fn inspect_presets(handles: &StoreHandles) -> (InspectionDocumentReport, BTreeSet<String>) {
+    let bytes = match handles.presets.read_optional(OsStr::new("presets.json")) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return (
+                unreadable_document(io::Error::from(io::ErrorKind::NotFound)),
+                BTreeSet::new(),
+            )
+        }
+        Err(error) => return (unreadable_store_document(error), BTreeSet::new()),
+    };
+    let byte_length = bytes.len();
+    let input = match std::str::from_utf8(&bytes) {
+        Ok(input) => input,
+        Err(error) => {
+            return (
+                invalid_document_report(
+                    byte_length,
+                    StoreError::invalid(format!("presets are not UTF-8: {error}")),
+                ),
+                BTreeSet::new(),
+            )
+        }
+    };
+    let records: Vec<Value> = match serde_json::from_str(input) {
+        Ok(records) => records,
+        Err(error) => {
+            return (
+                invalid_document_report(byte_length, StoreError::invalid(error.to_string())),
+                BTreeSet::new(),
+            )
+        }
+    };
+
+    let mut issues = Vec::new();
+    let mut ids = BTreeSet::new();
+    for (index, record) in records.into_iter().enumerate() {
+        let record_id = record.get("id").and_then(Value::as_str).map(str::to_owned);
+        match parse_preset(record) {
+            Ok(preset) if preset.origin != PresetOrigin::User => {
+                let error = StoreError::invalid("user preset store contains a builtin preset");
+                issues.push(inspection_issue(Some(index), record_id, Vec::new(), &error));
+            }
+            Ok(preset) if !ids.insert(preset.id.clone()) => {
+                let error = StoreError::invalid("user preset store contains duplicate ids");
+                issues.push(inspection_issue(
+                    Some(index),
+                    Some(preset.id),
+                    Vec::new(),
+                    &error,
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let actions = error
+                    .details()
+                    .and_then(|details| details.get("actions"))
+                    .and_then(Value::as_array)
+                    .map(|actions| {
+                        actions
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                issues.push(inspection_issue(Some(index), record_id, actions, &error));
+            }
+        }
+    }
+
+    (
+        InspectionDocumentReport {
+            exists: true,
+            byte_length,
+            valid: issues.is_empty(),
+            issues,
+        },
+        ids,
+    )
+}
+
+fn unreadable_document(error: io::Error) -> InspectionDocumentReport {
+    let exists = error.kind() != io::ErrorKind::NotFound;
+    let error = StoreError::io(error);
+    InspectionDocumentReport {
+        exists,
+        byte_length: 0,
+        valid: false,
+        issues: vec![inspection_issue(None, None, Vec::new(), &error)],
+    }
+}
+
+fn unreadable_store_document(error: StoreError) -> InspectionDocumentReport {
+    InspectionDocumentReport {
+        exists: true,
+        byte_length: 0,
+        valid: false,
+        issues: vec![inspection_issue(None, None, Vec::new(), &error)],
+    }
+}
+
+fn invalid_document_report(byte_length: usize, error: StoreError) -> InspectionDocumentReport {
+    InspectionDocumentReport {
+        exists: true,
+        byte_length,
+        valid: false,
+        issues: vec![inspection_issue(None, None, Vec::new(), &error)],
+    }
+}
+
+fn inspection_issue(
+    record_index: Option<usize>,
+    record_id: Option<String>,
+    actions: Vec<String>,
+    error: &StoreError,
+) -> InspectionIssue {
+    InspectionIssue {
+        record_index,
+        record_id,
+        actions,
+        code: error.code().to_owned(),
+        message: error.message().to_owned(),
+    }
 }
 
 impl fmt::Debug for StateStore {
@@ -48,10 +297,13 @@ impl fmt::Debug for StateStore {
 
 impl StateStore {
     pub fn open(paths: StorePaths, defaults: Defaults) -> Result<Self, StoreError> {
+        let handles = Arc::new(StoreHandles::open(&paths, true)?);
         let store = Self {
             paths,
+            handles,
             defaults,
             replacement_observer: None,
+            mutation_observer: None,
         };
         store.with_transaction(|store| {
             store.initialize()?;
@@ -67,9 +319,26 @@ impl StateStore {
         Ok(store)
     }
 
+    pub(crate) fn for_repair(paths: StorePaths, defaults: Defaults) -> Result<Self, StoreError> {
+        let handles = Arc::new(StoreHandles::open(&paths, true)?);
+        Ok(Self {
+            paths,
+            handles,
+            defaults,
+            replacement_observer: None,
+            mutation_observer: None,
+        })
+    }
+
     /// Adds a replacement-stage observer to a cloned store handle.
     pub fn with_replacement_observer(mut self, observer: Arc<dyn ReplacementObserver>) -> Self {
         self.replacement_observer = Some(observer);
+        self
+    }
+
+    /// Adds a preset-mutation observer to a cloned store handle.
+    pub fn with_mutation_observer(mut self, observer: Arc<dyn PresetMutationObserver>) -> Self {
+        self.mutation_observer = Some(observer);
         self
     }
 
@@ -144,10 +413,7 @@ impl StateStore {
             if store.find_preset(id)?.is_none() {
                 return Err(StoreError::not_found(id));
             }
-            let mut settings = store.load_settings()?;
-            settings.active_preset_id = id.to_owned();
-            store.write_settings(&settings)?;
-            serde_json::to_value(settings).map_err(|error| StoreError::invalid(error.to_string()))
+            Err(StoreError::apply_required(id))
         })
     }
 
@@ -159,49 +425,77 @@ impl StateStore {
                     "settings activePresetId does not exist",
                 ));
             }
+            if store.load_settings()?.active_preset_id != settings.active_preset_id {
+                return Err(StoreError::apply_required(&settings.active_preset_id));
+            }
             store.write_settings(&settings)?;
             serde_json::to_value(settings).map_err(|error| StoreError::invalid(error.to_string()))
         })
     }
 
-    fn with_transaction<T>(
+    pub(crate) fn with_transaction<T>(
         &self,
         operation: impl FnOnce(&Self) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         // A single configuration-root lock establishes the order for all settings/preset operations.
-        self.paths.reject_symlinks()?;
-        fs::create_dir_all(self.paths.settings_dir()).map_err(StoreError::io)?;
-        self.paths.reject_symlinks()?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.paths.lock_path())
-            .map_err(StoreError::io)?;
+        let lock = self
+            .handles
+            .settings
+            .open_lock(OsStr::new(".sleepy-session.lock"))?;
         lock.lock_exclusive().map_err(StoreError::io)?;
         let result = operation(self);
         FileExt::unlock(&lock).map_err(StoreError::io)?;
         result
     }
 
+    pub(crate) fn with_candidate_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Self, StateCandidate) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.with_transaction(|store| {
+            let candidate = StateCandidate {
+                settings: store.load_settings()?,
+                user_presets: store.load_user_presets()?,
+            };
+            operation(store, candidate)
+        })
+    }
+
+    pub(crate) fn with_repair_candidate_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.with_transaction(operation)
+    }
+
+    pub(super) fn observe_mutation(&self, stage: PresetMutationStage) -> Result<(), StoreError> {
+        if let Some(observer) = self.mutation_observer.as_deref() {
+            observer.reached(stage).map_err(StoreError::io)?;
+        }
+        Ok(())
+    }
+
     fn initialize(&self) -> Result<(), StoreError> {
-        if !self.paths.settings_path().exists() {
+        if !self.handles.settings.exists(OsStr::new("settings.json"))? {
             self.write_settings(&self.defaults.settings)?;
         }
-        if !self.paths.presets_path().exists() {
+        if !self.handles.presets.exists(OsStr::new("presets.json"))? {
             self.write_user_presets(&[])?;
         }
         Ok(())
     }
 
-    fn load_settings(&self) -> Result<SettingsDocument, StoreError> {
-        let input = fs::read_to_string(self.paths.settings_path()).map_err(StoreError::io)?;
+    pub(crate) fn load_settings(&self) -> Result<SettingsDocument, StoreError> {
+        let bytes = self.handles.settings.read(OsStr::new("settings.json"))?;
+        let input =
+            String::from_utf8(bytes).map_err(|error| StoreError::invalid(error.to_string()))?;
         validate_settings(&input).map_err(|error| StoreError::invalid(error.to_string()))
     }
 
-    fn load_user_presets(&self) -> Result<Vec<PresetDocument>, StoreError> {
-        let input = fs::read_to_string(self.paths.presets_path()).map_err(StoreError::io)?;
+    pub(crate) fn load_user_presets(&self) -> Result<Vec<PresetDocument>, StoreError> {
+        let bytes = self.handles.presets.read(OsStr::new("presets.json"))?;
+        let input =
+            String::from_utf8(bytes).map_err(|error| StoreError::invalid(error.to_string()))?;
         let presets: Vec<Value> =
             serde_json::from_str(&input).map_err(|error| StoreError::invalid(error.to_string()))?;
         let presets = presets
@@ -231,7 +525,7 @@ impl StateStore {
         Ok(presets)
     }
 
-    fn find_preset(&self, id: &str) -> Result<Option<PresetDocument>, StoreError> {
+    pub(crate) fn find_preset(&self, id: &str) -> Result<Option<PresetDocument>, StoreError> {
         if let Some(preset) = self.defaults.builtins.iter().find(|preset| preset.id == id) {
             return Ok(Some(preset.clone()));
         }
@@ -246,14 +540,14 @@ impl StateStore {
             .map_err(|error| StoreError::invalid(error.to_string()))?;
         let validated = parse_settings(value)?;
         atomic_replace(
-            &self.paths.settings_dir(),
-            &self.paths.settings_path(),
+            &self.handles.settings,
+            OsStr::new("settings.json"),
             &serde_json::to_vec(&validated).map_err(StoreError::io)?,
             self.replacement_observer.as_deref(),
         )
     }
 
-    fn write_user_presets(&self, presets: &[PresetDocument]) -> Result<(), StoreError> {
+    pub(super) fn write_user_presets(&self, presets: &[PresetDocument]) -> Result<(), StoreError> {
         let ids = presets
             .iter()
             .map(|preset| preset.id.as_str())
@@ -274,11 +568,22 @@ impl StateStore {
         let mut sorted = presets.to_vec();
         sorted.sort_by(|left, right| left.id.cmp(&right.id));
         atomic_replace(
-            &self.paths.presets_dir(),
-            &self.paths.presets_path(),
+            &self.handles.presets,
+            OsStr::new("presets.json"),
             &serde_json::to_vec(&sorted).map_err(StoreError::io)?,
             self.replacement_observer.as_deref(),
         )
+    }
+
+    pub(crate) fn secure_handles(&self) -> Arc<StoreHandles> {
+        Arc::clone(&self.handles)
+    }
+
+    pub(crate) fn document_presence(&self) -> Result<(bool, bool), StoreError> {
+        Ok((
+            self.handles.settings.exists(OsStr::new("settings.json"))?,
+            self.handles.presets.exists(OsStr::new("presets.json"))?,
+        ))
     }
 }
 
@@ -294,54 +599,37 @@ fn parse_settings(value: Value) -> Result<SettingsDocument, StoreError> {
     validate_settings(&value.to_string()).map_err(|error| StoreError::invalid(error.to_string()))
 }
 
-fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
+pub(crate) fn parse_preset(value: Value) -> Result<PresetDocument, StoreError> {
+    if let Ok(document) = serde_json::from_value::<PresetDocument>(value.clone()) {
+        validate_keybindings_with_reserved(&document.keybindings, &packaged_reserved_keybindings())
+            .map_err(StoreError::keybinding_conflict)?;
+    }
     validate_preset(&value.to_string()).map_err(|error| StoreError::invalid(error.to_string()))
 }
 
 fn atomic_replace(
-    directory: &Path,
-    destination: &Path,
+    directory: &SecureDir,
+    destination: &OsStr,
     bytes: &[u8],
     observer: Option<&dyn ReplacementObserver>,
 ) -> Result<(), StoreError> {
-    fs::create_dir_all(directory).map_err(StoreError::io)?;
-    let temporary = directory.join(format!(
-        ".{}.{}.tmp",
-        destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state"),
-        Uuid::new_v4()
-    ));
-    let mut replacement = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(StoreError::io)?;
-    let result = replacement
-        .write_all(bytes)
-        .and_then(|()| replacement.sync_all());
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(StoreError::io(error));
-    }
-    if let Some(observer) = observer {
-        if let Err(error) = observer.reached(ReplacementStage::TemporaryFileSynced) {
-            let _ = fs::remove_file(&temporary);
-            return Err(StoreError::io(error));
-        }
-    }
-    drop(replacement);
-    if let Err(error) = fs::rename(&temporary, destination) {
-        let _ = fs::remove_file(&temporary);
-        return Err(StoreError::io(error));
-    }
-    if let Some(observer) = observer {
-        if let Err(error) = observer.reached(ReplacementStage::RenamedBeforeParentSync) {
-            return Err(StoreError::commit_state_unknown(error));
-        }
-    }
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(StoreError::commit_state_unknown)
+    directory.atomic_replace(
+        destination,
+        bytes,
+        || {
+            observer
+                .map(|observer| observer.reached(ReplacementStage::TemporaryFileSynced))
+                .transpose()
+                .map(|_| ())
+                .map_err(StoreError::io)
+        },
+        || {
+            observer
+                .map(|observer| observer.reached(ReplacementStage::RenamedBeforeParentSync))
+                .transpose()
+                .map(|_| ())
+                .map_err(StoreError::commit_state_unknown)
+        },
+        || Ok(()),
+    )
 }
