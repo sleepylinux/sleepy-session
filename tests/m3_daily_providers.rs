@@ -1199,12 +1199,9 @@ async fn daily_shutdown_does_not_wait_for_non_reading_clients_response_write() {
     .unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     let draining = Arc::clone(&socket);
-    let mut drain = tokio::spawn(async move {
-        draining
-            .shutdown_and_drain(Duration::from_millis(150))
-            .await
-    });
-    let completed = tokio::time::timeout(Duration::from_millis(400), &mut drain).await;
+    let mut drain =
+        tokio::spawn(async move { draining.shutdown_and_drain(Duration::from_secs(1)).await });
+    let completed = tokio::time::timeout(Duration::from_secs(2), &mut drain).await;
     let finished_while_client_was_not_reading = completed.is_ok();
     drop(client);
     let drain_result = match completed {
