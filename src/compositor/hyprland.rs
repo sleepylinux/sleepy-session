@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::{
+    ffi::CString,
+    fs::{File, OpenOptions},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    },
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -14,7 +21,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{bounds_error, protocol::parse_full_snapshot, CompositorError, CompositorErrorKind};
+use super::{
+    bounds_error,
+    protocol::{parse_full_snapshot_with_metadata, ParsedHyprlandSnapshot},
+    CompositorError, CompositorErrorKind,
+};
 
 pub const MAX_INSTANCE_SIGNATURE_BYTES: usize = 128;
 pub const MAX_COMMAND_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -22,6 +33,7 @@ pub const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 
 const MAX_EVENT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_EVENT_GROUP_MEMBERS: usize = 16_384;
+const MAX_BATCH_SUBRESPONSE_BYTES: usize = 4 * 1024;
 
 const MONITORS_REQUEST: &[u8] = b"j/monitors";
 const WORKSPACES_REQUEST: &[u8] = b"j/workspaces";
@@ -46,8 +58,9 @@ impl Default for AdapterTiming {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct HyprlandPaths {
+    _instance_dir: Arc<File>,
     command_socket: PathBuf,
     event_socket: PathBuf,
 }
@@ -103,7 +116,7 @@ impl HyprlandAdapter {
             return self.confirm_exit(deadline).await;
         }
 
-        let pre = self.snapshot_at(deadline).await?;
+        let pre = self.snapshot_with_metadata_at(deadline).await?;
         let plan = ActionPlan::from_command(command, &pre)?;
         for request in &plan.requests {
             self.dispatch_at(request, deadline).await?;
@@ -116,9 +129,9 @@ impl HyprlandAdapter {
                     "Hyprland readback did not confirm the requested postcondition",
                 ));
             }
-            let post = self.snapshot_at(deadline).await?;
+            let post = self.snapshot_with_metadata_at(deadline).await?;
             if plan.expected.confirms(&post) {
-                return Ok(CompositorExecution::Snapshot(post));
+                return Ok(CompositorExecution::Snapshot(post.snapshot));
             }
             tokio::select! {
                 biased;
@@ -135,6 +148,9 @@ impl HyprlandAdapter {
 
     async fn dispatch_at(&self, request: &[u8], deadline: Instant) -> Result<(), CompositorError> {
         let response = self.request_at(request, deadline).await?;
+        if request.starts_with(b"[[BATCH]]") {
+            return validate_batch_response(request, &response);
+        }
         if response != b"ok" {
             return Err(CompositorError::new(
                 CompositorErrorKind::Rejected,
@@ -224,10 +240,7 @@ impl HyprlandAdapter {
                 if error.kind() == CompositorErrorKind::Cancelled {
                     return Ok(());
                 }
-                let degraded = HyprlandEvent::Degraded {
-                    kind: error.kind(),
-                    message: error.to_string(),
-                };
+                let degraded = HyprlandEvent::Degraded { kind: error.kind() };
                 match sender.try_send(degraded) {
                     Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
                     Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
@@ -288,8 +301,8 @@ impl HyprlandAdapter {
                     let line = line?;
                     if parse_event_line(&line)? == EventDisposition::Reconcile {
                         self.publish_snapshot(sender).await?;
+                        fallback.as_mut().reset(Instant::now() + self.timing.fallback_reconcile);
                     }
-                    fallback.as_mut().reset(Instant::now() + self.timing.fallback_reconcile);
                 }
             }
         }
@@ -318,10 +331,40 @@ impl HyprlandAdapter {
         &self,
         deadline: Instant,
     ) -> Result<HyprlandSnapshot, CompositorError> {
-        let monitors = self.request_at(MONITORS_REQUEST, deadline).await?;
-        let workspaces = self.request_at(WORKSPACES_REQUEST, deadline).await?;
-        let clients = self.request_at(CLIENTS_REQUEST, deadline).await?;
-        parse_full_snapshot(&monitors, &workspaces, &clients)
+        Ok(self.snapshot_with_metadata_at(deadline).await?.snapshot)
+    }
+
+    async fn snapshot_with_metadata_at(
+        &self,
+        deadline: Instant,
+    ) -> Result<ParsedHyprlandSnapshot, CompositorError> {
+        loop {
+            let monitors = self.request_at(MONITORS_REQUEST, deadline).await?;
+            let workspaces = self.request_at(WORKSPACES_REQUEST, deadline).await?;
+            let clients = self.request_at(CLIENTS_REQUEST, deadline).await?;
+            match parse_full_snapshot_with_metadata(&monitors, &workspaces, &clients) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) if error.kind() == CompositorErrorKind::Inconsistent => {
+                    if Instant::now() >= deadline {
+                        return Err(CompositorError::new(
+                            CompositorErrorKind::Timeout,
+                            "Hyprland queries did not become mutually consistent before the total deadline",
+                        ));
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = self.cancellation.cancelled() => return Err(CompositorError::new(
+                            CompositorErrorKind::Cancelled,
+                            "Hyprland snapshot reconciliation was cancelled",
+                        )),
+                        _ = tokio::time::sleep_until(
+                            std::cmp::min(deadline, Instant::now() + self.timing.confirmation_poll)
+                        ) => {}
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     async fn request_at(
@@ -414,7 +457,7 @@ enum ExpectedPostcondition {
     },
     WindowFullscreen {
         window_id: String,
-        expected: bool,
+        expected_mode: u8,
     },
     WindowFloating {
         window_id: String,
@@ -433,8 +476,9 @@ enum ExpectedPostcondition {
 impl ActionPlan {
     fn from_command(
         command: HyprlandCommand,
-        snapshot: &HyprlandSnapshot,
+        parsed: &ParsedHyprlandSnapshot,
     ) -> Result<Self, CompositorError> {
+        let snapshot = &parsed.snapshot;
         let (requests, expected) = match command {
             HyprlandCommand::FocusWindow { window_id } => {
                 let window = find_window(snapshot, window_id.as_str())?;
@@ -451,7 +495,7 @@ impl ActionPlan {
             } => {
                 let window = find_window(snapshot, window_id.as_str())?;
                 let workspace = find_workspace(snapshot, workspace_id.as_str())?;
-                let target = workspace_dispatch_target(workspace)?;
+                let target = workspace_dispatch_target(workspace, true)?;
                 (
                     vec![dispatch(format!(
                         "movetoworkspacesilent {target},address:{}",
@@ -474,7 +518,7 @@ impl ActionPlan {
             }
             HyprlandCommand::FocusWorkspace { workspace_id } => {
                 let workspace = find_workspace(snapshot, workspace_id.as_str())?;
-                let target = workspace_dispatch_target(workspace)?;
+                let target = workspace_dispatch_target(workspace, false)?;
                 (
                     vec![dispatch(format!("workspace {target}"))?],
                     ExpectedPostcondition::WorkspaceFocused {
@@ -493,7 +537,7 @@ impl ActionPlan {
                     .find(|monitor| monitor.id == monitor_id.as_str())
                     .ok_or_else(|| rejected_target("monitor"))?;
                 validate_dispatch_token(&monitor.id, "monitor")?;
-                let target = workspace_dispatch_target(workspace)?;
+                let target = workspace_dispatch_target(workspace, false)?;
                 (
                     vec![dispatch(format!(
                         "moveworkspacetomonitor {target} {}",
@@ -507,14 +551,30 @@ impl ActionPlan {
             }
             HyprlandCommand::ToggleFullscreen { window_id } => {
                 let window = find_window(snapshot, window_id.as_str())?;
+                let mode = parsed
+                    .fullscreen_modes
+                    .get(&window.id)
+                    .copied()
+                    .ok_or_else(|| rejected_target("window fullscreen state"))?;
+                let (operation, expected_mode) = match mode {
+                    0 => ("fullscreen 0 set", 2),
+                    1 => ("fullscreen 1 unset", 0),
+                    2 => ("fullscreen 0 unset", 0),
+                    _ => {
+                        return Err(CompositorError::new(
+                            CompositorErrorKind::Rejected,
+                            "Hyprland window had an unsupported fullscreen mode",
+                        ))
+                    }
+                };
                 (
-                    vec![
-                        dispatch(format!("focuswindow address:{}", window.id))?,
-                        dispatch("fullscreen 0".into())?,
-                    ],
+                    vec![batch_dispatches(
+                        format!("focuswindow address:{}", window.id),
+                        operation.into(),
+                    )?],
                     ExpectedPostcondition::WindowFullscreen {
                         window_id: window.id.clone(),
-                        expected: !window.fullscreen,
+                        expected_mode,
                     },
                 )
             }
@@ -541,10 +601,10 @@ impl ActionPlan {
             HyprlandCommand::ToggleGroup { window_id } => {
                 let window = find_window(snapshot, window_id.as_str())?;
                 (
-                    vec![
-                        dispatch(format!("focuswindow address:{}", window.id))?,
-                        dispatch("togglegroup".into())?,
-                    ],
+                    vec![batch_dispatches(
+                        format!("focuswindow address:{}", window.id),
+                        "togglegroup".into(),
+                    )?],
                     ExpectedPostcondition::WindowGrouped {
                         window_id: window.id.clone(),
                         expected: !window.grouped,
@@ -558,7 +618,8 @@ impl ActionPlan {
 }
 
 impl ExpectedPostcondition {
-    fn confirms(&self, snapshot: &HyprlandSnapshot) -> bool {
+    fn confirms(&self, parsed: &ParsedHyprlandSnapshot) -> bool {
+        let snapshot = &parsed.snapshot;
         match self {
             Self::WindowFocused { window_id } => snapshot
                 .windows
@@ -587,11 +648,8 @@ impl ExpectedPostcondition {
             }),
             Self::WindowFullscreen {
                 window_id,
-                expected,
-            } => snapshot
-                .windows
-                .iter()
-                .any(|window| window.id == *window_id && window.fullscreen == *expected),
+                expected_mode,
+            } => parsed.fullscreen_modes.get(window_id) == Some(expected_mode),
             Self::WindowFloating {
                 window_id,
                 expected,
@@ -646,22 +704,27 @@ fn rejected_target(description: &str) -> CompositorError {
     )
 }
 
-fn workspace_dispatch_target(workspace: &sleepy_sdk::Workspace) -> Result<&str, CompositorError> {
-    if workspace.id.starts_with('-') {
-        if !workspace.name.starts_with("special:") {
-            return Err(rejected_target("special workspace"));
+fn workspace_dispatch_target(
+    workspace: &sleepy_sdk::Workspace,
+    allow_special: bool,
+) -> Result<String, CompositorError> {
+    if workspace.name.starts_with("special:") {
+        if !allow_special {
+            return Err(CompositorError::new(
+                CompositorErrorKind::Unsupported,
+                "Hyprland special workspace operation has no deterministic legacy dispatcher",
+            ));
         }
         validate_dispatch_token(&workspace.name, "special workspace")?;
-        Ok(&workspace.name)
-    } else {
-        workspace
-            .id
-            .parse::<u64>()
-            .ok()
-            .filter(|id| *id > 0)
-            .ok_or_else(|| rejected_target("workspace"))?;
-        Ok(&workspace.id)
+        return Ok(workspace.name.clone());
     }
+
+    if workspace.name == workspace.id && workspace.id.parse::<u64>().ok().is_some_and(|id| id > 0) {
+        return Ok(workspace.id.clone());
+    }
+
+    validate_dispatch_token(&workspace.name, "named workspace")?;
+    Ok(format!("name:{}", workspace.name))
 }
 
 fn validate_dispatch_token(value: &str, description: &str) -> Result<(), CompositorError> {
@@ -689,6 +752,58 @@ fn dispatch(argument: String) -> Result<Vec<u8>, CompositorError> {
     Ok(format!("dispatch {argument}").into_bytes())
 }
 
+fn batch_dispatches(first: String, second: String) -> Result<Vec<u8>, CompositorError> {
+    let first = dispatch(first)?;
+    let second = dispatch(second)?;
+    if first.contains(&b';') || second.contains(&b';') {
+        return Err(CompositorError::new(
+            CompositorErrorKind::Rejected,
+            "Hyprland batch dispatcher contained an unsafe separator",
+        ));
+    }
+    let mut request = Vec::with_capacity(9 + first.len() + 1 + second.len());
+    request.extend_from_slice(b"[[BATCH]]");
+    request.extend_from_slice(&first);
+    request.push(b';');
+    request.extend_from_slice(&second);
+    Ok(request)
+}
+
+fn validate_batch_response(request: &[u8], response: &[u8]) -> Result<(), CompositorError> {
+    let expected = request[9..].split(|byte| *byte == b';').count();
+    let mut replies = Vec::new();
+    let mut start = 0;
+    while let Some(offset) = response[start..]
+        .windows(3)
+        .position(|window| window == b"\n\n\n")
+    {
+        let end = start + offset;
+        replies.push(&response[start..end]);
+        start = end + 3;
+    }
+    replies.push(&response[start..]);
+    if replies.len() != expected {
+        return Err(CompositorError::new(
+            CompositorErrorKind::Rejected,
+            "Hyprland batch reply count did not match the fixed request",
+        ));
+    }
+    for reply in replies {
+        if reply.len() > MAX_BATCH_SUBRESPONSE_BYTES {
+            return Err(bounds_error(format!(
+                "Hyprland batch subresponse exceeded {MAX_BATCH_SUBRESPONSE_BYTES} bytes"
+            )));
+        }
+        if reply != b"ok" {
+            return Err(CompositorError::new(
+                CompositorErrorKind::Rejected,
+                "Hyprland rejected a fixed compositor batch subcommand",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventDisposition {
     Ignore,
@@ -698,10 +813,7 @@ pub enum EventDisposition {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HyprlandEvent {
     Snapshot(HyprlandSnapshot),
-    Degraded {
-        kind: CompositorErrorKind,
-        message: String,
-    },
+    Degraded { kind: CompositorErrorKind },
 }
 
 pub fn parse_event_line(line: &[u8]) -> Result<EventDisposition, CompositorError> {
@@ -909,6 +1021,8 @@ fn validate_event_address(value: &str) -> Result<(), CompositorError> {
     let digits = value.strip_prefix("0x").unwrap_or(value);
     if digits.is_empty()
         || digits.len() > 16
+        || digits == "0"
+        || (digits.len() > 1 && digits.starts_with('0'))
         || !digits
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -1005,10 +1119,15 @@ impl HyprlandPaths {
     ) -> Result<Self, CompositorError> {
         validate_runtime_root(runtime_dir)?;
         validate_signature(signature)?;
-        let instance = runtime_dir.join("hypr").join(signature);
+        let runtime = open_private_directory(runtime_dir, "XDG_RUNTIME_DIR")?;
+        let hypr = open_private_child(&runtime, "hypr", "Hyprland runtime directory")?;
+        let instance = open_private_child(&hypr, signature, "Hyprland instance directory")?;
+        let instance = Arc::new(instance);
+        let anchored = PathBuf::from(format!("/proc/self/fd/{}", instance.as_raw_fd()));
         Ok(Self {
-            command_socket: instance.join(".socket.sock"),
-            event_socket: instance.join(".socket2.sock"),
+            _instance_dir: instance,
+            command_socket: anchored.join(".socket.sock"),
+            event_socket: anchored.join(".socket2.sock"),
         })
     }
 
@@ -1019,6 +1138,60 @@ impl HyprlandPaths {
     pub fn event_socket(&self) -> &Path {
         &self.event_socket
     }
+}
+
+fn open_private_directory(path: &Path, description: &str) -> Result<File, CompositorError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| unsafe_instance_directory(description))?;
+    validate_private_directory(&file, description)?;
+    Ok(file)
+}
+
+fn open_private_child(
+    parent: &File,
+    name: &str,
+    description: &str,
+) -> Result<File, CompositorError> {
+    let name = CString::new(name).map_err(|_| unsafe_instance_directory(description))?;
+    // SAFETY: parent is a live directory fd, name is NUL-terminated and contains no slash,
+    // and a successful descriptor is immediately owned by File.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(unsafe_instance_directory(description));
+    }
+    // SAFETY: openat returned a new owned descriptor on success.
+    let file = unsafe { File::from_raw_fd(fd) };
+    validate_private_directory(&file, description)?;
+    Ok(file)
+}
+
+fn validate_private_directory(file: &File, description: &str) -> Result<(), CompositorError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| unsafe_instance_directory(description))?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(unsafe_instance_directory(description));
+    }
+    Ok(())
+}
+
+fn unsafe_instance_directory(description: &str) -> CompositorError {
+    CompositorError::new(
+        CompositorErrorKind::UnsafeInstance,
+        format!("{description} was not a private, owned, non-symlink directory"),
+    )
 }
 
 fn validate_runtime_root(runtime_dir: &Path) -> Result<(), CompositorError> {

@@ -301,11 +301,13 @@ async fn run_hyprland_source(
                         diagnostic: None,
                     });
                 }
-                Some(HyprlandEvent::Degraded { kind, message }) => {
+                Some(HyprlandEvent::Degraded { kind }) => {
                     state.send_replace(DesktopCapability {
                         status: availability_for_compositor_error(kind),
                         data: None,
-                        diagnostic: Some(CapabilityFailure { message }),
+                        diagnostic: Some(CapabilityFailure {
+                            message: safe_hyprland_diagnostic(kind).into(),
+                        }),
                     });
                 }
                 None => return Ok(()),
@@ -329,8 +331,26 @@ fn hyprland_failure(error: &CompositorError) -> DesktopCapability<HyprlandSnapsh
         status: availability_for_compositor_error(error.kind()),
         data: None,
         diagnostic: Some(CapabilityFailure {
-            message: error.to_string(),
+            message: safe_hyprland_diagnostic(error.kind()).into(),
         }),
+    }
+}
+
+fn safe_hyprland_diagnostic(kind: CompositorErrorKind) -> &'static str {
+    match kind {
+        CompositorErrorKind::Unavailable | CompositorErrorKind::UnsafeInstance => {
+            "Hyprland compositor is unavailable"
+        }
+        CompositorErrorKind::Timeout => "Hyprland compositor reconciliation timed out",
+        CompositorErrorKind::Parse
+        | CompositorErrorKind::Inconsistent
+        | CompositorErrorKind::Bounds => "Hyprland compositor protocol data was invalid",
+        CompositorErrorKind::Io => "Hyprland compositor transport failed",
+        CompositorErrorKind::Rejected
+        | CompositorErrorKind::Unsupported
+        | CompositorErrorKind::Unconfirmed => "Hyprland compositor command failed",
+        CompositorErrorKind::Lagged => "Hyprland compositor event consumer lagged",
+        CompositorErrorKind::Cancelled => "Hyprland compositor reconciliation stopped",
     }
 }
 
@@ -340,9 +360,12 @@ fn availability_for_compositor_error(kind: CompositorErrorKind) -> CapabilityAva
             CapabilityAvailability::Unavailable
         }
         CompositorErrorKind::Timeout => CapabilityAvailability::Timeout,
-        CompositorErrorKind::Parse | CompositorErrorKind::Bounds => CapabilityAvailability::Parse,
+        CompositorErrorKind::Parse
+        | CompositorErrorKind::Inconsistent
+        | CompositorErrorKind::Bounds => CapabilityAvailability::Parse,
         CompositorErrorKind::Io
         | CompositorErrorKind::Rejected
+        | CompositorErrorKind::Unsupported
         | CompositorErrorKind::Unconfirmed
         | CompositorErrorKind::Lagged
         | CompositorErrorKind::Cancelled => CapabilityAvailability::Error,

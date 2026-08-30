@@ -36,8 +36,10 @@ pub enum CompositorErrorKind {
     Io,
     Timeout,
     Parse,
+    Inconsistent,
     Bounds,
     Rejected,
+    Unsupported,
     Unconfirmed,
     Lagged,
     Cancelled,
@@ -93,6 +95,10 @@ impl From<io::Error> for CompositorError {
 
 pub(crate) fn parse_error(message: impl Into<String>) -> CompositorError {
     CompositorError::new(CompositorErrorKind::Parse, message)
+}
+
+pub(crate) fn inconsistent_error(message: impl Into<String>) -> CompositorError {
+    CompositorError::new(CompositorErrorKind::Inconsistent, message)
 }
 
 pub(crate) fn bounds_error(message: impl Into<String>) -> CompositorError {
