@@ -1,12 +1,16 @@
 use std::{error::Error, fmt, future::Future, io, pin::Pin, sync::Arc, time::Duration};
 
 use super::{EventHub, GenerationAuthority};
+use crate::compositor::{
+    CompositorError, CompositorErrorKind, CompositorExecution, HyprlandAdapter,
+};
 use crate::system::{mutation_command, CommandRunner, ProcessCommandRunner, SystemFacade};
 use sleepy_sdk::{
     validate_mutation_request, CapabilityValue, DaemonCommand, EventCause, EventCauseKind,
-    MutationFailure, MutationResult, MutationStatus, RuntimeCapabilityId, RuntimeSnapshot,
-    SessionEvent, SystemMutation, WIRE_SCHEMA_VERSION,
+    HyprlandCommand, MutationFailure, MutationResult, MutationStatus, RuntimeCapabilityId,
+    RuntimeSnapshot, SessionEvent, SystemMutation, WIRE_SCHEMA_VERSION,
 };
+use tokio_util::sync::CancellationToken;
 
 pub trait MutationBackend: Send + Sync + 'static {
     fn execute<'a>(
@@ -30,16 +34,53 @@ pub struct ProductionMutationBackend {
     facade: SystemFacade<ProcessCommandRunner>,
     hub: EventHub,
     pending: std::sync::Mutex<Option<SystemMutation>>,
+    hyprland: Option<HyprlandAdapter>,
+    hyprland_diagnostic: String,
 }
 
 impl ProductionMutationBackend {
     pub fn new(hub: EventHub) -> Self {
+        let (hyprland, hyprland_diagnostic) =
+            match HyprlandAdapter::discover(CancellationToken::new()) {
+                Ok(adapter) => (Some(adapter), String::new()),
+                Err(error) => (None, error.to_string()),
+            };
         Self {
             runner: ProcessCommandRunner,
             facade: SystemFacade::new(ProcessCommandRunner),
             hub,
             pending: std::sync::Mutex::new(None),
+            hyprland,
+            hyprland_diagnostic,
         }
+    }
+
+    pub fn with_hyprland(hub: EventHub, adapter: HyprlandAdapter) -> Self {
+        Self {
+            runner: ProcessCommandRunner,
+            facade: SystemFacade::new(ProcessCommandRunner),
+            hub,
+            pending: std::sync::Mutex::new(None),
+            hyprland: Some(adapter),
+            hyprland_diagnostic: String::new(),
+        }
+    }
+
+    pub async fn execute_hyprland(
+        &self,
+        command: HyprlandCommand,
+    ) -> Result<CompositorExecution, CompositorError> {
+        let adapter = self.hyprland.as_ref().ok_or_else(|| {
+            CompositorError::new(
+                CompositorErrorKind::Unavailable,
+                if self.hyprland_diagnostic.is_empty() {
+                    "Hyprland compositor is unavailable"
+                } else {
+                    &self.hyprland_diagnostic
+                },
+            )
+        })?;
+        adapter.execute(command).await
     }
 }
 

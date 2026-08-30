@@ -18,7 +18,7 @@ pub use lifecycle::{LifecycleReconciler, ReconciliationReport, ShutdownCoordinat
 pub use mutation::{MutationBackend, MutationPipeline, PipelineError, ProductionMutationBackend};
 pub use private_socket::PrivateSocketBindObserver as SessionSocketBindObserver;
 pub use socket::SessionSocket;
-pub use sources::ProductionSources;
+pub use sources::{HyprlandSource, ProductionSources};
 pub use supervisor::SocketDrainReport;
 
 use sleepy_sdk::{

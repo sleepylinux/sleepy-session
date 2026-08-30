@@ -1,0 +1,36 @@
+[
+  {
+    "id": 2,
+    "name": "2",
+    "monitor": "DP-1",
+    "monitorID": 0,
+    "windows": 0,
+    "hasfullscreen": false,
+    "lastwindow": "0x0",
+    "lastwindowtitle": "",
+    "ispersistent": true,
+    "additiveFutureField": [1, 2, 3]
+  },
+  {
+    "id": 3,
+    "name": "3",
+    "monitor": "HDMI-A-1",
+    "monitorID": 1,
+    "windows": 1,
+    "hasfullscreen": false,
+    "lastwindow": "0xdef",
+    "lastwindowtitle": "Browser",
+    "ispersistent": false
+  },
+  {
+    "id": -99,
+    "name": "special:magic",
+    "monitor": "DP-1",
+    "monitorID": 0,
+    "windows": 1,
+    "hasfullscreen": true,
+    "lastwindow": "0xabc",
+    "lastwindowtitle": "Terminal",
+    "ispersistent": false
+  }
+]
