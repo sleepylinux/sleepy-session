@@ -23,6 +23,8 @@ use sleepy_sdk::{
     WIRE_SCHEMA_VERSION,
 };
 
+use crate::sessiond::supervisor::RequiredStartupTask;
+
 use super::{
     NotificationCommand, NotificationEventService, NotifyRequest, DBUS_NOTIFICATIONS_NAME,
 };
@@ -81,6 +83,20 @@ impl NotificationDbusServer {
             Connection::new_session().map_err(dbus_error)?,
             service,
             runtime,
+            None,
+        )
+    }
+
+    pub fn start_session_gated(
+        service: Arc<tokio::sync::Mutex<NotificationEventService>>,
+        runtime: tokio::runtime::Handle,
+        startup: RequiredStartupTask,
+    ) -> io::Result<Self> {
+        Self::start(
+            Connection::new_session().map_err(dbus_error)?,
+            service,
+            runtime,
+            Some(startup),
         )
     }
 
@@ -93,6 +109,21 @@ impl NotificationDbusServer {
             Connection::new_address(address).map_err(dbus_error)?,
             service,
             runtime,
+            None,
+        )
+    }
+
+    pub fn start_at_gated(
+        address: &str,
+        service: Arc<tokio::sync::Mutex<NotificationEventService>>,
+        runtime: tokio::runtime::Handle,
+        startup: RequiredStartupTask,
+    ) -> io::Result<Self> {
+        Self::start(
+            Connection::new_address(address).map_err(dbus_error)?,
+            service,
+            runtime,
+            Some(startup),
         )
     }
 
@@ -100,6 +131,7 @@ impl NotificationDbusServer {
         connection: Connection,
         service: Arc<tokio::sync::Mutex<NotificationEventService>>,
         runtime: tokio::runtime::Handle,
+        startup: Option<RequiredStartupTask>,
     ) -> io::Result<Self> {
         match connection
             .request_name(DBUS_NOTIFICATIONS_NAME, false, true, true)
@@ -129,6 +161,11 @@ impl NotificationDbusServer {
         let thread = thread::Builder::new()
             .name("sleepy-notifications-dbus".into())
             .spawn(move || {
+                if let Some(startup) = startup {
+                    if startup.ready_and_wait_blocking().is_err() {
+                        return;
+                    }
+                }
                 while !thread_stop.load(Ordering::Acquire) {
                     while let Ok(control) = controls.try_recv() {
                         match control {

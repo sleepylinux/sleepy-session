@@ -25,7 +25,10 @@ use crate::{
     overview::{
         overview_event_channel, ChannelOverviewEvents, NiriOverview, ProcessOverviewRunner,
     },
-    sessiond::private_socket::{peer_uid, NoopBindObserver, PrivateSocketEndpoint},
+    sessiond::{
+        private_socket::{peer_uid, NoopBindObserver, PrivateSocketEndpoint},
+        supervisor::RequiredStartupTask,
+    },
     system::{CommandRunner, CommandSpec, ProcessCommandRunner, RunControl},
     weather::{CurlTransport, MetNoProvider, NominatimProvider, SystemClock},
 };
@@ -438,6 +441,15 @@ impl<B: DailyBackend> DailySocket<B> {
         })
     }
     pub async fn serve(&self) -> io::Result<()> {
+        self.serve_inner(None).await
+    }
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        self.serve_inner(Some(startup)).await
+    }
+    async fn serve_inner(&self, startup: Option<RequiredStartupTask>) -> io::Result<()> {
+        if let Some(startup) = startup {
+            startup.ready_and_wait().await?;
+        }
         let mut shutdown = self.shutdown.subscribe();
         loop {
             let stream = tokio::select! { accepted = self.endpoint.accept() => accepted?, _ = shutdown.recv() => return Ok(()) };

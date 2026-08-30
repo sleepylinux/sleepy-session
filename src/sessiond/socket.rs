@@ -5,7 +5,9 @@ use std::{io, path::Path, sync::Arc, time::Duration};
 use tokio::net::UnixStream;
 
 use super::{
-    supervisor::{ConnectionContext, ConnectionLimits, EndpointKind, SocketSupervisor},
+    supervisor::{
+        ConnectionContext, ConnectionLimits, EndpointKind, RequiredStartupTask, SocketSupervisor,
+    },
     EventHub, SessionSocketBindObserver, SocketDrainReport,
 };
 
@@ -54,7 +56,7 @@ impl SessionSocket {
     pub async fn serve_one(&self) -> io::Result<()> {
         let hub = self.hub.clone();
         self.supervisor
-            .serve_one(move |stream, context| serve_stream(stream, hub, context))
+            .serve_one(move |stream, context| serve_stream(stream, hub.clone(), context))
             .await
     }
 
@@ -62,6 +64,16 @@ impl SessionSocket {
         let hub = self.hub.clone();
         self.supervisor
             .serve(move |stream, context| serve_stream(stream, hub.clone(), context))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        let hub = self.hub.clone();
+        self.supervisor
+            .serve_with_startup(startup, move |stream, context| {
+                serve_stream(stream, hub.clone(), context)
+            })
             .await
             .map(|_| ())
     }

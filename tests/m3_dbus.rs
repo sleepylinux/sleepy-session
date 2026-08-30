@@ -13,8 +13,24 @@ use sleepy_session::{
         NotificationDbusServer, NotificationEventService, NotificationStore,
         DBUS_NOTIFICATIONS_NAME,
     },
+    sessiond::supervisor::{DaemonLifecycle, DaemonNotification, DaemonNotifier, StartupBarrier},
     sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
 };
+
+struct BlockingReadyNotifier {
+    attempted: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl DaemonNotifier for BlockingReadyNotifier {
+    fn notify(&self, state: DaemonNotification) -> std::io::Result<()> {
+        if state == DaemonNotification::Ready {
+            self.attempted.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+        Ok(())
+    }
+}
 
 struct IsolatedBus {
     address: String,
@@ -138,6 +154,86 @@ async fn daemon_provider_owns_real_bus_name_and_serves_standard_plain_text_metho
         .method_call(DBUS_NOTIFICATIONS_NAME, "CloseNotification", (id,))
         .unwrap();
     assert_eq!(service.lock().await.provider().store().archive().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gated_dbus_worker_owns_the_name_but_does_not_process_notify_before_ready_release() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let store = NotificationStore::open_default(temp.path().join("notifications")).unwrap();
+    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let allocator = GenerationAllocator::open(temp.path().join("generation"), 16).unwrap();
+    let authority = GenerationAuthority::new(allocator, 0, hub);
+    let service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        provider, authority,
+    )));
+    let mut startup = StartupBarrier::new();
+    let dbus_startup = startup.required_task("notification-dbus");
+    let server = NotificationDbusServer::start_at_gated(
+        &bus.address,
+        Arc::clone(&service),
+        tokio::runtime::Handle::current(),
+        dbus_startup,
+    )
+    .unwrap();
+    let (ready_attempted_tx, ready_attempted_rx) = std::sync::mpsc::channel();
+    let (release_ready_tx, release_ready_rx) = std::sync::mpsc::channel();
+    let lifecycle = DaemonLifecycle::new(Arc::new(BlockingReadyNotifier {
+        attempted: ready_attempted_tx,
+        release: Mutex::new(release_ready_rx),
+    }));
+    let lifecycle_task = tokio::spawn(async move {
+        lifecycle
+            .complete_startup(&[], &mut startup, || async { Ok(()) })
+            .await
+    });
+    tokio::task::spawn_blocking(move || {
+        ready_attempted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("D-Bus worker did not acknowledge startup")
+    })
+    .await
+    .unwrap();
+
+    let address = bus.address.clone();
+    let (call_started_tx, call_started_rx) = std::sync::mpsc::channel();
+    let notify_task = tokio::task::spawn_blocking(move || {
+        let client = Connection::new_address(&address).unwrap();
+        let proxy = client.with_proxy(
+            DBUS_NOTIFICATIONS_NAME,
+            "/org/freedesktop/Notifications",
+            Duration::from_secs(2),
+        );
+        let hints: HashMap<String, Variant<Box<dyn RefArg>>> = HashMap::new();
+        call_started_tx.send(()).unwrap();
+        proxy.method_call::<(u32,), _, _, _>(
+            DBUS_NOTIFICATIONS_NAME,
+            "Notify",
+            (
+                "Example",
+                0_u32,
+                "",
+                "Gated",
+                "queued until READY",
+                Vec::<String>::new(),
+                hints,
+                5_000_i32,
+            ),
+        )
+    });
+    call_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("D-Bus Notify call did not start");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(service.lock().await.provider().store().active().is_empty());
+    assert!(!notify_task.is_finished());
+
+    release_ready_tx.send(()).unwrap();
+    lifecycle_task.await.unwrap().unwrap();
+    assert_eq!(notify_task.await.unwrap().unwrap().0, 1);
+    assert_eq!(service.lock().await.provider().store().active().len(), 1);
+    drop(server);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -42,7 +42,10 @@ impl MutationBackend for HugeBackend {
             let mut value = snapshot();
             for capability in &mut value.capabilities {
                 capability.diagnostic = Some(CapabilityFailure {
-                    message: "x".repeat(512 * 1024),
+                    // Ten diagnostics keep the serialized response below the
+                    // one-MiB frame ceiling while exceeding the Unix socket's
+                    // bounded kernel buffer when the peer does not read.
+                    message: "x".repeat(92 * 1024),
                 });
             }
             Ok(value)

@@ -2,10 +2,12 @@
 
 use std::{io, path::Path, sync::Arc, time::Duration};
 
-use tokio::net::UnixStream;
+use tokio::{io::BufReader, net::UnixStream};
 
 use super::{
-    supervisor::{ConnectionContext, ConnectionLimits, EndpointKind, SocketSupervisor},
+    supervisor::{
+        ConnectionContext, ConnectionLimits, EndpointKind, RequiredStartupTask, SocketSupervisor,
+    },
     MutationBackend, MutationPipeline,
 };
 
@@ -43,7 +45,7 @@ impl<B: MutationBackend> ControlSocket<B> {
     pub async fn serve_one(&self) -> io::Result<()> {
         let pipeline = Arc::clone(&self.pipeline);
         self.supervisor
-            .serve_one(move |stream, context| serve_stream(stream, pipeline, context))
+            .serve_one(move |stream, context| serve_stream(stream, Arc::clone(&pipeline), context))
             .await
     }
 
@@ -51,6 +53,16 @@ impl<B: MutationBackend> ControlSocket<B> {
         let pipeline = Arc::clone(&self.pipeline);
         self.supervisor
             .serve(move |stream, context| serve_stream(stream, Arc::clone(&pipeline), context))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        let pipeline = Arc::clone(&self.pipeline);
+        self.supervisor
+            .serve_with_startup(startup, move |stream, context| {
+                serve_stream(stream, Arc::clone(&pipeline), context)
+            })
             .await
             .map(|_| ())
     }
@@ -80,7 +92,8 @@ async fn serve_stream<B: MutationBackend>(
     pipeline: Arc<MutationPipeline<B>>,
     context: ConnectionContext,
 ) -> io::Result<()> {
-    let (mut read, mut write) = stream.into_split();
+    let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
     let bytes = context.read_frame(&mut read).await?;
     let input = std::str::from_utf8(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

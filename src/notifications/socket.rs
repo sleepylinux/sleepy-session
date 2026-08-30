@@ -2,6 +2,7 @@
 
 use super::{NotificationActionDispatcher, NotificationCommand, NotificationEventService};
 use crate::sessiond::private_socket::{peer_uid, read_bounded_line, PrivateSocketEndpoint};
+use crate::sessiond::supervisor::RequiredStartupTask;
 use serde::{Deserialize, Serialize};
 use sleepy_sdk::{NotificationDocument, WIRE_SCHEMA_VERSION};
 use std::{
@@ -144,6 +145,12 @@ impl NotificationSocket {
         Ok(())
     }
     pub async fn serve(&self) -> io::Result<()> {
+        self.serve_inner(None).await
+    }
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        self.serve_inner(Some(startup)).await
+    }
+    async fn serve_inner(&self, startup: Option<RequiredStartupTask>) -> io::Result<()> {
         if self.serving.swap(true, Ordering::AcqRel) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -154,6 +161,9 @@ impl NotificationSocket {
             flag: &self.serving,
             stopped: &self.stopped,
         };
+        if let Some(startup) = startup {
+            startup.ready_and_wait().await?;
+        }
         let mut shutdown = self.shutdown.subscribe();
         loop {
             let stream = tokio::select! { stream = self.endpoint.accept() => stream?, _ = shutdown.recv() => return Ok(()) };
