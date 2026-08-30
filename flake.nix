@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     sleepy-sdk = {
-      url = "github:sleepylinux/sleepy-sdk/152173b470fa7d1e90c6d3d6be103a4a4d3529bc";
+      url = "github:sleepylinux/sleepy-sdk/54cbc8a53213ca326bd4fc414e24a729534dd031";
       flake = false;
     };
   };

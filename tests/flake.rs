@@ -7,15 +7,14 @@ fn read_repository_file(path: &str) -> String {
 
 #[test]
 fn dependency_contract_pins_the_reviewed_gpl_sdk_revision() {
+    const SDK_REVISION: &str = "54cbc8a53213ca326bd4fc414e24a729534dd031";
     let flake = read_repository_file("flake.nix");
     let manifest = read_repository_file("Cargo.toml");
     let lockfile = read_repository_file("Cargo.lock");
 
-    assert!(
-        flake.contains("github:sleepylinux/sleepy-sdk/152173b470fa7d1e90c6d3d6be103a4a4d3529bc")
-    );
-    assert!(manifest.contains("rev = \"152173b470fa7d1e90c6d3d6be103a4a4d3529bc\""));
-    assert!(lockfile.contains("#152173b470fa7d1e90c6d3d6be103a4a4d3529bc"));
+    assert!(flake.contains(&format!("github:sleepylinux/sleepy-sdk/{SDK_REVISION}")));
+    assert!(manifest.contains(&format!("rev = \"{SDK_REVISION}\"")));
+    assert!(lockfile.contains(&format!("#{SDK_REVISION}")));
     assert_eq!(flake.matches("github:sleepylinux/sleepy-sdk/").count(), 1);
     assert_eq!(manifest.matches("sleepy-sdk =").count(), 1);
     assert_eq!(lockfile.matches("name = \"sleepy-sdk\"").count(), 1);

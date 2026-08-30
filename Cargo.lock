@@ -153,6 +153,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
+name = "futures-sink"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1944426bf7d03f1d14f708785e4b33efd750b36d48a157b836b3efc15ede8e1d"
+
+[[package]]
 name = "futures-task"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -347,6 +353,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "sd-notify"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b943eadf71d8b69e661330cb0e2656e31040acf21ee7708e2c238a0ec6af2bf4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -425,7 +440,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sleepy-sdk"
 version = "0.1.0"
-source = "git+https://github.com/sleepylinux/sleepy-sdk?rev=152173b470fa7d1e90c6d3d6be103a4a4d3529bc#152173b470fa7d1e90c6d3d6be103a4a4d3529bc"
+source = "git+https://github.com/sleepylinux/sleepy-sdk?rev=54cbc8a53213ca326bd4fc414e24a729534dd031#54cbc8a53213ca326bd4fc414e24a729534dd031"
 dependencies = [
  "semver",
  "serde",
@@ -441,12 +456,14 @@ dependencies = [
  "dbus",
  "fs2",
  "libc",
+ "sd-notify",
  "serde",
  "serde_json",
  "sha2",
  "sleepy-sdk",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -521,6 +538,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2efa149fe76073d6e8fd97ef4f4eca7b67f599660115591483572e406e165594"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]

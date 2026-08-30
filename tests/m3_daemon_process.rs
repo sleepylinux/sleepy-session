@@ -5,7 +5,7 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::Path,
     process::{Child, Command, Stdio},
-    sync::mpsc,
+    sync::{mpsc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -17,8 +17,17 @@ use sleepy_sdk::{
 use sleepy_session::osd::OsdPublication;
 use sleepy_session::theme_socket::{ThemeMessage, ThemeStatus};
 
+static PROCESS_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial_process_test() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
+    let _serial = serial_process_test();
     let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("runtime");
@@ -92,6 +101,7 @@ fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
 
 #[test]
 fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
+    let _serial = serial_process_test();
     let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("runtime");
@@ -188,6 +198,7 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
 
 #[test]
 fn externally_held_theme_lock_does_not_block_daemon_shutdown() {
+    let _serial = serial_process_test();
     let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("runtime");
@@ -243,6 +254,7 @@ fn externally_held_theme_lock_does_not_block_daemon_shutdown() {
 
 #[test]
 fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
+    let _serial = serial_process_test();
     let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("runtime");
@@ -350,6 +362,7 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
 
 #[test]
 fn malformed_provider_state_degrades_locally_without_blocking_daily_startup() {
+    let _serial = serial_process_test();
     use std::io::Write;
     let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();

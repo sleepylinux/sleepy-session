@@ -164,6 +164,10 @@ impl Drop for PrivateSocketEndpoint {
 }
 
 pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
+    peer_credentials(stream).map(|credentials| credentials.uid)
+}
+
+pub(crate) fn peer_credentials(stream: &UnixStream) -> io::Result<libc::ucred> {
     use std::os::fd::AsRawFd;
 
     let mut credentials = libc::ucred {
@@ -190,7 +194,7 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<libc::uid_t> {
             "invalid peer credentials length",
         ));
     }
-    Ok(credentials.uid)
+    Ok(credentials)
 }
 
 pub(crate) async fn read_bounded_line<R: AsyncRead + Unpin>(
