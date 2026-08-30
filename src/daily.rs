@@ -18,6 +18,7 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     calendar::IcsCalendarProvider,
@@ -395,7 +396,7 @@ fn executable_regular_file(path: &Path) -> bool {
 pub struct DailySocket<B> {
     endpoint: PrivateSocketEndpoint,
     backend: Arc<B>,
-    shutdown: tokio::sync::broadcast::Sender<()>,
+    shutdown: CancellationToken,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
     workers: Arc<tokio::sync::Semaphore>,
     admission: Arc<tokio::sync::Semaphore>,
@@ -428,11 +429,10 @@ impl<B: DailyBackend> DailySocket<B> {
             Arc::new(NoopBindObserver),
         )
         .await?;
-        let (shutdown, _) = tokio::sync::broadcast::channel(1);
         Ok(Self {
             endpoint,
             backend,
-            shutdown,
+            shutdown: CancellationToken::new(),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(max_workers)),
             admission: Arc::new(tokio::sync::Semaphore::new(max_workers)),
@@ -447,12 +447,12 @@ impl<B: DailyBackend> DailySocket<B> {
         self.serve_inner(Some(startup)).await
     }
     async fn serve_inner(&self, startup: Option<RequiredStartupTask>) -> io::Result<()> {
+        let shutdown = self.shutdown.child_token();
         if let Some(startup) = startup {
             startup.ready_and_wait().await?;
         }
-        let mut shutdown = self.shutdown.subscribe();
         loop {
-            let stream = tokio::select! { accepted = self.endpoint.accept() => accepted?, _ = shutdown.recv() => return Ok(()) };
+            let stream = tokio::select! { accepted = self.endpoint.accept() => accepted?, _ = shutdown.cancelled() => return Ok(()) };
             if self.stopping.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -468,7 +468,7 @@ impl<B: DailyBackend> DailySocket<B> {
             };
             let backend = Arc::clone(&self.backend);
             let workers = Arc::clone(&self.workers);
-            let client_shutdown = self.shutdown.subscribe();
+            let client_shutdown = self.shutdown.child_token();
             let request_timeout = self.request_timeout;
             let stopping = Arc::clone(&self.stopping);
             let mut tasks = self.tasks.lock().await;
@@ -500,7 +500,7 @@ impl<B: DailyBackend> DailySocket<B> {
     }
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
-        let _ = self.shutdown.send(());
+        self.shutdown.cancel();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut deadline_missed = false;
         let mut first_error = None;
@@ -543,7 +543,7 @@ async fn serve_client<B: DailyBackend>(
     stream: UnixStream,
     backend: Arc<B>,
     workers: Arc<tokio::sync::Semaphore>,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    shutdown: CancellationToken,
     request_timeout: Duration,
     stopping: Arc<AtomicBool>,
     _connection_permit: tokio::sync::OwnedSemaphorePermit,
@@ -556,7 +556,7 @@ async fn serve_client<B: DailyBackend>(
         }
         let line = tokio::select! {
             biased;
-            _ = shutdown.recv() => return Ok(()),
+            _ = shutdown.cancelled() => return Ok(()),
             line = read_bounded_line(&mut reader) => line?,
         };
         let Some(line) = line else {
@@ -570,7 +570,7 @@ async fn serve_client<B: DailyBackend>(
             {
                 let permit = tokio::select! {
                     biased;
-                    _ = shutdown.recv() => return Ok(()),
+                    _ = shutdown.cancelled() => return Ok(()),
                     permit = Arc::clone(&workers).acquire_owned() => permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "daily worker pool closed"))?,
                 };
                 let cancelled = Arc::new(AtomicBool::new(false));
@@ -583,7 +583,7 @@ async fn serve_client<B: DailyBackend>(
                 });
                 let handled = tokio::select! {
                     biased;
-                    _ = shutdown.recv() => {
+                    _ = shutdown.cancelled() => {
                         cancelled.store(true, Ordering::SeqCst);
                         let _ = worker.await.map_err(|error| io::Error::other(format!("daily worker failed: {error}")))?;
                         return Ok(());
@@ -623,7 +623,7 @@ async fn serve_client<B: DailyBackend>(
         }
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return Ok(()),
+            _ = shutdown.cancelled() => return Ok(()),
             written = tokio::time::timeout(remaining, write.write_all(&bytes)) => {
                 written
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daily response write exceeded request deadline"))??;

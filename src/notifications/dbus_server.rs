@@ -23,7 +23,7 @@ use sleepy_sdk::{
     WIRE_SCHEMA_VERSION,
 };
 
-use crate::sessiond::supervisor::RequiredStartupTask;
+use crate::sessiond::supervisor::{RequiredStartupTask, StartupTaskCancellation};
 
 use super::{
     NotificationCommand, NotificationEventService, NotifyRequest, DBUS_NOTIFICATIONS_NAME,
@@ -41,6 +41,7 @@ pub struct NotificationDbusServer {
     thread: Option<thread::JoinHandle<()>>,
     service: Arc<tokio::sync::Mutex<NotificationEventService>>,
     failure: tokio::sync::watch::Receiver<Option<String>>,
+    startup: Option<StartupTaskCancellation>,
 }
 
 #[derive(Clone)]
@@ -133,6 +134,7 @@ impl NotificationDbusServer {
         runtime: tokio::runtime::Handle,
         startup: Option<RequiredStartupTask>,
     ) -> io::Result<Self> {
+        let startup_cancellation = startup.as_ref().map(RequiredStartupTask::cancellation);
         match connection
             .request_name(DBUS_NOTIFICATIONS_NAME, false, true, true)
             .map_err(dbus_error)?
@@ -216,6 +218,7 @@ impl NotificationDbusServer {
             thread: Some(thread),
             service,
             failure,
+            startup: startup_cancellation,
         })
     }
 
@@ -248,6 +251,12 @@ impl NotificationDbusServer {
 impl Drop for NotificationDbusServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        if let Some(startup) = self.startup.take() {
+            startup.fail(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "notification D-Bus server stopped during startup",
+            ));
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }

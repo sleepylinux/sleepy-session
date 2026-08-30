@@ -3,7 +3,11 @@
 use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
 use sleepy_session::{
-    sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
+    sessiond::{
+        full_snapshot_event,
+        supervisor::{DaemonLifecycle, DaemonNotification, DaemonNotifier, StartupBarrier},
+        EventHub, GenerationAllocator, GenerationAuthority,
+    },
     theme::ThemeManager,
     theme_socket::{ThemeMessage, ThemeSocket, ThemeStatus},
 };
@@ -52,6 +56,48 @@ async fn start(
     let serving = Arc::clone(&socket);
     let task = tokio::spawn(async move { serving.serve().await });
     (socket, task)
+}
+
+#[tokio::test]
+async fn theme_socket_cannot_lose_shutdown_immediately_after_startup_release() {
+    struct Notifier;
+    impl DaemonNotifier for Notifier {
+        fn notify(&self, _state: DaemonNotification) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("runtime/sleepy/theme.sock");
+    let manager =
+        ThemeManager::open(temp.path().join("config"), temp.path().join("state")).unwrap();
+    let socket = Arc::new(
+        ThemeSocket::bind(&path, unsafe { libc::geteuid() }, manager, authority(&temp))
+            .await
+            .unwrap(),
+    );
+    let mut startup = StartupBarrier::new();
+    let worker = startup.required_task("theme");
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve_with_startup(worker).await });
+    let lifecycle = DaemonLifecycle::new(Arc::new(Notifier));
+
+    lifecycle
+        .complete_startup(&[socket.path()], &mut startup, || async {
+            socket
+                .shutdown_and_drain(Duration::from_millis(100))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("theme accept worker must observe immediate shutdown")
+        .unwrap()
+        .unwrap();
+    drop(socket);
+    assert!(!path.exists());
 }
 
 #[tokio::test]

@@ -237,6 +237,63 @@ async fn gated_dbus_worker_owns_the_name_but_does_not_process_notify_before_read
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_gated_dbus_server_cancels_its_startup_wait_and_releases_the_name() {
+    let bus = IsolatedBus::start();
+    let temp = tempfile::tempdir().unwrap();
+    let store = NotificationStore::open_default(temp.path().join("notifications")).unwrap();
+    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let hub = EventHub::new(full_snapshot_event(0).unwrap(), 16);
+    let allocator = GenerationAllocator::open(temp.path().join("generation"), 16).unwrap();
+    let authority = GenerationAuthority::new(allocator, 0, hub);
+    let service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        provider, authority,
+    )));
+    let mut startup = StartupBarrier::new();
+    let dbus_startup = startup.required_task("notification-dbus");
+    let server = NotificationDbusServer::start_at_gated(
+        &bus.address,
+        Arc::clone(&service),
+        tokio::runtime::Handle::current(),
+        dbus_startup,
+    )
+    .unwrap();
+
+    let mut drop_task = tokio::task::spawn_blocking(move || drop(server));
+    let dropped = tokio::time::timeout(Duration::from_millis(250), &mut drop_task).await;
+    let dropped_before_barrier = dropped.is_ok();
+    drop(startup);
+    match dropped {
+        Ok(joined) => joined.unwrap(),
+        Err(_) => drop_task.await.unwrap(),
+    }
+
+    assert!(
+        dropped_before_barrier,
+        "D-Bus Drop must wake and join its worker without the barrier owner"
+    );
+    assert!(service.lock().await.provider().store().active().is_empty());
+    let client = Connection::new_address(&bus.address).unwrap();
+    let dbus = client.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        Duration::from_secs(2),
+    );
+    let (names,): (Vec<String>,) = dbus
+        .method_call("org.freedesktop.DBus", "ListNames", ())
+        .unwrap();
+    assert!(!names.iter().any(|name| name == DBUS_NOTIFICATIONS_NAME));
+    drop(dbus);
+    drop(client);
+    let replacement = NotificationDbusServer::start_at(
+        &bus.address,
+        Arc::clone(&service),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    drop(replacement);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standard_signals_are_emitted_and_sender_disconnect_expires_archived_actions() {
     let bus = IsolatedBus::start();
     let temp = tempfile::tempdir().unwrap();

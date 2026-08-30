@@ -812,8 +812,13 @@ const STARTUP_CANCELLED: u8 = 2;
 struct StartupRelease {
     state: AtomicU8,
     async_changed: tokio::sync::Notify,
-    blocking_mutex: Mutex<()>,
+    blocking_mutex: Mutex<StartupControl>,
     blocking_changed: Condvar,
+}
+
+#[derive(Default)]
+struct StartupControl {
+    failure: Option<StoredError>,
 }
 
 impl StartupRelease {
@@ -821,13 +826,17 @@ impl StartupRelease {
         Self {
             state: AtomicU8::new(STARTUP_PENDING),
             async_changed: tokio::sync::Notify::new(),
-            blocking_mutex: Mutex::new(()),
+            blocking_mutex: Mutex::new(StartupControl::default()),
             blocking_changed: Condvar::new(),
         }
     }
 
     fn transition(&self, state: u8) {
         let _guard = self.blocking_mutex.lock().unwrap();
+        self.transition_locked(state);
+    }
+
+    fn transition_locked(&self, state: u8) {
         if self
             .state
             .compare_exchange(STARTUP_PENDING, state, Ordering::AcqRel, Ordering::Acquire)
@@ -836,6 +845,36 @@ impl StartupRelease {
             self.async_changed.notify_waiters();
             self.blocking_changed.notify_all();
         }
+    }
+
+    fn fail(&self, error: StoredError) -> bool {
+        let mut control = self.blocking_mutex.lock().unwrap();
+        if self.state.load(Ordering::Acquire) != STARTUP_PENDING {
+            return false;
+        }
+        control.failure.get_or_insert(error);
+        self.transition_locked(STARTUP_CANCELLED);
+        true
+    }
+
+    fn notify_and_release(&self, notify: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let control = self.blocking_mutex.lock().unwrap();
+        match self.state.load(Ordering::Acquire) {
+            STARTUP_CANCELLED => {
+                return Err(control
+                    .failure
+                    .clone()
+                    .map_or_else(startup_cancelled, StoredError::into_io_error));
+            }
+            STARTUP_RELEASED => return Ok(()),
+            _ => {}
+        }
+        if let Err(error) = notify() {
+            self.transition_locked(STARTUP_CANCELLED);
+            return Err(error);
+        }
+        self.transition_locked(STARTUP_RELEASED);
+        Ok(())
     }
 
     async fn wait_async(&self) -> io::Result<()> {
@@ -870,49 +909,78 @@ enum StartupAcknowledgement {
     Failed(StoredError),
 }
 
-pub struct RequiredStartupTask {
+#[derive(Clone)]
+pub(crate) struct StartupTaskCancellation {
     name: &'static str,
     acknowledgements: mpsc::UnboundedSender<StartupAcknowledgement>,
     release: Arc<StartupRelease>,
-    reported: bool,
+}
+
+impl StartupTaskCancellation {
+    pub(crate) fn fail(&self, error: io::Error) {
+        let error = StoredError::from_io_error(&error);
+        if self.release.fail(error.clone()) {
+            let _ = self
+                .acknowledgements
+                .send(StartupAcknowledgement::Failed(error));
+        }
+    }
+
+    fn disappeared(&self) {
+        self.fail(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!(
+                "required startup task {} stopped before release handoff",
+                self.name
+            ),
+        ));
+    }
+}
+
+pub struct RequiredStartupTask {
+    cancellation: StartupTaskCancellation,
+    handed_off: bool,
 }
 
 impl RequiredStartupTask {
-    fn report(&mut self, acknowledgement: StartupAcknowledgement) {
-        let _ = self.acknowledgements.send(acknowledgement);
-        self.reported = true;
+    fn acknowledge_ready(&self) {
+        let _ = self
+            .cancellation
+            .acknowledgements
+            .send(StartupAcknowledgement::Ready);
     }
 
-    pub fn fail(mut self, error: io::Error) {
-        self.report(StartupAcknowledgement::Failed(StoredError::from_io_error(
-            &error,
-        )));
+    pub(crate) fn cancellation(&self) -> StartupTaskCancellation {
+        self.cancellation.clone()
+    }
+
+    pub fn fail(self, error: io::Error) {
+        self.cancellation.fail(error);
     }
 
     pub async fn ready_and_wait(mut self) -> io::Result<()> {
-        self.report(StartupAcknowledgement::Ready);
-        self.release.wait_async().await
+        self.acknowledge_ready();
+        let result = self.cancellation.release.wait_async().await;
+        if result.is_ok() {
+            self.handed_off = true;
+        }
+        result
     }
 
     pub fn ready_and_wait_blocking(mut self) -> io::Result<()> {
-        self.report(StartupAcknowledgement::Ready);
-        self.release.wait_blocking()
+        self.acknowledge_ready();
+        let result = self.cancellation.release.wait_blocking();
+        if result.is_ok() {
+            self.handed_off = true;
+        }
+        result
     }
 }
 
 impl Drop for RequiredStartupTask {
     fn drop(&mut self) {
-        if !self.reported {
-            let error = io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                format!(
-                    "required startup task {} stopped before acknowledgement",
-                    self.name
-                ),
-            );
-            self.report(StartupAcknowledgement::Failed(StoredError::from_io_error(
-                &error,
-            )));
+        if !self.handed_off {
+            self.cancellation.disappeared();
         }
     }
 }
@@ -947,10 +1015,12 @@ impl StartupBarrier {
         assert!(!self.waiting, "required startup tasks are already frozen");
         self.required += 1;
         RequiredStartupTask {
-            name,
-            acknowledgements: self.sender.clone(),
-            release: Arc::clone(&self.release),
-            reported: false,
+            cancellation: StartupTaskCancellation {
+                name,
+                acknowledgements: self.sender.clone(),
+                release: Arc::clone(&self.release),
+            },
+            handed_off: false,
         }
     }
 
@@ -975,8 +1045,8 @@ impl StartupBarrier {
         Ok(())
     }
 
-    fn release(&self) {
-        self.release.transition(STARTUP_RELEASED);
+    fn notify_and_release(&self, notify: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        self.release.notify_and_release(notify)
     }
 
     fn cancel(&self) {
@@ -1048,11 +1118,7 @@ impl DaemonLifecycle {
             startup.cancel();
             return Err(error);
         }
-        if let Err(error) = self.notifier.notify(DaemonNotification::Ready) {
-            startup.cancel();
-            return Err(error);
-        }
-        startup.release();
+        startup.notify_and_release(|| self.notifier.notify(DaemonNotification::Ready))?;
         start_producers().await
     }
 

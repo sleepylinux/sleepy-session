@@ -1165,6 +1165,42 @@ async fn required_worker_start_failure_prevents_ready_and_producer_start() {
 }
 
 #[tokio::test]
+async fn ready_worker_disappearing_before_release_prevents_ready_and_producer_start() {
+    let _serial = serial_test().await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = DaemonLifecycle::new(Arc::new(EventNotifier {
+        events: Arc::clone(&events),
+        fail_ready: false,
+        fail_stopping: false,
+    }));
+    let producer_started = Arc::new(AtomicBool::new(false));
+    let mut startup = StartupBarrier::new();
+    let worker = startup.required_task("notification-dbus");
+    let (entered_sender, entered) = oneshot::channel();
+    let worker_task = tokio::spawn(async move {
+        entered_sender.send(()).unwrap();
+        worker.ready_and_wait().await
+    });
+    entered.await.unwrap();
+    tokio::task::yield_now().await;
+    worker_task.abort();
+    assert!(worker_task.await.unwrap_err().is_cancelled());
+
+    let producer_flag = Arc::clone(&producer_started);
+    let error = lifecycle
+        .complete_startup(&[], &mut startup, move || async move {
+            producer_flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(events.lock().unwrap().is_empty());
+    assert!(!producer_started.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn real_required_serve_start_failure_prevents_ready_and_producer_start() {
     let _serial = serial_test().await;
     let temp = tempfile::tempdir().unwrap();
