@@ -21,11 +21,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    bounds_error,
-    protocol::{parse_full_snapshot_with_metadata, ParsedHyprlandSnapshot},
-    CompositorError, CompositorErrorKind,
-};
+use super::{bounds_error, protocol::parse_full_snapshot, CompositorError, CompositorErrorKind};
 
 pub const MAX_INSTANCE_SIGNATURE_BYTES: usize = 128;
 pub const MAX_COMMAND_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -33,8 +29,6 @@ pub const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 
 const MAX_EVENT_FIELD_BYTES: usize = 4 * 1024;
 const MAX_EVENT_GROUP_MEMBERS: usize = 16_384;
-const MAX_BATCH_SUBRESPONSE_BYTES: usize = 4 * 1024;
-
 const MONITORS_REQUEST: &[u8] = b"j/monitors";
 const WORKSPACES_REQUEST: &[u8] = b"j/workspaces";
 const CLIENTS_REQUEST: &[u8] = b"j/clients";
@@ -110,13 +104,22 @@ impl HyprlandAdapter {
         &self,
         command: HyprlandCommand,
     ) -> Result<CompositorExecution, CompositorError> {
+        if matches!(
+            command,
+            HyprlandCommand::ToggleFullscreen { .. } | HyprlandCommand::ToggleGroup { .. }
+        ) {
+            return Err(unsupported_focused_action());
+        }
         let deadline = Instant::now() + self.timing.operation_timeout;
         if command == HyprlandCommand::Exit {
             self.dispatch_at(b"dispatch exit", deadline).await?;
             return self.confirm_exit(deadline).await;
         }
 
-        let pre = self.snapshot_with_metadata_at(deadline).await?;
+        let pre = self.snapshot_at(deadline).await?;
+        if focus_command_already_satisfied(&command, &pre) {
+            return Ok(CompositorExecution::Snapshot(pre));
+        }
         let plan = ActionPlan::from_command(command, &pre)?;
         for request in &plan.requests {
             self.dispatch_at(request, deadline).await?;
@@ -129,9 +132,9 @@ impl HyprlandAdapter {
                     "Hyprland readback did not confirm the requested postcondition",
                 ));
             }
-            let post = self.snapshot_with_metadata_at(deadline).await?;
+            let post = self.snapshot_at(deadline).await?;
             if plan.expected.confirms(&post) {
-                return Ok(CompositorExecution::Snapshot(post.snapshot));
+                return Ok(CompositorExecution::Snapshot(post));
             }
             tokio::select! {
                 biased;
@@ -148,9 +151,6 @@ impl HyprlandAdapter {
 
     async fn dispatch_at(&self, request: &[u8], deadline: Instant) -> Result<(), CompositorError> {
         let response = self.request_at(request, deadline).await?;
-        if request.starts_with(b"[[BATCH]]") {
-            return validate_batch_response(request, &response);
-        }
         if response != b"ok" {
             return Err(CompositorError::new(
                 CompositorErrorKind::Rejected,
@@ -331,18 +331,11 @@ impl HyprlandAdapter {
         &self,
         deadline: Instant,
     ) -> Result<HyprlandSnapshot, CompositorError> {
-        Ok(self.snapshot_with_metadata_at(deadline).await?.snapshot)
-    }
-
-    async fn snapshot_with_metadata_at(
-        &self,
-        deadline: Instant,
-    ) -> Result<ParsedHyprlandSnapshot, CompositorError> {
         loop {
             let monitors = self.request_at(MONITORS_REQUEST, deadline).await?;
             let workspaces = self.request_at(WORKSPACES_REQUEST, deadline).await?;
             let clients = self.request_at(CLIENTS_REQUEST, deadline).await?;
-            match parse_full_snapshot_with_metadata(&monitors, &workspaces, &clients) {
+            match parse_full_snapshot(&monitors, &workspaces, &clients) {
                 Ok(snapshot) => return Ok(snapshot),
                 Err(error) if error.kind() == CompositorErrorKind::Inconsistent => {
                     if Instant::now() >= deadline {
@@ -403,6 +396,20 @@ impl HyprlandAdapter {
     }
 }
 
+fn focus_command_already_satisfied(command: &HyprlandCommand, snapshot: &HyprlandSnapshot) -> bool {
+    match command {
+        HyprlandCommand::FocusWindow { window_id } => snapshot
+            .windows
+            .iter()
+            .any(|window| window.id == window_id.as_str() && window.focused),
+        HyprlandCommand::FocusWorkspace { workspace_id } => snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id.as_str() && workspace.focused),
+        _ => false,
+    }
+}
+
 impl super::CompositorAdapter for HyprlandAdapter {
     fn snapshot(
         &self,
@@ -455,10 +462,6 @@ enum ExpectedPostcondition {
         workspace_id: String,
         monitor_id: String,
     },
-    WindowFullscreen {
-        window_id: String,
-        expected_mode: u8,
-    },
     WindowFloating {
         window_id: String,
         expected: bool,
@@ -467,18 +470,13 @@ enum ExpectedPostcondition {
         window_id: String,
         expected: bool,
     },
-    WindowGrouped {
-        window_id: String,
-        expected: bool,
-    },
 }
 
 impl ActionPlan {
     fn from_command(
         command: HyprlandCommand,
-        parsed: &ParsedHyprlandSnapshot,
+        snapshot: &HyprlandSnapshot,
     ) -> Result<Self, CompositorError> {
-        let snapshot = &parsed.snapshot;
         let (requests, expected) = match command {
             HyprlandCommand::FocusWindow { window_id } => {
                 let window = find_window(snapshot, window_id.as_str())?;
@@ -549,35 +547,7 @@ impl ActionPlan {
                     },
                 )
             }
-            HyprlandCommand::ToggleFullscreen { window_id } => {
-                let window = find_window(snapshot, window_id.as_str())?;
-                let mode = parsed
-                    .fullscreen_modes
-                    .get(&window.id)
-                    .copied()
-                    .ok_or_else(|| rejected_target("window fullscreen state"))?;
-                let (operation, expected_mode) = match mode {
-                    0 => ("fullscreen 0 set", 2),
-                    1 => ("fullscreen 1 unset", 0),
-                    2 => ("fullscreen 0 unset", 0),
-                    _ => {
-                        return Err(CompositorError::new(
-                            CompositorErrorKind::Rejected,
-                            "Hyprland window had an unsupported fullscreen mode",
-                        ))
-                    }
-                };
-                (
-                    vec![batch_dispatches(
-                        format!("focuswindow address:{}", window.id),
-                        operation.into(),
-                    )?],
-                    ExpectedPostcondition::WindowFullscreen {
-                        window_id: window.id.clone(),
-                        expected_mode,
-                    },
-                )
-            }
+            HyprlandCommand::ToggleFullscreen { .. } => return Err(unsupported_focused_action()),
             HyprlandCommand::ToggleFloating { window_id } => {
                 let window = find_window(snapshot, window_id.as_str())?;
                 (
@@ -598,19 +568,7 @@ impl ActionPlan {
                     },
                 )
             }
-            HyprlandCommand::ToggleGroup { window_id } => {
-                let window = find_window(snapshot, window_id.as_str())?;
-                (
-                    vec![batch_dispatches(
-                        format!("focuswindow address:{}", window.id),
-                        "togglegroup".into(),
-                    )?],
-                    ExpectedPostcondition::WindowGrouped {
-                        window_id: window.id.clone(),
-                        expected: !window.grouped,
-                    },
-                )
-            }
+            HyprlandCommand::ToggleGroup { .. } => return Err(unsupported_focused_action()),
             HyprlandCommand::Exit => unreachable!("exit is handled without snapshot readback"),
         };
         Ok(Self { requests, expected })
@@ -618,8 +576,7 @@ impl ActionPlan {
 }
 
 impl ExpectedPostcondition {
-    fn confirms(&self, parsed: &ParsedHyprlandSnapshot) -> bool {
-        let snapshot = &parsed.snapshot;
+    fn confirms(&self, snapshot: &HyprlandSnapshot) -> bool {
         match self {
             Self::WindowFocused { window_id } => snapshot
                 .windows
@@ -646,10 +603,6 @@ impl ExpectedPostcondition {
             } => snapshot.workspaces.iter().any(|workspace| {
                 workspace.id == *workspace_id && workspace.monitor_id == *monitor_id
             }),
-            Self::WindowFullscreen {
-                window_id,
-                expected_mode,
-            } => parsed.fullscreen_modes.get(window_id) == Some(expected_mode),
             Self::WindowFloating {
                 window_id,
                 expected,
@@ -664,15 +617,15 @@ impl ExpectedPostcondition {
                 .windows
                 .iter()
                 .any(|window| window.id == *window_id && window.pinned == *expected),
-            Self::WindowGrouped {
-                window_id,
-                expected,
-            } => snapshot
-                .windows
-                .iter()
-                .any(|window| window.id == *window_id && window.grouped == *expected),
         }
     }
+}
+
+fn unsupported_focused_action() -> CompositorError {
+    CompositorError::new(
+        CompositorErrorKind::Unsupported,
+        "Hyprland legacy IPC has no target-aware fullscreen or group dispatcher",
+    )
 }
 
 fn find_window<'a>(
@@ -750,58 +703,6 @@ fn dispatch(argument: String) -> Result<Vec<u8>, CompositorError> {
         ));
     }
     Ok(format!("dispatch {argument}").into_bytes())
-}
-
-fn batch_dispatches(first: String, second: String) -> Result<Vec<u8>, CompositorError> {
-    let first = dispatch(first)?;
-    let second = dispatch(second)?;
-    if first.contains(&b';') || second.contains(&b';') {
-        return Err(CompositorError::new(
-            CompositorErrorKind::Rejected,
-            "Hyprland batch dispatcher contained an unsafe separator",
-        ));
-    }
-    let mut request = Vec::with_capacity(9 + first.len() + 1 + second.len());
-    request.extend_from_slice(b"[[BATCH]]");
-    request.extend_from_slice(&first);
-    request.push(b';');
-    request.extend_from_slice(&second);
-    Ok(request)
-}
-
-fn validate_batch_response(request: &[u8], response: &[u8]) -> Result<(), CompositorError> {
-    let expected = request[9..].split(|byte| *byte == b';').count();
-    let mut replies = Vec::new();
-    let mut start = 0;
-    while let Some(offset) = response[start..]
-        .windows(3)
-        .position(|window| window == b"\n\n\n")
-    {
-        let end = start + offset;
-        replies.push(&response[start..end]);
-        start = end + 3;
-    }
-    replies.push(&response[start..]);
-    if replies.len() != expected {
-        return Err(CompositorError::new(
-            CompositorErrorKind::Rejected,
-            "Hyprland batch reply count did not match the fixed request",
-        ));
-    }
-    for reply in replies {
-        if reply.len() > MAX_BATCH_SUBRESPONSE_BYTES {
-            return Err(bounds_error(format!(
-                "Hyprland batch subresponse exceeded {MAX_BATCH_SUBRESPONSE_BYTES} bytes"
-            )));
-        }
-        if reply != b"ok" {
-            return Err(CompositorError::new(
-                CompositorErrorKind::Rejected,
-                "Hyprland rejected a fixed compositor batch subcommand",
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

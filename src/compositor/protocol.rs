@@ -63,19 +63,6 @@ pub fn parse_full_snapshot(
     workspaces_json: &[u8],
     clients_json: &[u8],
 ) -> Result<HyprlandSnapshot, CompositorError> {
-    Ok(parse_full_snapshot_with_metadata(monitors_json, workspaces_json, clients_json)?.snapshot)
-}
-
-pub(crate) struct ParsedHyprlandSnapshot {
-    pub(crate) snapshot: HyprlandSnapshot,
-    pub(crate) fullscreen_modes: HashMap<String, u8>,
-}
-
-pub(crate) fn parse_full_snapshot_with_metadata(
-    monitors_json: &[u8],
-    workspaces_json: &[u8],
-    clients_json: &[u8],
-) -> Result<ParsedHyprlandSnapshot, CompositorError> {
     let upstream_monitors: Vec<UpstreamMonitor> = parse_json(monitors_json, "monitor")?;
     let upstream_workspaces: Vec<UpstreamWorkspace> = parse_json(workspaces_json, "workspace")?;
     let upstream_clients: Vec<UpstreamClient> = parse_json(clients_json, "client")?;
@@ -267,7 +254,6 @@ pub(crate) fn parse_full_snapshot_with_metadata(
     }
 
     let mut windows = Vec::with_capacity(upstream_clients.len());
-    let mut fullscreen_modes = HashMap::with_capacity(upstream_clients.len());
     let mut focused_window_seen = false;
     for client in upstream_clients {
         validate_workspace_ref(&client.workspace, true)?;
@@ -297,7 +283,6 @@ pub(crate) fn parse_full_snapshot_with_metadata(
         if client.fullscreen < 0 || client.fullscreen > 2 {
             return Err(parse_error("Hyprland fullscreen mode is outside 0..=2"));
         }
-        fullscreen_modes.insert(client.address.clone(), client.fullscreen as u8);
         let focused = client.focus_history_id == 0;
         if focused && std::mem::replace(&mut focused_window_seen, true) {
             return Err(parse_error("Hyprland reported multiple focused windows"));
@@ -311,7 +296,13 @@ pub(crate) fn parse_full_snapshot_with_metadata(
             let (_, workspace_monitor) = workspace_locations
                 .get(&client.workspace.id)
                 .expect("workspace foreign key was validated");
-            if client.workspace.id != *workspace_id || workspace_monitor != monitor_name {
+            let focused_monitor_number = monitor_numbers
+                .get(monitor_name)
+                .expect("focused monitor was validated");
+            let pinned_on_focused_monitor = client.pinned
+                && workspace_monitor == monitor_name
+                && client.monitor == *focused_monitor_number;
+            if client.workspace.id != *workspace_id && !pinned_on_focused_monitor {
                 return Err(inconsistent_error(
                     "Hyprland focused window and focused workspace disagree",
                 ));
@@ -330,13 +321,10 @@ pub(crate) fn parse_full_snapshot_with_metadata(
         });
     }
 
-    Ok(ParsedHyprlandSnapshot {
-        snapshot: HyprlandSnapshot {
-            monitors,
-            workspaces,
-            windows,
-        },
-        fullscreen_modes,
+    Ok(HyprlandSnapshot {
+        monitors,
+        workspaces,
+        windows,
     })
 }
 

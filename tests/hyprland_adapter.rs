@@ -84,38 +84,62 @@ async fn serve_event_connections(listener: UnixListener, connections: Vec<Vec<Ve
     }
 }
 
-async fn execute_case(
+async fn execute_stateful_case(
+    pre: WireSnapshot,
     command: HyprlandCommand,
-    dispatches: Vec<&'static [u8]>,
-    post_monitors: Vec<u8>,
-    post_workspaces: Vec<u8>,
-    post_clients: Vec<u8>,
+    dispatch: &'static [u8],
+    post: WireSnapshot,
 ) -> CompositorExecution {
     let (_directory, paths, listener) = command_fixture().await;
-    let mut script = vec![
-        (b"j/monitors" as &'static [u8], MONITORS.as_bytes().to_vec()),
-        (b"j/workspaces", WORKSPACES.as_bytes().to_vec()),
-        (b"j/clients", CLIENTS.as_bytes().to_vec()),
-    ];
-    script.extend(dispatches.into_iter().map(|request| {
-        let response = if request.starts_with(b"[[BATCH]]") {
-            b"ok\n\n\nok".to_vec()
-        } else {
-            b"ok".to_vec()
-        };
-        (request, response)
-    }));
-    script.extend([
-        (b"j/monitors" as &'static [u8], post_monitors.clone()),
-        (b"j/workspaces" as &'static [u8], post_workspaces.clone()),
-        (b"j/clients" as &'static [u8], post_clients.clone()),
-    ]);
-    let server = tokio::spawn(serve_script(listener, script));
+    let expected = parse_full_snapshot(&post.monitors, &post.workspaces, &post.clients).unwrap();
+    let server = tokio::spawn(async move {
+        let mut current = pre;
+        let mut next = Some(post);
+        let mut requests = Vec::new();
+        let mut post_queries = 0;
+        while post_queries < 3 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            let response = match request.as_slice() {
+                b"j/monitors" => current.monitors.clone(),
+                b"j/workspaces" => current.workspaces.clone(),
+                b"j/clients" => current.clients.clone(),
+                request if request == dispatch => {
+                    current = next.take().expect("dispatcher must run exactly once");
+                    b"ok".to_vec()
+                }
+                other => panic!("unexpected stateful compositor request {other:?}"),
+            };
+            if next.is_none()
+                && matches!(
+                    request.as_slice(),
+                    b"j/monitors" | b"j/workspaces" | b"j/clients"
+                )
+            {
+                post_queries += 1;
+            }
+            requests.push(request);
+            stream.write_all(&response).await.unwrap();
+        }
+        requests
+    });
     let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), test_timing());
 
     let result = adapter.execute(command).await.unwrap();
-    server.await.unwrap();
-    let expected = parse_full_snapshot(&post_monitors, &post_workspaces, &post_clients).unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests,
+        [
+            b"j/monitors".as_slice(),
+            b"j/workspaces".as_slice(),
+            b"j/clients".as_slice(),
+            dispatch,
+            b"j/monitors".as_slice(),
+            b"j/workspaces".as_slice(),
+            b"j/clients".as_slice(),
+        ]
+    );
     assert_eq!(result, CompositorExecution::Snapshot(expected));
     result
 }
@@ -132,6 +156,14 @@ fn wire_snapshot(monitors: Vec<u8>, workspaces: Vec<u8>, clients: Vec<u8>) -> Wi
         workspaces,
         clients,
     }
+}
+
+fn fixture_wire_snapshot() -> WireSnapshot {
+    wire_snapshot(
+        MONITORS.as_bytes().to_vec(),
+        WORKSPACES.as_bytes().to_vec(),
+        CLIENTS.as_bytes().to_vec(),
+    )
 }
 
 async fn execute_custom_case(
@@ -190,7 +222,6 @@ async fn assert_stale_readback_is_unconfirmed(
                 b"j/monitors" => MONITORS.as_bytes(),
                 b"j/workspaces" => WORKSPACES.as_bytes(),
                 b"j/clients" => CLIENTS.as_bytes(),
-                request if request.starts_with(b"[[BATCH]]") => b"ok\n\n\nok",
                 _ => b"ok",
             };
             stream.write_all(response).await.unwrap();
@@ -415,6 +446,68 @@ fn snapshot_focus_and_monitor_workspace_relationships_must_be_coherent() {
 }
 
 #[test]
+fn focused_pinned_window_may_reference_another_workspace_on_the_focused_monitor() {
+    let mut pinned: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
+    pinned[0]["workspace"] = serde_json::json!({"id": 2, "name": "2"});
+    let snapshot = parse_full_snapshot(
+        MONITORS.as_bytes(),
+        WORKSPACES.as_bytes(),
+        pinned.to_string().as_bytes(),
+    )
+    .expect("a pinned focused window may retain another workspace on its focused monitor");
+    let focused = snapshot
+        .windows
+        .iter()
+        .find(|window| window.focused)
+        .unwrap();
+    assert_eq!(focused.id, "0xabc");
+    assert_eq!(focused.workspace_id, "2");
+    assert!(focused.pinned);
+
+    let mut nonpinned = pinned.clone();
+    nonpinned[0]["pinned"] = serde_json::json!(false);
+    let error = parse_full_snapshot(
+        MONITORS.as_bytes(),
+        WORKSPACES.as_bytes(),
+        nonpinned.to_string().as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), CompositorErrorKind::Inconsistent);
+
+    let mut wrong_monitor = pinned;
+    wrong_monitor[0]["monitor"] = serde_json::json!(1);
+    let error = parse_full_snapshot(
+        MONITORS.as_bytes(),
+        WORKSPACES.as_bytes(),
+        wrong_monitor.to_string().as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), CompositorErrorKind::Inconsistent);
+}
+
+#[tokio::test]
+async fn coherent_pinned_focus_snapshot_completes_without_reconciliation_retry() {
+    let mut pinned: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
+    pinned[0]["workspace"] = serde_json::json!({"id": 2, "name": "2"});
+    let pinned = pinned.to_string().into_bytes();
+    let expected =
+        parse_full_snapshot(MONITORS.as_bytes(), WORKSPACES.as_bytes(), &pinned).unwrap();
+    let (_directory, paths, listener) = command_fixture().await;
+    let server = tokio::spawn(serve_script(
+        listener,
+        vec![
+            (b"j/monitors", MONITORS.as_bytes().to_vec()),
+            (b"j/workspaces", WORKSPACES.as_bytes().to_vec()),
+            (b"j/clients", pinned),
+        ],
+    ));
+    let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), test_timing());
+
+    assert_eq!(adapter.snapshot().await.unwrap(), expected);
+    assert_eq!(server.await.unwrap().len(), 3);
+}
+
+#[test]
 fn parser_enforces_sdk_collection_focus_and_numeric_bounds() {
     let monitor: serde_json::Value =
         serde_json::from_str::<serde_json::Value>(MONITORS).unwrap()[0].clone();
@@ -455,6 +548,18 @@ fn parser_enforces_sdk_collection_focus_and_numeric_bounds() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), CompositorErrorKind::Parse);
+
+    for mode in [1, 2] {
+        let mut fullscreen: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
+        fullscreen[0]["fullscreen"] = serde_json::json!(mode);
+        let snapshot = parse_full_snapshot(
+            MONITORS.as_bytes(),
+            WORKSPACES.as_bytes(),
+            fullscreen.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(snapshot.windows[0].fullscreen, "fullscreen mode {mode}");
+    }
 
     for invalid_mode in [3, 4] {
         let mut invalid_fullscreen: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
@@ -737,6 +842,74 @@ async fn missing_command_socket_is_terminal_unavailable_without_fallback_probing
 }
 
 #[tokio::test]
+async fn focused_only_mutations_are_unsupported_before_any_transport() {
+    for command in [
+        HyprlandCommand::ToggleFullscreen {
+            window_id: StableId("0xabc".into()),
+        },
+        HyprlandCommand::ToggleFullscreen {
+            window_id: StableId("0xdef".into()),
+        },
+        HyprlandCommand::ToggleFullscreen {
+            window_id: StableId("0x999".into()),
+        },
+        HyprlandCommand::ToggleGroup {
+            window_id: StableId("0xabc".into()),
+        },
+        HyprlandCommand::ToggleGroup {
+            window_id: StableId("0xdef".into()),
+        },
+        HyprlandCommand::ToggleGroup {
+            window_id: StableId("0x999".into()),
+        },
+    ] {
+        let (_directory, paths, listener) = command_fixture().await;
+        let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), test_timing());
+
+        let error = tokio::time::timeout(Duration::from_millis(50), adapter.execute(command))
+            .await
+            .expect("unsupported actions must fail without waiting on compositor I/O")
+            .unwrap_err();
+        assert_eq!(error.kind(), CompositorErrorKind::Unsupported);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
+            "unsupported actions must not connect to the command socket"
+        );
+    }
+}
+
+#[tokio::test]
+async fn already_focused_targets_return_the_existing_snapshot_without_dispatch() {
+    for command in [
+        HyprlandCommand::FocusWindow {
+            window_id: StableId("0xabc".into()),
+        },
+        HyprlandCommand::FocusWorkspace {
+            workspace_id: StableId("-99".into()),
+        },
+    ] {
+        let (_directory, paths, listener) = command_fixture().await;
+        let server = tokio::spawn(serve_script(
+            listener,
+            vec![
+                (b"j/monitors", MONITORS.as_bytes().to_vec()),
+                (b"j/workspaces", WORKSPACES.as_bytes().to_vec()),
+                (b"j/clients", CLIENTS.as_bytes().to_vec()),
+            ],
+        ));
+        let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), test_timing());
+
+        assert_eq!(
+            adapter.execute(command).await.unwrap(),
+            CompositorExecution::Snapshot(parse_fixture())
+        );
+        assert_eq!(server.await.unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
 async fn snapshot_deadline_and_cancellation_interrupt_blocked_responses() {
     let (_directory, paths, listener) = command_fixture().await;
     let accepted = tokio::spawn(async move {
@@ -773,137 +946,136 @@ async fn snapshot_deadline_and_cancellation_interrupt_blocked_responses() {
 }
 
 #[tokio::test]
-async fn every_closed_action_uses_fixed_wire_bytes_and_confirmed_readback() {
+async fn supported_actions_use_fixed_targeted_bytes_and_stateful_confirmed_readback() {
     let mut normal_monitors: serde_json::Value = serde_json::from_str(MONITORS).unwrap();
     let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
     focus_normal_monitor(&mut normal_monitors, &mut clients);
-    execute_case(
+    execute_stateful_case(
+        fixture_wire_snapshot(),
         HyprlandCommand::FocusWindow {
             window_id: StableId("0xdef".into()),
         },
-        vec![b"dispatch focuswindow address:0xdef"],
-        normal_monitors.to_string().into_bytes(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
+        b"dispatch focuswindow address:0xdef",
+        wire_snapshot(
+            normal_monitors.to_string().into_bytes(),
+            WORKSPACES.as_bytes().to_vec(),
+            clients.to_string().into_bytes(),
+        ),
     )
     .await;
 
     let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
     clients[1]["workspace"] = serde_json::json!({"id": -99, "name": "special:magic"});
     clients[1]["monitor"] = serde_json::json!(0);
-    execute_case(
+    execute_stateful_case(
+        fixture_wire_snapshot(),
         HyprlandCommand::MoveWindowToWorkspace {
             window_id: StableId("0xdef".into()),
             workspace_id: StableId("-99".into()),
         },
-        vec![b"dispatch movetoworkspacesilent special:magic,address:0xdef"],
-        MONITORS.as_bytes().to_vec(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
+        b"dispatch movetoworkspacesilent special:magic,address:0xdef",
+        wire_snapshot(
+            MONITORS.as_bytes().to_vec(),
+            WORKSPACES.as_bytes().to_vec(),
+            clients.to_string().into_bytes(),
+        ),
     )
     .await;
 
     let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-    clients.as_array_mut().unwrap().remove(0);
-    clients[0]["focusHistoryID"] = serde_json::json!(0);
-    let mut normal_monitors: serde_json::Value = serde_json::from_str(MONITORS).unwrap();
-    normal_monitors[0]["focused"] = serde_json::json!(false);
-    normal_monitors[1]["focused"] = serde_json::json!(true);
-    execute_case(
+    clients.as_array_mut().unwrap().remove(1);
+    execute_stateful_case(
+        fixture_wire_snapshot(),
         HyprlandCommand::CloseWindow {
-            window_id: StableId("0xabc".into()),
+            window_id: StableId("0xdef".into()),
         },
-        vec![b"dispatch closewindow address:0xabc"],
-        normal_monitors.to_string().into_bytes(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
+        b"dispatch closewindow address:0xdef",
+        wire_snapshot(
+            MONITORS.as_bytes().to_vec(),
+            WORKSPACES.as_bytes().to_vec(),
+            clients.to_string().into_bytes(),
+        ),
     )
     .await;
 
     let mut monitors: serde_json::Value = serde_json::from_str(MONITORS).unwrap();
     let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
     focus_normal_monitor(&mut monitors, &mut clients);
-    execute_case(
+    execute_stateful_case(
+        fixture_wire_snapshot(),
         HyprlandCommand::FocusWorkspace {
             workspace_id: StableId("3".into()),
         },
-        vec![b"dispatch workspace 3"],
-        monitors.to_string().into_bytes(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
+        b"dispatch workspace 3",
+        wire_snapshot(
+            monitors.to_string().into_bytes(),
+            WORKSPACES.as_bytes().to_vec(),
+            clients.to_string().into_bytes(),
+        ),
     )
     .await;
 
-    let mut workspaces: serde_json::Value = serde_json::from_str(WORKSPACES).unwrap();
-    workspaces.as_array_mut().unwrap().push(serde_json::json!({
-        "id": 4, "name": "4", "monitor": "HDMI-A-1"
-    }));
-    workspaces[1]["monitor"] = serde_json::json!("DP-1");
+    let mut pre_workspaces: serde_json::Value = serde_json::from_str(WORKSPACES).unwrap();
+    pre_workspaces
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": 4, "name": "4", "monitor": "HDMI-A-1"
+        }));
+    let mut post_workspaces = pre_workspaces.clone();
+    post_workspaces[1]["monitor"] = serde_json::json!("DP-1");
     let mut monitors: serde_json::Value = serde_json::from_str(MONITORS).unwrap();
     monitors[1]["activeWorkspace"] = serde_json::json!({"id": 4, "name": "4"});
     let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
     clients[1]["monitor"] = serde_json::json!(0);
-    execute_case(
+    execute_stateful_case(
+        wire_snapshot(
+            MONITORS.as_bytes().to_vec(),
+            pre_workspaces.to_string().into_bytes(),
+            CLIENTS.as_bytes().to_vec(),
+        ),
         HyprlandCommand::MoveWorkspaceToMonitor {
             workspace_id: StableId("3".into()),
             monitor_id: StableId("DP-1".into()),
         },
-        vec![b"dispatch moveworkspacetomonitor 3 DP-1"],
-        monitors.to_string().into_bytes(),
-        workspaces.to_string().into_bytes(),
-        clients.to_string().into_bytes(),
+        b"dispatch moveworkspacetomonitor 3 DP-1",
+        wire_snapshot(
+            monitors.to_string().into_bytes(),
+            post_workspaces.to_string().into_bytes(),
+            clients.to_string().into_bytes(),
+        ),
     )
     .await;
 
     let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-    clients[0]["fullscreen"] = serde_json::json!(2);
-    execute_case(
-        HyprlandCommand::ToggleFullscreen {
-            window_id: StableId("0xabc".into()),
-        },
-        vec![b"[[BATCH]]dispatch focuswindow address:0xabc;dispatch fullscreen 0 set"],
-        MONITORS.as_bytes().to_vec(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
-    )
-    .await;
-
-    let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-    clients[0]["floating"] = serde_json::json!(false);
-    execute_case(
+    clients[1]["floating"] = serde_json::json!(true);
+    execute_stateful_case(
+        fixture_wire_snapshot(),
         HyprlandCommand::ToggleFloating {
-            window_id: StableId("0xabc".into()),
+            window_id: StableId("0xdef".into()),
         },
-        vec![b"dispatch togglefloating address:0xabc"],
-        MONITORS.as_bytes().to_vec(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
+        b"dispatch togglefloating address:0xdef",
+        wire_snapshot(
+            MONITORS.as_bytes().to_vec(),
+            WORKSPACES.as_bytes().to_vec(),
+            clients.to_string().into_bytes(),
+        ),
     )
     .await;
 
     let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
     clients[0]["pinned"] = serde_json::json!(false);
-    execute_case(
+    execute_stateful_case(
+        fixture_wire_snapshot(),
         HyprlandCommand::TogglePinned {
             window_id: StableId("0xabc".into()),
         },
-        vec![b"dispatch pin address:0xabc"],
-        MONITORS.as_bytes().to_vec(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
-    )
-    .await;
-
-    let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-    clients[0]["grouped"] = serde_json::json!(["0xabc"]);
-    execute_case(
-        HyprlandCommand::ToggleGroup {
-            window_id: StableId("0xabc".into()),
-        },
-        vec![b"[[BATCH]]dispatch focuswindow address:0xabc;dispatch togglegroup"],
-        MONITORS.as_bytes().to_vec(),
-        WORKSPACES.as_bytes().to_vec(),
-        clients.to_string().into_bytes(),
+        b"dispatch pin address:0xabc",
+        wire_snapshot(
+            MONITORS.as_bytes().to_vec(),
+            WORKSPACES.as_bytes().to_vec(),
+            clients.to_string().into_bytes(),
+        ),
     )
     .await;
 }
@@ -987,9 +1159,18 @@ async fn workspace_commands_distinguish_numeric_named_and_special_selectors() {
     )
     .await;
 
+    let mut special_workspaces: serde_json::Value = serde_json::from_str(WORKSPACES).unwrap();
+    special_workspaces
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": -100,
+            "name": "special:inactive",
+            "monitor": "DP-1"
+        }));
     for command in [
         HyprlandCommand::FocusWorkspace {
-            workspace_id: StableId("-99".into()),
+            workspace_id: StableId("-100".into()),
         },
         HyprlandCommand::MoveWorkspaceToMonitor {
             workspace_id: StableId("-99".into()),
@@ -1001,7 +1182,7 @@ async fn workspace_commands_distinguish_numeric_named_and_special_selectors() {
             listener,
             vec![
                 (b"j/monitors", MONITORS.as_bytes().to_vec()),
-                (b"j/workspaces", WORKSPACES.as_bytes().to_vec()),
+                (b"j/workspaces", special_workspaces.to_string().into_bytes()),
                 (b"j/clients", CLIENTS.as_bytes().to_vec()),
             ],
         ));
@@ -1042,179 +1223,7 @@ async fn workspace_commands_distinguish_numeric_named_and_special_selectors() {
 }
 
 #[tokio::test]
-async fn focused_only_actions_use_one_sequential_batch_and_mutate_only_the_target() {
-    for (pre_mode, operation, post_mode) in [
-        (0, "fullscreen 0 set", 2),
-        (1, "fullscreen 1 unset", 0),
-        (2, "fullscreen 0 unset", 0),
-    ] {
-        let mut pre_clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-        pre_clients[1]["fullscreen"] = serde_json::json!(pre_mode);
-        let mut post_monitors: serde_json::Value = serde_json::from_str(MONITORS).unwrap();
-        let mut post_clients = pre_clients.clone();
-        focus_normal_monitor(&mut post_monitors, &mut post_clients);
-        post_clients[1]["fullscreen"] = serde_json::json!(post_mode);
-        let request = match operation {
-            "fullscreen 0 set" => {
-                b"[[BATCH]]dispatch focuswindow address:0xdef;dispatch fullscreen 0 set"
-                    as &'static [u8]
-            }
-            "fullscreen 1 unset" => {
-                b"[[BATCH]]dispatch focuswindow address:0xdef;dispatch fullscreen 1 unset"
-            }
-            "fullscreen 0 unset" => {
-                b"[[BATCH]]dispatch focuswindow address:0xdef;dispatch fullscreen 0 unset"
-            }
-            _ => unreachable!(),
-        };
-        execute_custom_case(
-            wire_snapshot(
-                MONITORS.as_bytes().to_vec(),
-                WORKSPACES.as_bytes().to_vec(),
-                pre_clients.to_string().into_bytes(),
-            ),
-            HyprlandCommand::ToggleFullscreen {
-                window_id: StableId("0xdef".into()),
-            },
-            request,
-            b"ok\n\n\nok".to_vec(),
-            wire_snapshot(
-                post_monitors.to_string().into_bytes(),
-                WORKSPACES.as_bytes().to_vec(),
-                post_clients.to_string().into_bytes(),
-            ),
-        )
-        .await;
-    }
-
-    let mut post_monitors: serde_json::Value = serde_json::from_str(MONITORS).unwrap();
-    let mut post_clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-    focus_normal_monitor(&mut post_monitors, &mut post_clients);
-    post_clients[1]["grouped"] = serde_json::json!(["0xdef"]);
-    execute_custom_case(
-        wire_snapshot(
-            MONITORS.as_bytes().to_vec(),
-            WORKSPACES.as_bytes().to_vec(),
-            CLIENTS.as_bytes().to_vec(),
-        ),
-        HyprlandCommand::ToggleGroup {
-            window_id: StableId("0xdef".into()),
-        },
-        b"[[BATCH]]dispatch focuswindow address:0xdef;dispatch togglegroup",
-        b"ok\n\n\nok".to_vec(),
-        wire_snapshot(
-            post_monitors.to_string().into_bytes(),
-            WORKSPACES.as_bytes().to_vec(),
-            post_clients.to_string().into_bytes(),
-        ),
-    )
-    .await;
-
-    let mut grouped_monitors: serde_json::Value = serde_json::from_str(MONITORS).unwrap();
-    let mut grouped_clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-    focus_normal_monitor(&mut grouped_monitors, &mut grouped_clients);
-    grouped_clients[0]["workspace"] = serde_json::json!({"id": 3, "name": "3"});
-    grouped_clients[0]["monitor"] = serde_json::json!(1);
-    grouped_clients[0]["grouped"] = serde_json::json!(["0xabc", "0xdef"]);
-    grouped_clients[1]["grouped"] = serde_json::json!(["0xabc", "0xdef"]);
-    let mut ungrouped_clients = grouped_clients.clone();
-    ungrouped_clients[0]["grouped"] = serde_json::json!([]);
-    ungrouped_clients[1]["grouped"] = serde_json::json!([]);
-    execute_custom_case(
-        wire_snapshot(
-            grouped_monitors.to_string().into_bytes(),
-            WORKSPACES.as_bytes().to_vec(),
-            grouped_clients.to_string().into_bytes(),
-        ),
-        HyprlandCommand::ToggleGroup {
-            window_id: StableId("0xdef".into()),
-        },
-        b"[[BATCH]]dispatch focuswindow address:0xdef;dispatch togglegroup",
-        b"ok\n\n\nok".to_vec(),
-        wire_snapshot(
-            grouped_monitors.to_string().into_bytes(),
-            WORKSPACES.as_bytes().to_vec(),
-            ungrouped_clients.to_string().into_bytes(),
-        ),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn invalid_fullscreen_mode_and_malformed_batch_reply_cannot_mutate_state() {
-    let (_directory, paths, listener) = command_fixture().await;
-    let mut invalid_clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
-    invalid_clients[1]["fullscreen"] = serde_json::json!(3);
-    let server = tokio::spawn(serve_script(
-        listener,
-        vec![
-            (b"j/monitors", MONITORS.as_bytes().to_vec()),
-            (b"j/workspaces", WORKSPACES.as_bytes().to_vec()),
-            (b"j/clients", invalid_clients.to_string().into_bytes()),
-        ],
-    ));
-    let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), test_timing());
-    let error = adapter
-        .execute(HyprlandCommand::ToggleFullscreen {
-            window_id: StableId("0xdef".into()),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), CompositorErrorKind::Parse);
-    server.await.unwrap();
-
-    let (_directory, paths, listener) = command_fixture().await;
-    let server = tokio::spawn(serve_script(
-        listener,
-        vec![
-            (b"j/monitors", MONITORS.as_bytes().to_vec()),
-            (b"j/workspaces", WORKSPACES.as_bytes().to_vec()),
-            (b"j/clients", CLIENTS.as_bytes().to_vec()),
-            (
-                b"[[BATCH]]dispatch focuswindow address:0xdef;dispatch togglegroup",
-                b"ok\n\n\nnot-ok".to_vec(),
-            ),
-        ],
-    ));
-    let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), test_timing());
-    let error = adapter
-        .execute(HyprlandCommand::ToggleGroup {
-            window_id: StableId("0xdef".into()),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), CompositorErrorKind::Rejected);
-    server.await.unwrap();
-
-    let (_directory, paths, listener) = command_fixture().await;
-    let oversized = vec![b'x'; 4 * 1024 + 1];
-    let mut response = b"ok\n\n\n".to_vec();
-    response.extend_from_slice(&oversized);
-    let server = tokio::spawn(serve_script(
-        listener,
-        vec![
-            (b"j/monitors", MONITORS.as_bytes().to_vec()),
-            (b"j/workspaces", WORKSPACES.as_bytes().to_vec()),
-            (b"j/clients", CLIENTS.as_bytes().to_vec()),
-            (
-                b"[[BATCH]]dispatch focuswindow address:0xdef;dispatch togglegroup",
-                response,
-            ),
-        ],
-    ));
-    let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), test_timing());
-    let error = adapter
-        .execute(HyprlandCommand::ToggleGroup {
-            window_id: StableId("0xdef".into()),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), CompositorErrorKind::Bounds);
-    server.await.unwrap();
-}
-
-#[tokio::test]
-async fn every_non_exit_action_family_times_out_unconfirmed_on_stale_readback() {
+async fn every_supported_non_exit_action_times_out_unconfirmed_on_stale_readback() {
     for (command, dispatches) in [
         (
             HyprlandCommand::FocusWindow {
@@ -1249,12 +1258,6 @@ async fn every_non_exit_action_family_times_out_unconfirmed_on_stale_readback() 
             vec![b"dispatch moveworkspacetomonitor 3 DP-1"],
         ),
         (
-            HyprlandCommand::ToggleFullscreen {
-                window_id: StableId("0xabc".into()),
-            },
-            vec![b"[[BATCH]]dispatch focuswindow address:0xabc;dispatch fullscreen 0 set"],
-        ),
-        (
             HyprlandCommand::ToggleFloating {
                 window_id: StableId("0xabc".into()),
             },
@@ -1265,12 +1268,6 @@ async fn every_non_exit_action_family_times_out_unconfirmed_on_stale_readback() 
                 window_id: StableId("0xabc".into()),
             },
             vec![b"dispatch pin address:0xabc"],
-        ),
-        (
-            HyprlandCommand::ToggleGroup {
-                window_id: StableId("0xabc".into()),
-            },
-            vec![b"[[BATCH]]dispatch focuswindow address:0xabc;dispatch togglegroup"],
         ),
     ] {
         assert_stale_readback_is_unconfirmed(command, dispatches).await;
