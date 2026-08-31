@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     io,
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
@@ -18,7 +19,8 @@ use sleepy_sdk::{
     NetworkRuntimeState, NetworkSnapshot, RuntimeCapabilityId, StableId, UtilityCommand,
     DESKTOP_WIRE_VERSION,
 };
-use sleepy_session::desktop::core::state_from_record;
+use sleepy_session::desktop::adapters::AppearanceProducer;
+use sleepy_session::desktop::core::{state_from_record, CoreSystemProducer};
 use sleepy_session::desktop::resources::parse_host_resources;
 use sleepy_session::desktop::secret_agent::{
     NetworkSecretExchange, SecretBroker, SecretRequestLease, SecretSocket, SecretZeroizeObserver,
@@ -31,7 +33,10 @@ use sleepy_session::desktop::{
     DesktopStateAuthority, ProducerError,
 };
 use sleepy_session::sessiond::supervisor::PreparedDesktopSockets;
-use sleepy_session::system::{CommandOutput, CommandRunner, CommandSpec, RunnerError};
+use sleepy_session::system::{
+    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunControl, RunnerError,
+    SystemFacade,
+};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -59,11 +64,7 @@ struct DrainTrackingProducer {
     drained: Arc<AtomicUsize>,
 }
 
-struct OwnedBlockingProducer {
-    domain: DesktopDomainId,
-    started: Arc<std::sync::atomic::AtomicBool>,
-    finished: Arc<std::sync::atomic::AtomicBool>,
-}
+struct UncooperativeAsyncProducer(DesktopDomainId);
 
 #[async_trait]
 impl DesktopProducer for ReconnectingProducer {
@@ -147,14 +148,14 @@ impl DesktopProducer for DrainTrackingProducer {
 }
 
 #[async_trait]
-impl DesktopProducer for OwnedBlockingProducer {
+impl DesktopProducer for UncooperativeAsyncProducer {
     fn domain(&self) -> DesktopDomainId {
-        self.domain
+        self.0
     }
 
     async fn initial(&self) -> DesktopDomainState {
         DesktopDomainState::terminal(
-            self.domain,
+            self.0,
             CapabilityAvailability::Unavailable,
             "fixture unavailable",
         )
@@ -166,15 +167,36 @@ impl DesktopProducer for OwnedBlockingProducer {
         _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
         _cancellation: CancellationToken,
     ) -> Result<(), ProducerError> {
-        self.started.store(true, Ordering::Release);
-        let finished = Arc::clone(&self.finished);
-        tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            finished.store(true, Ordering::Release);
-        })
-        .await
-        .unwrap();
-        Ok(())
+        std::future::pending().await
+    }
+}
+
+#[derive(Clone)]
+struct BlockingProcessRunner {
+    pid_path: Arc<PathBuf>,
+}
+
+impl CommandRunner for BlockingProcessRunner {
+    fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+        self.run_controlled(command, &RunControl::for_timeout(Duration::from_secs(30)))
+    }
+
+    fn run_controlled(
+        &self,
+        _command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        let mut command = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                "printf '%s' \"$$\" > \"$1\"; exec sleep 30".to_owned(),
+                "sleepy-producer-test".to_owned(),
+                self.pid_path.to_string_lossy().into_owned(),
+            ],
+        );
+        command.timeout = Duration::from_secs(30);
+        ProcessCommandRunner.run_controlled(&command, control)
     }
 }
 
@@ -715,7 +737,6 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
             output_id: StableId("output:DP-1".into()),
         },
         "/run/user/1000/sleepy/captures/capture.png",
-        "00000000-0000-4000-8000-000000000051",
     )
     .unwrap()
     .unwrap();
@@ -725,38 +746,25 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
         [
             "screenshot",
             "--interactive-consent",
-            "--gesture-token",
-            "00000000-0000-4000-8000-000000000051",
             "--output-id",
             "DP-1",
             "--output-path",
             "/run/user/1000/sleepy/captures/capture.png"
         ]
     );
-    let color = utilities::action_spec(
-        &UtilityCommand::PickColor,
-        "unused",
-        "00000000-0000-4000-8000-000000000052",
-    )
-    .unwrap()
-    .unwrap();
+    let color = utilities::action_spec(&UtilityCommand::PickColor, "unused")
+        .unwrap()
+        .unwrap();
     assert_eq!(color.program, "sleepy-capture-helper");
     assert_eq!(
         color.args,
-        [
-            "pick-color",
-            "--interactive-consent",
-            "--gesture-token",
-            "00000000-0000-4000-8000-000000000052",
-            "--clipboard"
-        ]
+        ["pick-color", "--interactive-consent", "--clipboard"]
     );
     let recording = utilities::action_spec(
         &UtilityCommand::StartRecording {
             output_id: StableId("output:eDP-1".into()),
         },
         "/run/user/1000/sleepy/captures/recording.mkv",
-        "00000000-0000-4000-8000-000000000053",
     )
     .unwrap()
     .unwrap();
@@ -766,8 +774,6 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
         [
             "record",
             "--interactive-consent",
-            "--gesture-token",
-            "00000000-0000-4000-8000-000000000053",
             "--output-id",
             "eDP-1",
             "--output-path",
@@ -790,11 +796,9 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
         UtilityCommand::StopRecording,
         UtilityCommand::SetGameMode { enabled: true },
     ] {
-        assert!(
-            utilities::action_spec(&command, "unused", "00000000-0000-4000-8000-000000000054")
-                .unwrap()
-                .is_none()
-        );
+        assert!(utilities::action_spec(&command, "unused")
+            .unwrap()
+            .is_none());
     }
 
     assert_eq!(
@@ -1109,6 +1113,27 @@ async fn initialization_deadline_begins_before_generation_open_and_never_resets(
 }
 
 #[tokio::test]
+async fn completed_initialization_replays_after_the_first_publication_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let authority = DesktopStateAuthority::open(
+        available_registry(),
+        temp.path().join("desktop-generation"),
+        8,
+    )
+    .await
+    .unwrap();
+    let first = authority.initialize().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2_050)).await;
+
+    let started = Instant::now();
+    let replay = authority.initialize().await.unwrap();
+
+    assert_eq!(replay, first);
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert_eq!(authority.current_generation(), first.generation);
+}
+
+#[tokio::test]
 async fn every_available_domain_assembles_one_sdk_valid_atomic_snapshot() {
     let producers = DesktopDomainId::ALL
         .into_iter()
@@ -1395,42 +1420,111 @@ async fn producer_runtime_restarts_panics_and_gathers_all_owned_work() {
 }
 
 #[tokio::test]
-async fn runtime_timeout_does_not_detach_owned_blocking_production_work() {
-    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let registry = Arc::new(
-        DesktopRegistry::new(complete_registry_with(Some((
+async fn runtime_timeout_is_bounded_and_reaps_a_production_command_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let pid_path = Arc::new(temp.path().join("producer-child.pid"));
+    let core = Arc::new(
+        CoreSystemProducer::new(
             DesktopDomainId::Network,
-            Arc::new(OwnedBlockingProducer {
-                domain: DesktopDomainId::Network,
-                started: Arc::clone(&started),
-                finished: Arc::clone(&finished),
-            }),
-        ))))
+            Arc::new(SystemFacade::new(BlockingProcessRunner {
+                pid_path: Arc::clone(&pid_path),
+            })),
+        )
+        .unwrap(),
+    ) as Arc<dyn DesktopProducer>;
+    let uncooperative = Arc::new(UncooperativeAsyncProducer(DesktopDomainId::Bluetooth))
+        as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(
+            DesktopDomainId::ALL
+                .into_iter()
+                .map(|domain| match domain {
+                    DesktopDomainId::Network => Arc::clone(&core),
+                    DesktopDomainId::Bluetooth => Arc::clone(&uncooperative),
+                    _ => producer(
+                        domain,
+                        DesktopDomainState::terminal(
+                            domain,
+                            CapabilityAvailability::Unsupported,
+                            "fixture unsupported",
+                        )
+                        .unwrap(),
+                    ),
+                })
+                .collect(),
+        )
         .unwrap(),
     );
-    let temp = tempfile::tempdir().unwrap();
     let authority =
-        DesktopStateAuthority::open(Arc::clone(&registry), temp.path().join("generation"), 16)
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
             .await
             .unwrap();
     authority.initialize().await.unwrap();
     let runtime = registry.start(authority, 16).unwrap();
-    while !started.load(Ordering::Acquire) {
-        tokio::task::yield_now().await;
+    let child_start_deadline = Instant::now() + Duration::from_secs(3);
+    while !pid_path.exists() {
+        assert!(
+            Instant::now() < child_start_deadline,
+            "producer child did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    let child_pid = std::fs::read_to_string(pid_path.as_ref())
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
 
     let before = Instant::now();
-    assert_eq!(
-        runtime
-            .shutdown(Duration::from_millis(10))
-            .await
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::TimedOut
+    let result = tokio::time::timeout(
+        Duration::from_millis(350),
+        runtime.shutdown(Duration::from_millis(100)),
+    )
+    .await
+    .expect("desktop producer shutdown exceeded its hard deadline");
+
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(before.elapsed() < Duration::from_millis(250));
+    assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+}
+
+#[tokio::test]
+async fn appearance_poll_cannot_leave_a_blocking_worker_past_bounded_shutdown() {
+    use sleepy_session::desktop::appearance::AppearanceService;
+    use sleepy_session::theme::ThemeManager;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    let state = temp.path().join("state");
+    let manager = Arc::new(tokio::sync::Mutex::new(
+        ThemeManager::open(&config, &state).unwrap(),
+    ));
+    let service = Arc::new(AppearanceService::open(Arc::clone(&manager), &state).unwrap());
+    let appearance = Arc::new(AppearanceProducer::new(service)) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Appearance,
+            appearance,
+        ))))
+        .unwrap(),
     );
-    assert!(before.elapsed() >= Duration::from_millis(100));
-    assert!(finished.load(Ordering::Acquire));
+    let authority =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let held_theme_lock = manager.lock().await;
+    let baseline_owners = Arc::strong_count(&manager);
+    let runtime = registry.start(authority, 16).unwrap();
+    tokio::time::sleep(Duration::from_millis(2_050)).await;
+
+    let started = Instant::now();
+    let result = runtime.shutdown(Duration::from_millis(100)).await;
+
+    assert!(result.is_ok());
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(Arc::strong_count(&manager), baseline_owners);
+    drop(held_theme_lock);
 }
 
 #[tokio::test]
@@ -2148,4 +2242,41 @@ async fn secret_socket_uses_binary_one_shot_framing_and_mode_0600() {
     drop(stream);
     server.await.unwrap().unwrap();
     assert_eq!(exchange.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn secret_shutdown_cancels_and_joins_a_live_leased_handler_awaiting_response() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let exchange = Arc::new(AcceptFixtureExchange::default());
+    let socket = SecretSocket::bind(
+        temp.path().join("secret.sock"),
+        unsafe { libc::geteuid() },
+        SecretBroker::default(),
+        exchange.clone(),
+    )
+    .await
+    .unwrap();
+    let serving = Arc::clone(&socket);
+    let server = tokio::spawn(async move { serving.serve_one().await });
+    let mut client = UnixStream::connect(socket.path()).await.unwrap();
+    let challenge_length = client.read_u32().await.unwrap() as usize;
+    assert_eq!(challenge_length, 16);
+    let mut challenge = vec![0_u8; challenge_length];
+    client.read_exact(&mut challenge).await.unwrap();
+
+    let started = Instant::now();
+    let report = socket.shutdown_and_drain().await.unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(report.completed, 1);
+    assert_eq!(report.aborted, 0);
+    assert_eq!(exchange.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client.read_u8().await.unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert!(server.await.unwrap().is_err());
 }

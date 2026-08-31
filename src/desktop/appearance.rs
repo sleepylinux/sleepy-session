@@ -52,6 +52,26 @@ impl AppearanceService {
         .map_err(|error| io::Error::other(format!("appearance worker failed: {error}")))?
     }
 
+    pub(crate) async fn polling_snapshot(&self) -> io::Result<DesktopAppearanceSnapshot> {
+        let manager = Arc::clone(&self.manager);
+        let state = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            let theme = manager
+                .try_lock()
+                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "theme manager is busy"))?
+                .current()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let wallpaper_id = read_wallpaper(&state)?;
+            Ok(DesktopAppearanceSnapshot {
+                availability: super::available_producer(),
+                theme,
+                wallpaper_id,
+            })
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("appearance worker failed: {error}")))?
+    }
+
     pub async fn apply(
         &self,
         command: &AppearanceCommand,

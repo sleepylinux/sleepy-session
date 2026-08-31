@@ -259,14 +259,12 @@ impl<B: DailyBackend> DesktopMutationExecutor for ProductionDesktopMutationExecu
                 }
                 let service = Arc::clone(&self.utilities);
                 let command = command.clone();
-                let gesture_token = request.request_id.clone();
-                let state =
-                    tokio::task::spawn_blocking(move || service.execute(&command, &gesture_token))
-                        .await
-                        .map_err(|error| {
-                            ProducerError::new(format!("utility action worker failed: {error}"))
-                        })?
-                        .map_err(|error| ProducerError::new(error.to_string()))?;
+                let state = tokio::task::spawn_blocking(move || service.execute(&command))
+                    .await
+                    .map_err(|error| {
+                        ProducerError::new(format!("utility action worker failed: {error}"))
+                    })?
+                    .map_err(|error| ProducerError::new(error.to_string()))?;
                 // One-shot utilities (screenshot/color pick) have no result payload in the
                 // v3 SDK. Their bounded process exit is the confirmation; the returned state
                 // is still published even when an independent utility in that domain is absent.

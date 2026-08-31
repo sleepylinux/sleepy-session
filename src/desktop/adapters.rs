@@ -190,7 +190,7 @@ impl AppearanceProducer {
     }
 
     async fn snapshot(&self) -> DesktopDomainState {
-        match self.service.snapshot().await {
+        match self.service.polling_snapshot().await {
             Ok(snapshot) => DesktopDomainState::available(
                 DesktopDomainId::Appearance,
                 DesktopDomainValue::Appearance {

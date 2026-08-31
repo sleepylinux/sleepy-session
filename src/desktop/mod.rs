@@ -46,6 +46,7 @@ pub mod utilities;
 
 const INITIAL_DEADLINE: Duration = Duration::from_secs(2);
 const INITIAL_PROBE_BUDGET: Duration = Duration::from_millis(1_500);
+const PRODUCER_SHUTDOWN_TOLERANCE: Duration = Duration::from_millis(100);
 const MAX_DESKTOP_FRAME_BYTES: usize = 896 * 1024;
 const MAX_DESKTOP_SERIALIZED_ITEMS: usize = 20_000;
 const MAX_DESKTOP_STRING_BYTES: usize = 768 * 1024;
@@ -349,8 +350,13 @@ pub struct DesktopRegistry {
 
 pub struct DesktopProducerRuntime {
     cancellation: CancellationToken,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    tasks: Vec<ProducerTask>,
     aggregator: tokio::task::JoinHandle<io::Result<()>>,
+}
+
+struct ProducerTask {
+    wrapper: tokio::task::JoinHandle<()>,
+    active_attempt: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
 }
 
 pub struct DesktopStateAuthority {
@@ -653,6 +659,15 @@ impl DesktopStateAuthority {
 
     pub async fn initialize(&self) -> io::Result<DesktopEnvelope> {
         let _initialization = self.initialization.lock().await;
+        if let Some(existing) = self
+            .transaction
+            .lock()
+            .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?
+            .latest_snapshot
+            .clone()
+        {
+            return Ok(existing);
+        }
         let deadline = self.startup_deadline;
         ensure_initial_deadline(deadline)?;
         let overall_deadline = tokio::time::Instant::from_std(deadline);
@@ -1185,7 +1200,9 @@ impl DesktopRegistry {
             let producer = Arc::clone(producer);
             let sender = sender.clone();
             let token = cancellation.child_token();
-            tasks.push(tokio::spawn(async move {
+            let active_attempt = Arc::new(StdMutex::new(None));
+            let attempt_slot = Arc::clone(&active_attempt);
+            let wrapper = tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(100);
                 loop {
                     let started = tokio::time::Instant::now();
@@ -1195,9 +1212,15 @@ impl DesktopRegistry {
                     let run_producer = Arc::clone(&producer);
                     let run_sender = sender.clone();
                     let run_token = token.child_token();
-                    let result =
-                        tokio::spawn(async move { run_producer.run(run_sender, run_token).await })
-                            .await;
+                    let attempt =
+                        tokio::spawn(async move { run_producer.run(run_sender, run_token).await });
+                    if let Ok(mut active) = attempt_slot.lock() {
+                        *active = Some(attempt.abort_handle());
+                    }
+                    let result = attempt.await;
+                    if let Ok(mut active) = attempt_slot.lock() {
+                        active.take();
+                    }
                     if token.is_cancelled() {
                         return;
                     }
@@ -1226,7 +1249,11 @@ impl DesktopRegistry {
                     }
                     backoff = backoff.saturating_mul(2).min(Duration::from_secs(5));
                 }
-            }));
+            });
+            tasks.push(ProducerTask {
+                wrapper,
+                active_attempt,
+            });
         }
         drop(sender);
         let token = cancellation.child_token();
@@ -1257,10 +1284,11 @@ impl DesktopProducerRuntime {
     pub async fn shutdown(mut self, timeout: Duration) -> io::Result<()> {
         self.cancellation.cancel();
         let deadline = tokio::time::Instant::now() + timeout;
+        let reap_deadline = deadline + PRODUCER_SHUTDOWN_TOLERANCE;
         let mut failure = None;
         let mut timed_out_at = None;
         for index in 0..self.tasks.len() {
-            match tokio::time::timeout_at(deadline, &mut self.tasks[index]).await {
+            match tokio::time::timeout_at(deadline, &mut self.tasks[index].wrapper).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     failure.get_or_insert_with(|| {
@@ -1269,57 +1297,60 @@ impl DesktopProducerRuntime {
                 }
                 Err(_) => {
                     timed_out_at = Some(index);
-                    for task in &mut self.tasks[index..] {
-                        if let Err(error) = task.await {
-                            failure.get_or_insert_with(|| {
-                                io::Error::other(format!(
-                                    "desktop producer task failed while draining: {error}"
-                                ))
-                            });
-                        }
-                    }
                     failure.get_or_insert_with(|| {
                         io::Error::new(io::ErrorKind::TimedOut, "desktop producers did not drain")
                     });
+                    for task in &mut self.tasks[index..] {
+                        if let Ok(mut active) = task.active_attempt.lock() {
+                            if let Some(attempt) = active.take() {
+                                attempt.abort();
+                            }
+                        }
+                    }
+                    for task in &mut self.tasks[index..] {
+                        match tokio::time::timeout_at(reap_deadline, &mut task.wrapper).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                failure.get_or_insert_with(|| {
+                                    io::Error::other(format!(
+                                        "desktop producer task failed while draining: {error}"
+                                    ))
+                                });
+                            }
+                            Err(_) => {
+                                task.wrapper.abort();
+                                let _ = (&mut task.wrapper).await;
+                            }
+                        }
+                    }
                     break;
                 }
             }
         }
-        if timed_out_at.is_some() {
-            match (&mut self.aggregator).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    failure.get_or_insert(error);
-                }
-                Err(error) => {
-                    failure.get_or_insert_with(|| {
-                        io::Error::other(format!(
-                            "desktop producer aggregator failed while draining: {error}"
-                        ))
-                    });
-                }
-            }
+        let aggregator_deadline = if timed_out_at.is_some() {
+            reap_deadline
         } else {
-            match tokio::time::timeout_at(deadline, &mut self.aggregator).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(error))) => {
-                    failure.get_or_insert(error);
-                }
-                Ok(Err(error)) => {
-                    failure.get_or_insert_with(|| {
-                        io::Error::other(format!("desktop producer aggregator failed: {error}"))
-                    });
-                }
-                Err(_) => {
-                    self.aggregator.abort();
-                    let _ = (&mut self.aggregator).await;
-                    failure.get_or_insert_with(|| {
-                        io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "desktop producer aggregator did not drain",
-                        )
-                    });
-                }
+            deadline
+        };
+        match tokio::time::timeout_at(aggregator_deadline, &mut self.aggregator).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                failure.get_or_insert(error);
+            }
+            Ok(Err(error)) => {
+                failure.get_or_insert_with(|| {
+                    io::Error::other(format!("desktop producer aggregator failed: {error}"))
+                });
+            }
+            Err(_) => {
+                self.aggregator.abort();
+                let _ = (&mut self.aggregator).await;
+                failure.get_or_insert_with(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "desktop producer aggregator did not drain",
+                    )
+                });
             }
         }
         match failure {

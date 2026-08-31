@@ -40,22 +40,15 @@ const GAME_MODE_DESTINATION: &str = "com.feralinteractive.GameMode";
 const GAME_MODE_PATH: &str = "/com/feralinteractive/GameMode";
 const GAME_MODE_INTERFACE: &str = "com.feralinteractive.GameMode";
 
-pub fn action_spec(
-    command: &UtilityCommand,
-    output_path: &str,
-    gesture_token: &str,
-) -> io::Result<Option<CommandSpec>> {
+pub fn action_spec(command: &UtilityCommand, output_path: &str) -> io::Result<Option<CommandSpec>> {
     let spec = match command {
         UtilityCommand::Screenshot { output_id } => {
             validate_output_path(output_path)?;
-            validate_gesture_token(gesture_token)?;
             CommandSpec::new(
                 "sleepy-capture-helper",
                 [
                     "screenshot",
                     "--interactive-consent",
-                    "--gesture-token",
-                    gesture_token,
                     "--output-id",
                     output_name(output_id)?,
                     "--output-path",
@@ -63,29 +56,17 @@ pub fn action_spec(
                 ],
             )
         }
-        UtilityCommand::PickColor => {
-            validate_gesture_token(gesture_token)?;
-            CommandSpec::new(
-                "sleepy-capture-helper",
-                [
-                    "pick-color",
-                    "--interactive-consent",
-                    "--gesture-token",
-                    gesture_token,
-                    "--clipboard",
-                ],
-            )
-        }
+        UtilityCommand::PickColor => CommandSpec::new(
+            "sleepy-capture-helper",
+            ["pick-color", "--interactive-consent", "--clipboard"],
+        ),
         UtilityCommand::StartRecording { output_id } => {
             validate_output_path(output_path)?;
-            validate_gesture_token(gesture_token)?;
             CommandSpec::new(
                 "sleepy-capture-helper",
                 [
                     "record",
                     "--interactive-consent",
-                    "--gesture-token",
-                    gesture_token,
                     "--output-id",
                     output_name(output_id)?,
                     "--output-path",
@@ -110,23 +91,10 @@ fn execute_capture_with<R: crate::system::CommandRunner>(
     runner: &R,
     command: &UtilityCommand,
     output_path: &str,
-    gesture_token: &str,
 ) -> io::Result<()> {
-    let spec = action_spec(command, output_path, gesture_token)?
+    let spec = action_spec(command, output_path)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "capture command required"))?;
     super::network::run(runner, spec).map(|_| ())
-}
-
-fn validate_gesture_token(token: &str) -> io::Result<()> {
-    let parsed = uuid::Uuid::parse_str(token)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "capture.gesture-required"))?;
-    if parsed.to_string() != token {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "capture.gesture-required",
-        ));
-    }
-    Ok(())
 }
 
 fn output_name(output_id: &sleepy_sdk::StableId) -> io::Result<&str> {
@@ -247,11 +215,22 @@ impl ProductionUtilityService {
         }
     }
 
-    pub fn execute(
-        &self,
-        command: &UtilityCommand,
-        gesture_token: &str,
-    ) -> io::Result<DesktopDomainState> {
+    fn state_for_poll(&self, domain: DesktopDomainId) -> DesktopDomainState {
+        if domain != DesktopDomainId::Recording {
+            return self.state(domain);
+        }
+        match self
+            .recording_snapshot_for_poll()
+            .map(DesktopDomainValue::Recording)
+        {
+            Ok(value) => DesktopDomainState::available(domain, value).unwrap_or_else(|error| {
+                terminal(domain, CapabilityAvailability::Parse, error.to_string())
+            }),
+            Err(error) => terminal(domain, availability_for_io(&error), error.to_string()),
+        }
+    }
+
+    pub fn execute(&self, command: &UtilityCommand) -> io::Result<DesktopDomainState> {
         match command {
             UtilityCommand::InvokeTrayMenu { item_id, menu_id } => {
                 self.tray.invoke(item_id, menu_id)?;
@@ -270,7 +249,7 @@ impl ProductionUtilityService {
                 Ok(self.state(DesktopDomainId::IdleInhibit))
             }
             UtilityCommand::StartRecording { output_id } => {
-                self.start_recording(output_id, gesture_token)?;
+                self.start_recording(output_id)?;
                 Ok(self.state(DesktopDomainId::Recording))
             }
             UtilityCommand::PauseRecording => {
@@ -284,11 +263,11 @@ impl ProductionUtilityService {
             UtilityCommand::Screenshot { .. } => {
                 let path = self.output_path("screenshot", "png");
                 let path = path_to_string(&path)?;
-                execute_capture_with(&self.runner, command, path, gesture_token)?;
+                execute_capture_with(&self.runner, command, path)?;
                 Ok(self.state(DesktopDomainId::Screenshot))
             }
             UtilityCommand::PickColor => {
-                execute_capture_with(&self.runner, command, "unused", gesture_token)?;
+                execute_capture_with(&self.runner, command, "unused")?;
                 Ok(self.state(DesktopDomainId::ColorPicker))
             }
             UtilityCommand::SetGameMode { enabled } => {
@@ -359,11 +338,25 @@ impl ProductionUtilityService {
         Ok(runtime.state.clone())
     }
 
-    fn start_recording(
-        &self,
-        output_id: &sleepy_sdk::StableId,
-        gesture_token: &str,
-    ) -> io::Result<()> {
+    fn recording_snapshot_for_poll(&self) -> io::Result<RecordingState> {
+        let mut runtime = self.recording.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::Poisoned(_) => {
+                io::Error::other("recording state lock poisoned")
+            }
+            std::sync::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, "recording state is busy")
+            }
+        })?;
+        ensure_executable("sleepy-capture-helper")?;
+        if let Some(child) = runtime.child.as_mut() {
+            if child.try_wait()?.is_some() {
+                *runtime = RecordingRuntime::default();
+            }
+        }
+        Ok(runtime.state.clone())
+    }
+
+    fn start_recording(&self, output_id: &sleepy_sdk::StableId) -> io::Result<()> {
         let mut runtime = self
             .recording
             .lock()
@@ -384,7 +377,6 @@ impl ProductionUtilityService {
                 output_id: output_id.clone(),
             },
             path_text,
-            gesture_token,
         )?
         .ok_or_else(|| io::Error::other("recording command contract missing"))?;
         let mut command = fixed_child(&spec)?;
@@ -659,7 +651,7 @@ impl UtilityProducer {
     async fn probe(&self) -> DesktopDomainState {
         let service = Arc::clone(&self.service);
         let domain = self.domain;
-        tokio::task::spawn_blocking(move || service.state(domain))
+        tokio::task::spawn_blocking(move || service.state_for_poll(domain))
             .await
             .unwrap_or_else(|_| {
                 terminal(
@@ -1220,6 +1212,18 @@ mod tests {
     }
 
     #[test]
+    fn polling_recording_state_never_waits_for_a_mutation_owned_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = ProductionUtilityService::open(temp.path().join("captures")).unwrap();
+        let _held_mutation = service.recording.lock().unwrap();
+
+        assert_eq!(
+            service.recording_snapshot_for_poll().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn live_helper_without_ready_ack_cannot_confirm_recording_start() {
         let (mut child, mut status) = scripted_status_child("sleep 5");
         assert_eq!(
@@ -1301,17 +1305,22 @@ mod tests {
                 output_id: StableId("output:DP-1".into()),
             },
             "/run/user/1000/sleepy/captures/screenshot.png",
-            "00000000-0000-4000-8000-000000000071",
         )
         .unwrap();
         let seen = runner.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].program, "sleepy-capture-helper");
-        assert_eq!(seen[0].args[0], "screenshot");
-        assert!(seen[0]
-            .args
-            .windows(2)
-            .any(|pair| { pair == ["--gesture-token", "00000000-0000-4000-8000-000000000071",] }));
+        assert_eq!(
+            seen[0].args,
+            [
+                "screenshot",
+                "--interactive-consent",
+                "--output-id",
+                "DP-1",
+                "--output-path",
+                "/run/user/1000/sleepy/captures/screenshot.png"
+            ]
+        );
     }
 
     #[test]

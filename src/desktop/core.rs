@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use sleepy_sdk::{
@@ -36,6 +43,10 @@ impl<R> DeadlineRunner<R> {
             inner,
             control: RunControl::for_timeout(timeout),
         }
+    }
+
+    fn controlled(inner: R, control: RunControl) -> Self {
+        Self { inner, control }
     }
 }
 
@@ -98,6 +109,34 @@ impl<R: CommandRunner> CoreSystemProducer<R> {
             .expect("static diagnostic"),
         }
     }
+
+    async fn probe_until_cancelled(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Option<DesktopDomainState> {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let control =
+            RunControl::for_request(Instant::now() + PROBE_DEADLINE, Arc::clone(&interrupted));
+        let facade = Arc::clone(&self.facade);
+        let domain = self.domain;
+        let mut worker =
+            tokio::task::spawn_blocking(move || probe_domain_controlled(&facade, domain, control));
+        tokio::select! {
+            result = &mut worker => Some(result.unwrap_or_else(|_| {
+                DesktopDomainState::terminal(
+                    domain,
+                    CapabilityAvailability::Error,
+                    "core system probe worker failed",
+                )
+                .expect("static diagnostic")
+            })),
+            _ = cancellation.cancelled() => {
+                interrupted.store(true, Ordering::SeqCst);
+                let _ = worker.await;
+                None
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -124,7 +163,9 @@ impl<R: CommandRunner> DesktopProducer for CoreSystemProducer<R> {
                 biased;
                 _ = cancellation.cancelled() => return Ok(()),
                 _ = interval.tick() => {
-                    let current = self.probe().await;
+                    let Some(current) = self.probe_until_cancelled(&cancellation).await else {
+                        return Ok(());
+                    };
                     if previous.as_ref() != Some(&current) {
                         sender.send(DesktopDomainUpdate { state: current.clone() })
                             .await
@@ -142,6 +183,23 @@ pub fn probe_domain<R: CommandRunner>(
     domain: DesktopDomainId,
 ) -> DesktopDomainState {
     let runner = DeadlineRunner::new(facade.runner(), PROBE_DEADLINE);
+    probe_domain_with_runner(facade, domain, runner)
+}
+
+fn probe_domain_controlled<R: CommandRunner>(
+    facade: &SystemFacade<R>,
+    domain: DesktopDomainId,
+    control: RunControl,
+) -> DesktopDomainState {
+    let runner = DeadlineRunner::controlled(facade.runner(), control);
+    probe_domain_with_runner(facade, domain, runner)
+}
+
+fn probe_domain_with_runner<R: CommandRunner>(
+    facade: &SystemFacade<R>,
+    domain: DesktopDomainId,
+    runner: DeadlineRunner<R>,
+) -> DesktopDomainState {
     let rich = match domain {
         DesktopDomainId::Network => super::network::probe(&runner).map(DesktopDomainValue::Network),
         DesktopDomainId::Bluetooth => {
