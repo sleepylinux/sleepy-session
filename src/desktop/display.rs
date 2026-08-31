@@ -8,7 +8,7 @@ use std::{
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
 use sleepy_sdk::{BrightnessSnapshot, NightLightSnapshot};
 
-use crate::system::{CommandRunner, CommandSpec};
+use crate::system::{CommandRunner, CommandSpec, RunControl};
 
 const SYSTEMD_DESTINATION: &str = "org.freedesktop.systemd1";
 const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
@@ -70,6 +70,20 @@ pub fn probe_night_light() -> io::Result<NightLightSnapshot> {
     })
 }
 
+pub(crate) fn probe_night_light_controlled(control: &RunControl) -> io::Result<NightLightSnapshot> {
+    ensure_active(control)?;
+    let timeout = control.remaining().min(DBUS_TIMEOUT);
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "night-light probe exceeded its deadline",
+        ));
+    }
+    let enabled = night_light_state_until(timeout)?;
+    ensure_active(control)?;
+    Ok(NightLightSnapshot { enabled })
+}
+
 pub fn mutate_brightness<R: CommandRunner>(
     runner: &R,
     level: f64,
@@ -120,8 +134,12 @@ fn parse_brightness(output: &[u8]) -> io::Result<f64> {
 }
 
 fn night_light_state() -> io::Result<bool> {
+    night_light_state_until(DBUS_TIMEOUT)
+}
+
+fn night_light_state_until(timeout: Duration) -> io::Result<bool> {
     let connection = dbus::blocking::Connection::new_session().map_err(dbus_error)?;
-    let unit = connection.with_proxy(SYSTEMD_DESTINATION, GAMMASTEP_PATH, DBUS_TIMEOUT);
+    let unit = connection.with_proxy(SYSTEMD_DESTINATION, GAMMASTEP_PATH, timeout);
     let active: String = unit.get(SYSTEMD_UNIT, "ActiveState").map_err(dbus_error)?;
     match active.as_str() {
         "active" | "activating" | "reloading" => Ok(true),
@@ -130,6 +148,22 @@ fn night_light_state() -> io::Result<bool> {
             io::ErrorKind::InvalidData,
             "night-light unit returned an unknown state",
         )),
+    }
+}
+
+fn ensure_active(control: &RunControl) -> io::Result<()> {
+    if control.is_cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "night-light probe was cancelled",
+        ))
+    } else if control.remaining().is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "night-light probe exceeded its deadline",
+        ))
+    } else {
+        Ok(())
     }
 }
 

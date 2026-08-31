@@ -155,11 +155,15 @@ impl<R: CommandRunner> DesktopProducer for CoreSystemProducer<R> {
                 biased;
                 _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
+                    let observation = context.begin_observation();
                     let Some(current) = self.probe_until_cancelled(&context).await else {
                         return Ok(());
                     };
                     if previous.as_ref() != Some(&current) {
-                        sender.send(DesktopDomainUpdate { state: current.clone() })
+                        let update = observation
+                            .finish(current.clone())
+                            .map_err(|error| ProducerError::new(error.to_string()))?;
+                        sender.send(update)
                             .await
                             .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                         previous = Some(current);
@@ -175,7 +179,7 @@ pub fn probe_domain<R: CommandRunner>(
     domain: DesktopDomainId,
 ) -> DesktopDomainState {
     let runner = DeadlineRunner::new(facade.runner(), PROBE_DEADLINE);
-    probe_domain_with_runner(facade, domain, runner)
+    probe_domain_with_runner(domain, runner)
 }
 
 fn probe_domain_controlled<R: CommandRunner>(
@@ -184,11 +188,10 @@ fn probe_domain_controlled<R: CommandRunner>(
     control: RunControl,
 ) -> DesktopDomainState {
     let runner = DeadlineRunner::controlled(facade.runner(), control);
-    probe_domain_with_runner(facade, domain, runner)
+    probe_domain_with_runner(domain, runner)
 }
 
 fn probe_domain_with_runner<R: CommandRunner>(
-    facade: &SystemFacade<R>,
     domain: DesktopDomainId,
     runner: DeadlineRunner<R>,
 ) -> DesktopDomainState {
@@ -203,10 +206,11 @@ fn probe_domain_with_runner<R: CommandRunner>(
             super::display::probe_brightness(&runner).map(DesktopDomainValue::Brightness)
         }
         DesktopDomainId::NightLight => {
-            super::display::probe_night_light().map(DesktopDomainValue::NightLight)
+            super::display::probe_night_light_controlled(&runner.control)
+                .map(DesktopDomainValue::NightLight)
         }
         DesktopDomainId::Power => super::power::probe(&runner).map(DesktopDomainValue::Power),
-        _ => return probe_legacy_domain(facade, domain),
+        _ => return probe_legacy_domain(&runner, domain),
     };
     match rich {
         Ok(value) => DesktopDomainState::available(domain, value).unwrap_or_else(|error| {
@@ -221,7 +225,7 @@ fn probe_domain_with_runner<R: CommandRunner>(
 }
 
 fn probe_legacy_domain<R: CommandRunner>(
-    facade: &SystemFacade<R>,
+    runner: &DeadlineRunner<R>,
     domain: DesktopDomainId,
 ) -> DesktopDomainState {
     let runtime_id = match domain {
@@ -232,7 +236,10 @@ fn probe_legacy_domain<R: CommandRunner>(
         DesktopDomainId::Battery => RuntimeCapabilityId::Battery,
         _ => unreachable!("constructor limits legacy core domains"),
     };
-    state_from_record(domain, facade.runtime_capability(runtime_id))
+    state_from_record(
+        domain,
+        SystemFacade::new(runner.clone()).runtime_capability(runtime_id),
+    )
 }
 
 fn availability_for_io(error: &io::Error) -> CapabilityAvailability {

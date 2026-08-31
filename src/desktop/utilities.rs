@@ -25,7 +25,7 @@ use super::{
     DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue, DesktopProducer,
     DesktopProducerContext, ProducerError,
 };
-use crate::system::{CommandSpec, ProcessCommandRunner};
+use crate::system::{CommandSpec, ProcessCommandRunner, RunControl};
 
 const LOGIN1_DESTINATION: &str = "org.freedesktop.login1";
 const LOGIN1_MANAGER_PATH: &str = "/org/freedesktop/login1";
@@ -214,15 +214,46 @@ impl ProductionUtilityService {
         }
     }
 
-    fn state_for_poll(&self, domain: DesktopDomainId) -> io::Result<DesktopDomainState> {
+    fn state_for_poll(
+        &self,
+        domain: DesktopDomainId,
+        control: &RunControl,
+    ) -> io::Result<DesktopDomainState> {
         let result = match domain {
+            DesktopDomainId::Tray => self
+                .tray
+                .probe_controlled(control)
+                .map(DesktopDomainValue::Tray),
+            DesktopDomainId::Clipboard => self
+                .clipboard_snapshot_controlled(control)
+                .map(DesktopDomainValue::Clipboard),
             DesktopDomainId::Recording => self
                 .recording_snapshot_for_poll()
                 .map(DesktopDomainValue::Recording),
             DesktopDomainId::IdleInhibit => self
-                .idle_snapshot_for_poll()
+                .idle_snapshot_for_poll(control)
                 .map(DesktopDomainValue::IdleInhibit),
-            _ => return Ok(self.state(domain)),
+            DesktopDomainId::GameMode => self
+                .game_mode_snapshot_controlled(control)
+                .map(DesktopDomainValue::GameMode),
+            DesktopDomainId::Screenshot | DesktopDomainId::ColorPicker => {
+                ensure_run_active(control, "utility polling")?;
+                let available = ensure_executable("sleepy-capture-helper");
+                ensure_run_active(control, "utility polling")?;
+                available.map(|()| {
+                    if domain == DesktopDomainId::Screenshot {
+                        DesktopDomainValue::Screenshot
+                    } else {
+                        DesktopDomainValue::ColorPicker
+                    }
+                })
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "utility service was assigned a non-utility domain",
+                ))
+            }
         };
         match result {
             Ok(value) => Ok(
@@ -290,12 +321,25 @@ impl ProductionUtilityService {
         self.clipboard_snapshot_with(&self.runner)
     }
 
+    fn clipboard_snapshot_controlled(
+        &self,
+        control: &RunControl,
+    ) -> io::Result<Vec<ClipboardEntry>> {
+        let list =
+            super::network::run_controlled(&self.runner, super::clipboard::list_spec(), control)?;
+        self.clipboard_entries(&list)
+    }
+
     fn clipboard_snapshot_with<R: crate::system::CommandRunner>(
         &self,
         runner: &R,
     ) -> io::Result<Vec<ClipboardEntry>> {
         let list = super::network::run(runner, super::clipboard::list_spec())?;
-        let rows = super::clipboard::parse_list(&list)?;
+        self.clipboard_entries(&list)
+    }
+
+    fn clipboard_entries(&self, list: &[u8]) -> io::Result<Vec<ClipboardEntry>> {
+        let rows = super::clipboard::parse_list(list)?;
         let mut entries = Vec::with_capacity(rows.len());
         for (id, preview) in rows {
             let stable_id = sleepy_sdk::StableId(format!("clipboard:{id}"));
@@ -486,7 +530,7 @@ impl ProductionUtilityService {
             .is_some())
     }
 
-    fn idle_snapshot_for_poll(&self) -> io::Result<bool> {
+    fn idle_snapshot_for_poll(&self, control: &RunControl) -> io::Result<bool> {
         let inhibited = self
             .idle_inhibitor
             .try_lock()
@@ -499,7 +543,7 @@ impl ProductionUtilityService {
                 }
             })?
             .is_some();
-        require_bus_name(true, LOGIN1_DESTINATION)?;
+        require_bus_name_controlled(true, LOGIN1_DESTINATION, control)?;
         Ok(inhibited)
     }
 
@@ -534,6 +578,15 @@ impl ProductionUtilityService {
 
     fn game_mode_snapshot(&self) -> io::Result<bool> {
         require_bus_name(false, GAME_MODE_DESTINATION)?;
+        self.game_mode
+            .lock()
+            .map(|state| *state)
+            .map_err(|_| io::Error::other("game mode lock poisoned"))
+    }
+
+    fn game_mode_snapshot_controlled(&self, control: &RunControl) -> io::Result<bool> {
+        require_bus_name_controlled(false, GAME_MODE_DESTINATION, control)?;
+        ensure_run_active(control, "game-mode polling")?;
         self.game_mode
             .lock()
             .map(|state| *state)
@@ -699,7 +752,7 @@ impl UtilityProducer {
                         "utility polling was cancelled",
                     ));
                 }
-                let state = service.state_for_poll(domain)?;
+                let state = service.state_for_poll(domain, &control)?;
                 if control.is_cancelled() {
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
@@ -755,11 +808,15 @@ impl DesktopProducer for UtilityProducer {
                 biased;
                 _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
+                    let observation = context.begin_observation();
                     let Some(current) = self.polling_probe(&context).await else {
                         continue;
                     };
                     if previous.as_ref() != Some(&current) {
-                        sender.send(DesktopDomainUpdate { state: current.clone() })
+                        let update = observation
+                            .finish(current.clone())
+                            .map_err(|error| ProducerError::new(error.to_string()))?;
+                        sender.send(update)
                             .await
                             .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                         previous = Some(current);
@@ -945,17 +1002,30 @@ fn ensure_executable(program: &str) -> io::Result<()> {
 }
 
 fn require_bus_name(system: bool, name: &str) -> io::Result<()> {
+    require_bus_name_until(system, name, Duration::from_secs(2))
+}
+
+fn require_bus_name_controlled(system: bool, name: &str, control: &RunControl) -> io::Result<()> {
+    ensure_run_active(control, "D-Bus availability probe")?;
+    let timeout = control.remaining().min(Duration::from_secs(2));
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "D-Bus availability probe exceeded its deadline",
+        ));
+    }
+    require_bus_name_until(system, name, timeout)?;
+    ensure_run_active(control, "D-Bus availability probe")
+}
+
+fn require_bus_name_until(system: bool, name: &str, timeout: Duration) -> io::Result<()> {
     let connection = if system {
         dbus::blocking::Connection::new_system()
     } else {
         dbus::blocking::Connection::new_session()
     }
     .map_err(dbus_error)?;
-    let proxy = connection.with_proxy(
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        Duration::from_secs(2),
-    );
+    let proxy = connection.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", timeout);
     let (owned,): (bool,) = proxy
         .method_call("org.freedesktop.DBus", "NameHasOwner", (name,))
         .map_err(dbus_error)?;
@@ -966,6 +1036,22 @@ fn require_bus_name(system: bool, name: &str) -> io::Result<()> {
             io::ErrorKind::NotFound,
             "required D-Bus service is unavailable",
         ))
+    }
+}
+
+fn ensure_run_active(control: &RunControl, operation: &str) -> io::Result<()> {
+    if control.is_cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!("{operation} was cancelled"),
+        ))
+    } else if control.remaining().is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{operation} exceeded its deadline"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1003,7 +1089,29 @@ pub struct ProductionLogind;
 
 impl ProductionLogind {
     pub fn state(self) -> io::Result<DesktopDomainState> {
-        let deadline = Instant::now() + LOGIND_STATE_TIMEOUT;
+        self.state_until(Instant::now() + LOGIND_STATE_TIMEOUT, None)
+    }
+
+    fn state_controlled(self, control: &RunControl) -> io::Result<DesktopDomainState> {
+        ensure_run_active(control, "logind polling")?;
+        let remaining = control.remaining().min(LOGIND_STATE_TIMEOUT);
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "logind polling exceeded its deadline",
+            ));
+        }
+        self.state_until(Instant::now() + remaining, Some(control))
+    }
+
+    fn state_until(
+        self,
+        deadline: Instant,
+        control: Option<&RunControl>,
+    ) -> io::Result<DesktopDomainState> {
+        if let Some(control) = control {
+            ensure_run_active(control, "logind polling")?;
+        }
         let connection = dbus::blocking::Connection::new_system().map_err(dbus_error)?;
         let manager = connection.with_proxy(
             LOGIN1_DESTINATION,
@@ -1014,10 +1122,16 @@ impl ProductionLogind {
         let (session_path,): (dbus::Path<'static>,) = manager
             .method_call(LOGIN1_MANAGER, "GetSession", (session_id,))
             .map_err(dbus_error)?;
+        if let Some(control) = control {
+            ensure_run_active(control, "logind polling")?;
+        }
         let session = connection.with_proxy(LOGIN1_DESTINATION, session_path, remaining(deadline)?);
         let locked: bool = session
             .get(LOGIN1_SESSION, "LockedHint")
             .map_err(dbus_error)?;
+        if let Some(control) = control {
+            ensure_run_active(control, "logind polling")?;
+        }
         DesktopDomainState::available(
             DesktopDomainId::Lock,
             DesktopDomainValue::Lock(LockState { secure: locked }),
@@ -1119,8 +1233,8 @@ impl LogindProducer {
         let result = match context {
             Some(context) => {
                 context
-                    .spawn_blocking(Instant::now() + LOGIND_STATE_TIMEOUT, |_control| {
-                        ProductionLogind.state()
+                    .spawn_blocking(Instant::now() + LOGIND_STATE_TIMEOUT, |control| {
+                        ProductionLogind.state_controlled(&control)
                     })
                     .await
             }
@@ -1166,9 +1280,13 @@ impl DesktopProducer for LogindProducer {
                 biased;
                 _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
+                    let observation = context.begin_observation();
                     let current = self.probe(Some(&context)).await;
                     if previous.as_ref() != Some(&current) {
-                        sender.send(DesktopDomainUpdate { state: current.clone() })
+                        let update = observation
+                            .finish(current.clone())
+                            .map_err(|error| ProducerError::new(error.to_string()))?;
+                        sender.send(update)
                             .await
                             .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                         previous = Some(current);
@@ -1310,7 +1428,10 @@ mod tests {
         let _held_mutation = service.idle_inhibitor.lock().unwrap();
 
         assert_eq!(
-            service.idle_snapshot_for_poll().unwrap_err().kind(),
+            service
+                .idle_snapshot_for_poll(&RunControl::for_timeout(Duration::from_secs(1)))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::WouldBlock
         );
     }
@@ -1333,9 +1454,11 @@ mod tests {
         held_observed.recv_timeout(Duration::from_secs(1)).unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let context = DesktopProducerContext::new(
+        let context = DesktopProducerContext::for_domain(
             cancellation.clone(),
             Arc::new(super::super::BlockingTaskTracker::default()),
+            DesktopDomainId::Recording,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
         let task = tokio::spawn(async move { producer.run(sender, context).await });
 

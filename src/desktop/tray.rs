@@ -15,6 +15,8 @@ use dbus::{
 };
 use sleepy_sdk::{StableId, TrayItem, TrayMenuNode};
 
+use crate::system::RunControl;
+
 const WATCHER_DESTINATION: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const WATCHER_INTERFACE: &str = "org.kde.StatusNotifierWatcher";
@@ -56,10 +58,27 @@ pub struct TrayService {
 
 impl TrayService {
     pub fn probe(&self) -> io::Result<Vec<TrayItem>> {
-        self.probe_until(Instant::now() + OPERATION_TIMEOUT)
+        self.probe_until(Instant::now() + OPERATION_TIMEOUT, None)
     }
 
-    fn probe_until(&self, deadline: Instant) -> io::Result<Vec<TrayItem>> {
+    pub fn probe_controlled(&self, control: &RunControl) -> io::Result<Vec<TrayItem>> {
+        ensure_active(Some(control))?;
+        let remaining = control.remaining().min(OPERATION_TIMEOUT);
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tray probe exceeded its deadline",
+            ));
+        }
+        self.probe_until(Instant::now() + remaining, Some(control))
+    }
+
+    fn probe_until(
+        &self,
+        deadline: Instant,
+        control: Option<&RunControl>,
+    ) -> io::Result<Vec<TrayItem>> {
+        ensure_active(control)?;
         let connection = dbus::blocking::Connection::new_session().map_err(dbus_error)?;
         let watcher =
             connection.with_proxy(WATCHER_DESTINATION, WATCHER_PATH, remaining(deadline)?);
@@ -72,6 +91,7 @@ impl TrayService {
         let mut targets = BTreeMap::new();
         let mut items = Vec::with_capacity(registrations.len());
         for registration in registrations {
+            ensure_active(control)?;
             let (service, path) = split_registration(&registration)?;
             let proxy = connection.with_proxy(service, path, remaining(deadline)?);
             let title: String = proxy
@@ -84,7 +104,7 @@ impl TrayService {
             let hash = stable_hash(service.as_bytes(), path.as_bytes());
             let id = format!("tray:{hash:016x}");
             let (menu, actions) =
-                match menu_for_item(&connection, service, path, hash, &title, deadline) {
+                match menu_for_item(&connection, service, path, hash, &title, deadline, control) {
                     Ok(menu) => menu,
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         fallback_menu(hash, &title)
@@ -110,6 +130,7 @@ impl TrayService {
                 menu,
             });
         }
+        ensure_active(control)?;
         *self
             .targets
             .lock()
@@ -148,7 +169,7 @@ impl TrayService {
                 }
                 Ok(())
             },
-            || self.probe_until(deadline),
+            || self.probe_until(deadline, None),
         )
     }
 
@@ -196,7 +217,9 @@ fn menu_for_item(
     hash: u64,
     title: &str,
     deadline: Instant,
+    control: Option<&RunControl>,
 ) -> io::Result<(TrayMenuNode, BTreeMap<String, MenuAction>)> {
+    ensure_active(control)?;
     let item = connection.with_proxy(service, item_path, remaining(deadline)?);
     let menu_path: dbus::Path<'static> = item.get(ITEM_INTERFACE, "Menu").map_err(dbus_error)?;
     if menu_path == "/NO_DBUSMENU" {
@@ -211,6 +234,7 @@ fn menu_for_item(
             (0_i32, -1_i32, Vec::<String>::new()),
         )
         .map_err(dbus_error)?;
+    ensure_active(control)?;
     let mut actions = BTreeMap::new();
     let mut count = 1_usize;
     let children = parse_children(&layout.2, hash, &menu_path, &mut actions, &mut count, 0)?;
@@ -225,6 +249,20 @@ fn menu_for_item(
         },
         actions,
     ))
+}
+
+fn ensure_active(control: Option<&RunControl>) -> io::Result<()> {
+    match control {
+        Some(control) if control.is_cancelled() => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "tray probe was cancelled",
+        )),
+        Some(control) if control.remaining().is_zero() => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "tray probe exceeded its deadline",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn parse_children(

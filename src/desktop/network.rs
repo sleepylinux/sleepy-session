@@ -268,7 +268,21 @@ fn bounded(program: &str, args: Vec<String>) -> CommandSpec {
 }
 
 pub(crate) fn run<R: CommandRunner>(runner: &R, spec: CommandSpec) -> io::Result<Vec<u8>> {
-    match runner.run(&spec) {
+    command_output(runner.run(&spec))
+}
+
+pub(crate) fn run_controlled<R: CommandRunner>(
+    runner: &R,
+    spec: CommandSpec,
+    control: &crate::system::RunControl,
+) -> io::Result<Vec<u8>> {
+    command_output(runner.run_controlled(&spec, control))
+}
+
+fn command_output(
+    result: Result<crate::system::CommandOutput, crate::system::RunnerError>,
+) -> io::Result<Vec<u8>> {
+    match result {
         Ok(output) if output.status == 0 => Ok(output.stdout),
         Ok(_) => Err(io::Error::other("desktop adapter command failed")),
         Err(error) => Err(io::Error::new(

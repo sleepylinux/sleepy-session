@@ -127,7 +127,11 @@ impl DesktopProducer for HyprlandProducer {
                     let Some(_event) = event else {
                         return Err(ProducerError::new("Hyprland event stream closed"));
                     };
-                    sender.send(DesktopDomainUpdate { state: self.snapshot().await })
+                    let observation = context.begin_observation();
+                    let update = observation
+                        .finish(self.snapshot().await)
+                        .map_err(|error| ProducerError::new(error.to_string()))?;
+                    sender.send(update)
                         .await
                         .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                 }
@@ -373,7 +377,11 @@ impl DesktopProducer for OsdProducer {
                 _ = context.cancelled() => return Ok(()),
                 publication = subscriber.recv() => {
                     let publication = publication.map_err(|error| ProducerError::new(error.to_string()))?;
-                    sender.send(DesktopDomainUpdate { state: osd_state(publication.visible) })
+                    let update = context
+                        .begin_observation()
+                        .finish(osd_state(publication.visible))
+                        .map_err(|error| ProducerError::new(error.to_string()))?;
+                    sender.send(update)
                         .await
                         .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                 }
@@ -435,11 +443,15 @@ async fn poll_updates<P: PollingState + Sync>(
             biased;
             _ = context.cancelled() => return Ok(()),
             _ = interval.tick() => {
+                let observation = context.begin_observation();
                 let Some(current) = producer.polling_snapshot(&context).await else {
                     continue;
                 };
                 if previous.as_ref() != Some(&current) {
-                    sender.send(DesktopDomainUpdate { state: current.clone() })
+                    let update = observation
+                        .finish(current.clone())
+                        .map_err(|error| ProducerError::new(error.to_string()))?;
+                    sender.send(update)
                         .await
                         .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                     previous = Some(current);

@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
@@ -16,10 +18,10 @@ use sleepy_sdk::{
     validate_desktop_envelope, validate_desktop_result, AppearanceCommand, AudioCommand,
     BluetoothCommand, CapabilityAvailability, CapabilityFailure, CapabilityRecord, CapabilityValue,
     DesktopCommand, DesktopDomainUpdate as SdkDomainUpdate, DesktopEnvelope, DesktopEvent,
-    DesktopRequest, DesktopResultStatus, DesktopSessionCommand, DesktopSystemUpdate, EventCause,
-    EventCauseKind, LockState, MediaCommand, MediaTransport, NetworkAccessPoint, NetworkCommand,
-    NetworkRuntimeState, NetworkSnapshot, RuntimeCapabilityId, StableId, UtilityCommand,
-    DESKTOP_WIRE_VERSION,
+    DesktopRequest, DesktopResultStatus, DesktopSessionCommand, DesktopSystemUpdate,
+    DesktopUtilityUpdate, EventCause, EventCauseKind, LockState, MediaCommand, MediaTransport,
+    NetworkAccessPoint, NetworkCommand, NetworkRuntimeState, NetworkSnapshot, RuntimeCapabilityId,
+    StableId, UtilityCommand, DESKTOP_WIRE_VERSION,
 };
 use sleepy_session::desktop::adapters::AppearanceProducer;
 use sleepy_session::desktop::core::{state_from_record, CoreSystemProducer};
@@ -28,6 +30,7 @@ use sleepy_session::desktop::secret_agent::{
     NetworkSecretExchange, SecretBroker, SecretRequestLease, SecretSocket, SecretZeroizeObserver,
     MAX_SECRET_FRAME,
 };
+use sleepy_session::desktop::utilities::{ProductionUtilityService, UtilityProducer};
 use sleepy_session::desktop::{audio, bluetooth, display, media, network, power};
 use sleepy_session::desktop::{
     DesktopControlAuthority, DesktopDomainId, DesktopDomainState, DesktopDomainValue,
@@ -77,6 +80,14 @@ struct RegisteredBlockingProducer {
     started: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     test_release: Arc<AtomicBool>,
+}
+
+struct IdleReadbackExecutor;
+
+struct PausedIdleObservationProducer {
+    sampled: Arc<AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+    enqueued: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -200,13 +211,10 @@ impl DesktopProducer for SingleUpdateProducer {
         cancellation: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         sender
-            .send(sleepy_session::desktop::DesktopDomainUpdate {
-                state: DesktopDomainState::available(
-                    self.domain,
-                    DesktopDomainValue::empty(self.domain),
-                )
-                .unwrap(),
-            })
+            .send(sleepy_session::desktop::DesktopDomainUpdate::unversioned(
+                DesktopDomainState::available(self.domain, DesktopDomainValue::empty(self.domain))
+                    .unwrap(),
+            ))
             .await
             .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
         self.update_sent.store(true, Ordering::SeqCst);
@@ -245,6 +253,64 @@ impl DesktopProducer for RegisteredBlockingProducer {
     }
 }
 
+#[async_trait]
+impl DesktopProducer for PausedIdleObservationProducer {
+    fn domain(&self) -> DesktopDomainId {
+        DesktopDomainId::IdleInhibit
+    }
+
+    async fn initial(&self) -> DesktopDomainState {
+        DesktopDomainState::available(
+            DesktopDomainId::IdleInhibit,
+            DesktopDomainValue::IdleInhibit(false),
+        )
+        .unwrap()
+    }
+
+    async fn run(
+        &self,
+        sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
+        context: DesktopProducerContext,
+    ) -> Result<(), ProducerError> {
+        let observation = context.begin_observation();
+        self.sampled.store(true, Ordering::SeqCst);
+        self.release.notified().await;
+        sender
+            .send(
+                observation
+                    .finish(
+                        DesktopDomainState::available(
+                            DesktopDomainId::IdleInhibit,
+                            DesktopDomainValue::IdleInhibit(false),
+                        )
+                        .unwrap(),
+                    )
+                    .map_err(|error| ProducerError::new(error.to_string()))?,
+            )
+            .await
+            .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
+        self.enqueued.store(true, Ordering::SeqCst);
+        context.cancelled().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DesktopMutationExecutor for IdleReadbackExecutor {
+    async fn execute(
+        &self,
+        _request: &DesktopRequest,
+    ) -> Result<DesktopMutationOutcome, ProducerError> {
+        Ok(DesktopMutationOutcome::Confirmed(vec![
+            DesktopDomainState::available(
+                DesktopDomainId::IdleInhibit,
+                DesktopDomainValue::IdleInhibit(true),
+            )
+            .unwrap(),
+        ]))
+    }
+}
+
 #[derive(Clone)]
 struct BlockingProcessRunner {
     pid_path: Arc<PathBuf>,
@@ -252,6 +318,12 @@ struct BlockingProcessRunner {
 
 #[derive(Clone)]
 struct DescendantPipeRunner {
+    parent_pid_path: Arc<PathBuf>,
+    descendant_pid_path: Arc<PathBuf>,
+}
+
+#[derive(Clone)]
+struct EscapedDescendantRunner {
     parent_pid_path: Arc<PathBuf>,
     descendant_pid_path: Arc<PathBuf>,
 }
@@ -297,6 +369,32 @@ impl CommandRunner for DescendantPipeRunner {
                 "printf '%s' \"$$\" > \"$1\"; sleep 30 & printf '%s' \"$!\" > \"$2\"; wait"
                     .to_owned(),
                 "sleepy-producer-descendant-test".to_owned(),
+                self.parent_pid_path.to_string_lossy().into_owned(),
+                self.descendant_pid_path.to_string_lossy().into_owned(),
+            ],
+        );
+        command.timeout = Duration::from_secs(30);
+        ProcessCommandRunner.run_controlled(&command, control)
+    }
+}
+
+impl CommandRunner for EscapedDescendantRunner {
+    fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+        self.run_controlled(command, &RunControl::for_timeout(Duration::from_secs(30)))
+    }
+
+    fn run_controlled(
+        &self,
+        _command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        let mut command = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                "printf '%s' \"$$\" > \"$1\"; setsid sh -c 'printf \"%s\" \"$$\" > \"$1\"; exec /bin/sleep 30' sleepy-escaped \"$2\" & wait"
+                    .to_owned(),
+                "sleepy-producer-escaped-descendant-test".to_owned(),
                 self.parent_pid_path.to_string_lossy().into_owned(),
                 self.descendant_pid_path.to_string_lossy().into_owned(),
             ],
@@ -1712,6 +1810,270 @@ async fn process_cancellation_kills_the_pipe_owning_group_and_reaps_descendant_o
     );
     assert!(shutdown.is_ok(), "shutdown hung on descendant-held pipes");
     assert!(shutdown.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn process_cancellation_reaps_an_escaped_descendant_without_reaping_unrelated_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent_pid_path = Arc::new(temp.path().join("producer-parent.pid"));
+    let descendant_pid_path = Arc::new(temp.path().join("producer-escaped.pid"));
+    let core = Arc::new(
+        CoreSystemProducer::new(
+            DesktopDomainId::Network,
+            Arc::new(SystemFacade::new(EscapedDescendantRunner {
+                parent_pid_path: Arc::clone(&parent_pid_path),
+                descendant_pid_path: Arc::clone(&descendant_pid_path),
+            })),
+        )
+        .unwrap(),
+    ) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Network,
+            core,
+        ))))
+        .unwrap(),
+    );
+    let authority =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let runtime = registry.start(authority, 16).unwrap();
+    let child_start_deadline = Instant::now() + Duration::from_secs(3);
+    while !parent_pid_path.exists() || !descendant_pid_path.exists() {
+        assert!(
+            Instant::now() < child_start_deadline,
+            "escaped process tree did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let parent_pid = fs::read_to_string(parent_pid_path.as_ref())
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let descendant_pid = fs::read_to_string(descendant_pid_path.as_ref())
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let mut unrelated = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("unrelated daemon child should start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let shutdown = tokio::time::timeout(
+        Duration::from_millis(500),
+        runtime.shutdown(Duration::from_millis(100)),
+    )
+    .await;
+    let parent_alive = unsafe { libc::kill(parent_pid, 0) } == 0;
+    let descendant_alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
+    if descendant_alive {
+        unsafe {
+            libc::kill(descendant_pid, libc::SIGKILL);
+        }
+    }
+    let unrelated_status = unrelated
+        .wait()
+        .expect("runner reaped an unrelated daemon child");
+
+    assert!(!parent_alive, "direct command child was not reaped");
+    assert!(
+        !descendant_alive,
+        "session-escaped command descendant survived cancellation"
+    );
+    assert!(unrelated_status.success());
+    assert!(shutdown.is_ok(), "shutdown exceeded its ownership bound");
+    assert!(shutdown.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn idle_poll_sampled_before_a_confirmed_mutation_cannot_publish_after_it() {
+    let sampled = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let enqueued = Arc::new(AtomicBool::new(false));
+    let idle = Arc::new(PausedIdleObservationProducer {
+        sampled: Arc::clone(&sampled),
+        release: Arc::clone(&release),
+        enqueued: Arc::clone(&enqueued),
+    }) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::IdleInhibit,
+            idle,
+        ))))
+        .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let authority =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let control = DesktopControlAuthority::open(
+        Arc::clone(&authority),
+        Arc::new(IdleReadbackExecutor),
+        temp.path().join("dedupe.json"),
+        8,
+    )
+    .await
+    .unwrap();
+    let mut events = authority.subscribe().await.unwrap();
+    events.recv().await.unwrap();
+    let runtime = registry.start(Arc::clone(&authority), 16).unwrap();
+    let sample_deadline = Instant::now() + Duration::from_secs(1);
+    while !sampled.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < sample_deadline,
+            "idle poll did not reach the paused availability seam"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let request = DesktopRequest {
+        schema_version: DESKTOP_WIRE_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000100".into(),
+        expected_generation: authority.current_generation(),
+        command: DesktopCommand::Utility(UtilityCommand::SetIdleInhibited { enabled: true }),
+    };
+    let result = control
+        .handle_json(&serde_json::to_string(&request).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result.status, DesktopResultStatus::Succeeded);
+    let readback = events.recv().await.unwrap();
+    assert!(matches!(
+        readback.payload,
+        DesktopEvent::DomainUpdate(SdkDomainUpdate::Utilities(
+            DesktopUtilityUpdate::IdleInhibited(ref state)
+        )) if state.data == Some(true)
+    ));
+    assert!(matches!(
+        events.recv().await.unwrap().payload,
+        DesktopEvent::CommandResult(_)
+    ));
+
+    release.notify_one();
+    let enqueue_deadline = Instant::now() + Duration::from_secs(1);
+    while !enqueued.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < enqueue_deadline,
+            "older idle observation was not enqueued"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err(),
+        "older idle observation published after the confirmed mutation"
+    );
+    assert_eq!(authority.current_generation(), result.generation);
+    runtime.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[test]
+fn real_clipboard_hanging_child_is_cancelled_and_reaped_before_runtime_shutdown_returns() {
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let cliphist = bin.join("cliphist");
+    fs::write(
+        &cliphist,
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$SLEEPY_TEST_CLIPHIST_PID\"\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cliphist, fs::Permissions::from_mode(0o700)).unwrap();
+    let pid_path = temp.path().join("cliphist.pid");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "clipboard_runtime_shutdown_helper",
+            "--nocapture",
+        ])
+        .env("PATH", &bin)
+        .env("SLEEPY_TEST_CLIPHIST_PID", &pid_path)
+        .output()
+        .unwrap();
+    if let Ok(pid) = fs::read_to_string(&pid_path)
+        .and_then(|value| value.parse::<libc::pid_t>().map_err(io::Error::other))
+    {
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    assert!(
+        output.status.success(),
+        "clipboard shutdown helper failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn clipboard_runtime_shutdown_helper() {
+    let Some(pid_path) = std::env::var_os("SLEEPY_TEST_CLIPHIST_PID") else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let temp = tempfile::tempdir().unwrap();
+        let service = Arc::new(
+            ProductionUtilityService::open(temp.path().join("captures"))
+                .expect("production utility service should open"),
+        );
+        let clipboard = Arc::new(
+            UtilityProducer::new(DesktopDomainId::Clipboard, service)
+                .expect("clipboard producer should construct"),
+        ) as Arc<dyn DesktopProducer>;
+        let registry = Arc::new(
+            DesktopRegistry::new(complete_registry_with(Some((
+                DesktopDomainId::Clipboard,
+                clipboard,
+            ))))
+            .unwrap(),
+        );
+        let authority =
+            DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+                .await
+                .unwrap();
+        authority.initialize().await.unwrap();
+        let producer_runtime = registry.start(authority, 16).unwrap();
+        let start_deadline = Instant::now() + Duration::from_secs(4);
+        while !PathBuf::from(&pid_path).exists() {
+            assert!(
+                Instant::now() < start_deadline,
+                "real clipboard child did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let pid = fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+
+        let started = Instant::now();
+        let shutdown = tokio::time::timeout(
+            Duration::from_millis(4_250),
+            producer_runtime.shutdown(Duration::from_secs(4)),
+        )
+        .await
+        .expect("clipboard runtime exceeded its one shutdown deadline plus tolerance");
+
+        assert!(
+            shutdown.is_ok(),
+            "production clipboard worker did not drain"
+        );
+        assert!(started.elapsed() < Duration::from_millis(4_150));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    });
 }
 
 #[tokio::test]

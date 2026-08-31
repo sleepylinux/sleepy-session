@@ -75,13 +75,13 @@ impl GenerationAllocator {
 
     pub(crate) fn next_generation_while(
         &mut self,
-        mut cancelled: impl FnMut() -> bool,
+        cancelled: impl Fn() -> bool,
     ) -> io::Result<u64> {
-        ensure_not_cancelled(&mut cancelled)?;
+        ensure_not_cancelled(&cancelled)?;
         if self.next == self.end {
-            self.reserve_block_while(&mut cancelled)?;
+            self.reserve_block_while(&cancelled)?;
         }
-        ensure_not_cancelled(&mut cancelled)?;
+        ensure_not_cancelled(&cancelled)?;
         let generation = self.next;
         self.next = self
             .next
@@ -103,10 +103,10 @@ impl GenerationAllocator {
     }
 
     fn reserve_block(&mut self) -> io::Result<()> {
-        self.reserve_block_while(&mut || false)
+        self.reserve_block_while(&|| false)
     }
 
-    fn reserve_block_while(&mut self, cancelled: &mut impl FnMut() -> bool) -> io::Result<()> {
+    fn reserve_block_while(&mut self, cancelled: &impl Fn() -> bool) -> io::Result<()> {
         let lock = self
             .directory
             .open_lock(&self.lock_name)
@@ -132,11 +132,13 @@ impl GenerationAllocator {
             .checked_add(self.block_size)
             .ok_or_else(|| io::Error::other("generation range exhausted"))?;
         ensure_not_cancelled(cancelled)?;
-        atomic_write(
+        atomic_write_while(
             &self.directory,
             &self.state_name,
             format!("{end}\n").as_bytes(),
+            cancelled,
         )?;
+        ensure_not_cancelled(cancelled)?;
         FileExt::unlock(&lock)?;
 
         self.next = start;
@@ -145,7 +147,7 @@ impl GenerationAllocator {
     }
 }
 
-fn ensure_not_cancelled(cancelled: &mut impl FnMut() -> bool) -> io::Result<()> {
+fn ensure_not_cancelled(cancelled: &impl Fn() -> bool) -> io::Result<()> {
     if cancelled() {
         Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -194,10 +196,30 @@ fn read_next(directory: &SecureDir, name: &OsStr) -> io::Result<u64> {
     }
 }
 
-fn atomic_write(directory: &SecureDir, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+fn atomic_write_while(
+    directory: &SecureDir,
+    name: &OsStr,
+    bytes: &[u8],
+    cancelled: &impl Fn() -> bool,
+) -> io::Result<()> {
     directory
-        .atomic_replace(name, bytes, || Ok(()), || Ok(()), || Ok(()))
-        .map_err(store_error)
+        .atomic_replace(
+            name,
+            bytes,
+            || ensure_not_cancelled(cancelled).map_err(StoreError::io),
+            || ensure_not_cancelled(cancelled).map_err(StoreError::io),
+            || ensure_not_cancelled(cancelled).map_err(StoreError::io),
+        )
+        .map_err(|error| {
+            if cancelled() {
+                io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "generation allocation was cancelled",
+                )
+            } else {
+                store_error(error)
+            }
+        })
 }
 
 fn store_error(error: StoreError) -> io::Error {
@@ -207,4 +229,30 @@ fn store_error(error: StoreError) -> io::Error {
         io::ErrorKind::Other
     };
     io::Error::new(kind, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn controlled_reservation_cancels_after_file_sync_without_committing_a_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("generation");
+        let mut allocator = GenerationAllocator::open(&path, 1).unwrap();
+        assert_eq!(allocator.next_generation().unwrap(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"2\n");
+        let checks = AtomicUsize::new(0);
+
+        let error = allocator
+            .next_generation_while(|| checks.fetch_add(1, Ordering::SeqCst) >= 4)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read(&path).unwrap(), b"2\n");
+        assert_eq!(allocator.next_generation().unwrap(), 2);
+        assert_eq!(std::fs::read(&path).unwrap(), b"3\n");
+    }
 }

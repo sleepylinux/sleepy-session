@@ -313,6 +313,36 @@ impl DesktopDomainState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesktopDomainUpdate {
     pub state: DesktopDomainState,
+    observation_revision: Option<u64>,
+}
+
+impl DesktopDomainUpdate {
+    pub fn unversioned(state: DesktopDomainState) -> Self {
+        Self {
+            state,
+            observation_revision: None,
+        }
+    }
+}
+
+pub struct DesktopObservation {
+    domain: DesktopDomainId,
+    revision: u64,
+}
+
+impl DesktopObservation {
+    pub fn finish(self, state: DesktopDomainState) -> io::Result<DesktopDomainUpdate> {
+        if state.domain() != self.domain {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "desktop observation belongs to a different producer",
+            ));
+        }
+        Ok(DesktopDomainUpdate {
+            state,
+            observation_revision: Some(self.revision),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +382,8 @@ pub struct DesktopProducerContext {
     cancellation: CancellationToken,
     blocking_cancelled: Arc<AtomicBool>,
     blocking_tasks: Arc<BlockingTaskTracker>,
+    observation_domain: Option<DesktopDomainId>,
+    observation_revision: Option<Arc<AtomicU64>>,
 }
 
 impl DesktopProducerContext {
@@ -360,6 +392,23 @@ impl DesktopProducerContext {
             cancellation,
             blocking_cancelled: Arc::new(AtomicBool::new(false)),
             blocking_tasks,
+            observation_domain: None,
+            observation_revision: None,
+        }
+    }
+
+    fn for_domain(
+        cancellation: CancellationToken,
+        blocking_tasks: Arc<BlockingTaskTracker>,
+        domain: DesktopDomainId,
+        observation_revision: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            cancellation,
+            blocking_cancelled: Arc::new(AtomicBool::new(false)),
+            blocking_tasks,
+            observation_domain: Some(domain),
+            observation_revision: Some(observation_revision),
         }
     }
 
@@ -369,6 +418,19 @@ impl DesktopProducerContext {
 
     pub fn is_cancelled(&self) -> bool {
         self.blocking_cancelled.load(Ordering::SeqCst) || self.cancellation.is_cancelled()
+    }
+
+    pub fn begin_observation(&self) -> DesktopObservation {
+        DesktopObservation {
+            domain: self
+                .observation_domain
+                .expect("producer runtime contexts carry an observation domain"),
+            revision: self
+                .observation_revision
+                .as_ref()
+                .expect("producer runtime contexts carry an observation revision")
+                .load(Ordering::SeqCst),
+        }
     }
 
     pub fn spawn_blocking<F, T>(
@@ -454,6 +516,12 @@ impl BlockingTaskTracker {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
+
+    async fn drain(&self) {
+        while !self.is_idle() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 }
 
 pub struct DesktopRegistry {
@@ -497,6 +565,8 @@ impl ActiveAttemptSlot {
         &self,
         parent: &CancellationToken,
         blocking_tasks: Arc<BlockingTaskTracker>,
+        domain: DesktopDomainId,
+        observation_revision: Arc<AtomicU64>,
         spawn: impl FnOnce(DesktopProducerContext) -> tokio::task::JoinHandle<T>,
     ) -> Option<(u64, tokio::task::JoinHandle<T>)>
     where
@@ -510,7 +580,12 @@ impl ActiveAttemptSlot {
             return None;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let context = DesktopProducerContext::new(parent.child_token(), blocking_tasks);
+        let context = DesktopProducerContext::for_domain(
+            parent.child_token(),
+            blocking_tasks,
+            domain,
+            observation_revision,
+        );
         let attempt = spawn(context.clone());
         *active = Some(ActiveAttempt {
             id,
@@ -566,6 +641,7 @@ pub struct DesktopStateAuthority {
     initialization: Mutex<()>,
     initialized: Notify,
     events: broadcast::Sender<DesktopEnvelope>,
+    observation_revisions: Arc<BTreeMap<DesktopDomainId, Arc<AtomicU64>>>,
 }
 
 struct DesktopAuthorityTransaction {
@@ -842,6 +918,12 @@ impl DesktopStateAuthority {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "desktop.initialization-timeout"))?
         .map_err(join_error)??;
         let (events, _) = broadcast::channel(event_capacity);
+        let observation_revisions = Arc::new(
+            DesktopDomainId::ALL
+                .into_iter()
+                .map(|domain| (domain, Arc::new(AtomicU64::new(0))))
+                .collect(),
+        );
         Ok(Arc::new(Self {
             registry,
             transaction: Arc::new(StdMutex::new(DesktopAuthorityTransaction {
@@ -854,6 +936,7 @@ impl DesktopStateAuthority {
             initialization: Mutex::new(()),
             initialized: Notify::new(),
             events,
+            observation_revisions,
         }))
     }
 
@@ -978,8 +1061,18 @@ impl DesktopStateAuthority {
         let transaction = Arc::clone(&self.transaction);
         let registry = Arc::clone(&self.registry);
         let events = self.events.clone();
+        let observation_revisions = Arc::clone(&self.observation_revisions);
         tokio::task::spawn_blocking(move || {
-            publish_domain_transaction(transaction, registry, events, update, cause, None)
+            publish_domain_transaction(
+                transaction,
+                registry,
+                events,
+                observation_revisions,
+                DesktopDomainUpdate::unversioned(update),
+                cause,
+                None,
+            )?
+            .ok_or_else(|| io::Error::other("unversioned desktop publication was discarded"))
         })
         .await
         .map_err(join_error)?
@@ -987,19 +1080,21 @@ impl DesktopStateAuthority {
 
     async fn publish_domain_controlled(
         &self,
-        update: DesktopDomainState,
+        update: DesktopDomainUpdate,
         cause: EventCause,
         context: &DesktopProducerContext,
-    ) -> io::Result<DesktopEnvelope> {
+    ) -> io::Result<Option<DesktopEnvelope>> {
         let transaction = Arc::clone(&self.transaction);
         let registry = Arc::clone(&self.registry);
         let events = self.events.clone();
+        let observation_revisions = Arc::clone(&self.observation_revisions);
         context
             .spawn_blocking(StdInstant::now() + INITIAL_DEADLINE, move |control| {
                 publish_domain_transaction(
                     transaction,
                     registry,
                     events,
+                    observation_revisions,
                     update,
                     cause,
                     Some(&control),
@@ -1091,10 +1186,11 @@ fn publish_domain_transaction(
     transaction: Arc<StdMutex<DesktopAuthorityTransaction>>,
     registry: Arc<DesktopRegistry>,
     events: broadcast::Sender<DesktopEnvelope>,
-    update: DesktopDomainState,
+    observation_revisions: Arc<BTreeMap<DesktopDomainId, Arc<AtomicU64>>>,
+    update: DesktopDomainUpdate,
     cause: EventCause,
     control: Option<&crate::system::RunControl>,
-) -> io::Result<DesktopEnvelope> {
+) -> io::Result<Option<DesktopEnvelope>> {
     ensure_publication_active(control)?;
     let mut transaction = lock_publication_transaction(&transaction, control)?;
     ensure_publication_active(control)?;
@@ -1104,9 +1200,18 @@ fn publish_domain_transaction(
             "desktop authority has not initialized",
         )
     })?;
-    let domain = update.domain();
+    let domain = update.state.domain();
+    let observation_revision = observation_revisions
+        .get(&domain)
+        .expect("registry domains have observation revisions");
+    if update
+        .observation_revision
+        .is_some_and(|expected| expected != observation_revision.load(Ordering::SeqCst))
+    {
+        return Ok(None);
+    }
     let mut staged = current.clone();
-    staged.insert(domain, update);
+    staged.insert(domain, update.state);
     let snapshot = match registry.assemble(&staged) {
         Ok(snapshot) => snapshot,
         Err(_) => {
@@ -1125,10 +1230,11 @@ fn publish_domain_transaction(
     let generation = match control {
         Some(control) => transaction
             .generations
-            .next_generation_while(|| control.is_cancelled())?,
+            .next_generation_while(|| control.is_cancelled() || control.remaining().is_zero())?,
         None => transaction.generations.next_generation()?,
     };
     ensure_publication_active(control)?;
+    let advances_observation_revision = cause.kind == EventCauseKind::Request;
     let incremental = validated_envelope(
         generation,
         cause,
@@ -1143,11 +1249,14 @@ fn publish_domain_transaction(
         DesktopEvent::FullSnapshot(Box::new(snapshot)),
     )?;
     ensure_publication_active(control)?;
+    if advances_observation_revision {
+        observation_revision.fetch_add(1, Ordering::SeqCst);
+    }
     transaction.states = Some(staged);
     transaction.latest_snapshot = Some(replay);
     transaction.current_generation = generation;
     let _ = events.send(incremental.clone());
-    Ok(incremental)
+    Ok(Some(incremental))
 }
 
 fn lock_publication_transaction<'a>(
@@ -1486,6 +1595,12 @@ impl DesktopRegistry {
             let blocking_tasks = Arc::new(BlockingTaskTracker::default());
             let attempt_slot = Arc::clone(&active_attempt);
             let attempt_blocking_tasks = Arc::clone(&blocking_tasks);
+            let observation_revision = Arc::clone(
+                authority
+                    .observation_revisions
+                    .get(&domain)
+                    .expect("registry domains have observation revisions"),
+            );
             let wrapper = tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(100);
                 loop {
@@ -1498,6 +1613,8 @@ impl DesktopRegistry {
                     let Some((attempt_id, attempt)) = attempt_slot.begin(
                         &token,
                         Arc::clone(&attempt_blocking_tasks),
+                        domain,
+                        Arc::clone(&observation_revision),
                         move |context| {
                             tokio::spawn(async move { run_producer.run(run_sender, context).await })
                         },
@@ -1521,7 +1638,11 @@ impl DesktopRegistry {
                         diagnostic,
                     )
                     .expect("producer error has a diagnostic");
-                    if sender.send(DesktopDomainUpdate { state }).await.is_err() {
+                    if sender
+                        .send(DesktopDomainUpdate::unversioned(state))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     if started.elapsed() >= Duration::from_secs(10) {
@@ -1557,7 +1678,7 @@ impl DesktopRegistry {
                     update = receiver.recv() => {
                         let Some(update) = update else { return Ok(()); };
                         let publication = authority.publish_domain_controlled(
-                            update.state,
+                            update,
                             EventCause { kind: EventCauseKind::External, request_id: None },
                             &run_aggregator_context,
                         ).await;
@@ -1666,6 +1787,7 @@ impl DesktopProducerRuntime {
                         "desktop producer blocking workers did not drain",
                     )
                 });
+                task.blocking_tasks.drain().await;
             }
         }
         if !self
@@ -1679,6 +1801,7 @@ impl DesktopProducerRuntime {
                     "desktop publication worker did not drain",
                 )
             });
+            self.aggregator_blocking_tasks.drain().await;
         }
         match failure {
             Some(error) => Err(error),
@@ -2525,15 +2648,21 @@ mod tests {
         let begin_slot = Arc::clone(&slot);
         let begin_gate = Arc::clone(&spawn_gate);
         let begin = std::thread::spawn(move || {
-            begin_slot.begin(&parent, blocking_tasks, move |context| {
-                spawn_entered.send(()).unwrap();
-                let (open, changed) = &*begin_gate;
-                let mut open = open.lock().unwrap();
-                while !*open {
-                    open = changed.wait(open).unwrap();
-                }
-                runtime.spawn(async move { context.cancelled().await })
-            })
+            begin_slot.begin(
+                &parent,
+                blocking_tasks,
+                DesktopDomainId::Network,
+                Arc::new(AtomicU64::new(0)),
+                move |context| {
+                    spawn_entered.send(()).unwrap();
+                    let (open, changed) = &*begin_gate;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        open = changed.wait(open).unwrap();
+                    }
+                    runtime.spawn(async move { context.cancelled().await })
+                },
+            )
         });
         spawn_observed.recv_timeout(Duration::from_secs(1)).unwrap();
 

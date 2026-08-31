@@ -1,5 +1,6 @@
 use std::{
-    fmt,
+    collections::{BTreeMap, BTreeSet},
+    fmt, fs,
     io::{self, Read},
     os::{fd::AsRawFd, unix::process::CommandExt},
     process::{Command, Stdio},
@@ -230,29 +231,38 @@ impl ProcessCommandRunner {
             )
         })?;
         let process_group = child.id() as libc::pid_t;
+        let mut process_tree = OwnedProcessTree::new(process_group);
+        if let Err(error) = process_tree.refresh() {
+            terminate_process_boundary(&mut child, process_group, &mut process_tree);
+            return Err(process_ownership_error(error));
+        }
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
         if let Err(error) = set_nonblocking(stdout.as_raw_fd()) {
-            terminate_process_boundary(&mut child, process_group);
+            terminate_process_boundary(&mut child, process_group, &mut process_tree);
             return Err(output_error(error));
         }
         if let Err(error) = set_nonblocking(stderr.as_raw_fd()) {
-            terminate_process_boundary(&mut child, process_group);
+            terminate_process_boundary(&mut child, process_group, &mut process_tree);
             return Err(output_error(error));
         }
         let mut stdout_capture = OutputCapture::new(spec.max_output_bytes);
         let mut stderr_capture = OutputCapture::new(spec.max_output_bytes);
         let status = loop {
+            if let Err(error) = process_tree.refresh() {
+                terminate_process_boundary(&mut child, process_group, &mut process_tree);
+                return Err(process_ownership_error(error));
+            }
             if let Err(error) = stdout_capture.read_available(&mut stdout) {
-                terminate_process_boundary(&mut child, process_group);
+                terminate_process_boundary(&mut child, process_group, &mut process_tree);
                 return Err(error);
             }
             if let Err(error) = stderr_capture.read_available(&mut stderr) {
-                terminate_process_boundary(&mut child, process_group);
+                terminate_process_boundary(&mut child, process_group, &mut process_tree);
                 return Err(error);
             }
             if control.is_cancelled() {
-                terminate_process_boundary(&mut child, process_group);
+                terminate_process_boundary(&mut child, process_group, &mut process_tree);
                 drain_closed_boundary(
                     &mut stdout,
                     &mut stderr,
@@ -263,8 +273,11 @@ impl ProcessCommandRunner {
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let _ = process_tree.refresh();
                     kill_process_group(process_group);
+                    process_tree.kill_all();
                     reap_process_group(process_group);
+                    process_tree.reap_all();
                     drain_closed_boundary(
                         &mut stdout,
                         &mut stderr,
@@ -277,7 +290,7 @@ impl ProcessCommandRunner {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Ok(None) => {
-                    terminate_process_boundary(&mut child, process_group);
+                    terminate_process_boundary(&mut child, process_group, &mut process_tree);
                     drain_closed_boundary(
                         &mut stdout,
                         &mut stderr,
@@ -289,7 +302,7 @@ impl ProcessCommandRunner {
                     ));
                 }
                 Err(error) => {
-                    terminate_process_boundary(&mut child, process_group);
+                    terminate_process_boundary(&mut child, process_group, &mut process_tree);
                     drain_closed_boundary(
                         &mut stdout,
                         &mut stderr,
@@ -316,11 +329,137 @@ impl ProcessCommandRunner {
     }
 }
 
-fn terminate_process_boundary(child: &mut std::process::Child, process_group: libc::pid_t) {
+struct OwnedProcessTree {
+    root: libc::pid_t,
+    descendants: BTreeMap<libc::pid_t, u64>,
+}
+
+impl OwnedProcessTree {
+    fn new(root: libc::pid_t) -> Self {
+        Self {
+            root,
+            descendants: BTreeMap::new(),
+        }
+    }
+
+    fn refresh(&mut self) -> io::Result<()> {
+        self.descendants
+            .retain(|pid, start| process_start_time(*pid).ok().flatten() == Some(*start));
+        let mut pending = Vec::with_capacity(self.descendants.len() + 1);
+        pending.push(self.root);
+        pending.extend(self.descendants.keys().copied());
+        let mut visited = BTreeSet::new();
+        while let Some(parent) = pending.pop() {
+            if !visited.insert(parent) {
+                continue;
+            }
+            for child in process_children(parent)? {
+                if child <= 0 || child == self.root {
+                    continue;
+                }
+                let Some(start_time) = process_start_time(child)? else {
+                    continue;
+                };
+                match self.descendants.get(&child) {
+                    Some(existing) if *existing != start_time => continue,
+                    Some(_) => {}
+                    None => {
+                        self.descendants.insert(child, start_time);
+                    }
+                }
+                pending.push(child);
+            }
+        }
+        Ok(())
+    }
+
+    fn kill_all(&self) {
+        for (&pid, &start_time) in &self.descendants {
+            if process_start_time(pid).ok().flatten() == Some(start_time) {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    fn reap_all(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while !self.descendants.is_empty() && Instant::now() < deadline {
+            self.kill_all();
+            self.descendants.retain(|pid, start_time| {
+                if process_start_time(*pid).ok().flatten() != Some(*start_time) {
+                    return false;
+                }
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(*pid, &mut status, libc::WNOHANG) };
+                if waited == *pid {
+                    return false;
+                }
+                process_start_time(*pid).ok().flatten() == Some(*start_time)
+            });
+            if !self.descendants.is_empty() {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn process_children(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    contents
+        .split_ascii_whitespace()
+        .map(|value| {
+            value
+                .parse::<libc::pid_t>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid child PID"))
+        })
+        .collect()
+}
+
+fn process_start_time(pid: libc::pid_t) -> io::Result<Option<u64>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let fields = stat
+        .rsplit_once(") ")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat is malformed"))?
+        .1;
+    let start_time = fields
+        .split_ascii_whitespace()
+        .nth(19)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat is incomplete"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "process start time is invalid"))?;
+    Ok(Some(start_time))
+}
+
+fn process_ownership_error(error: io::Error) -> RunnerError {
+    RunnerError::new(
+        RunnerErrorKind::Io,
+        format!("could not track adapter descendants: {error}"),
+    )
+}
+
+fn terminate_process_boundary(
+    child: &mut std::process::Child,
+    process_group: libc::pid_t,
+    process_tree: &mut OwnedProcessTree,
+) {
+    let _ = process_tree.refresh();
     kill_process_group(process_group);
+    process_tree.kill_all();
     let _ = child.kill();
     let _ = child.wait();
     reap_process_group(process_group);
+    process_tree.reap_all();
 }
 
 fn kill_process_group(process_group: libc::pid_t) {

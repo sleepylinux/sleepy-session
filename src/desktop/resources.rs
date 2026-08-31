@@ -117,7 +117,11 @@ impl DesktopProducer for ResourceProducer {
                 biased;
                 _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
-                    sender.send(DesktopDomainUpdate { state: self.probe(Some(&context)).await })
+                    let update = context
+                        .begin_observation()
+                        .finish(self.probe(Some(&context)).await)
+                        .map_err(|error| ProducerError::new(error.to_string()))?;
+                    sender.send(update)
                         .await
                         .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                 }
