@@ -467,6 +467,10 @@ impl SupervisorResponse {
         Self::error(4)
     }
 
+    fn output_limit() -> Self {
+        Self::error(5)
+    }
+
     fn error(tag: u8) -> Self {
         Self {
             tag,
@@ -488,6 +492,10 @@ impl SupervisorResponse {
             )),
             2 => Err(RunnerError::cancelled()),
             3 => Err(RunnerError::spawn("adapter executable is unavailable")),
+            5 => Err(RunnerError::new(
+                RunnerErrorKind::Io,
+                "adapter output exceeded the bounded capture limit",
+            )),
             _ => Err(RunnerError::new(
                 RunnerErrorKind::Io,
                 "adapter command supervisor failed",
@@ -845,6 +853,9 @@ fn supervise_command(request: SupervisorRequest, parent: &mut impl Read) -> Supe
             }
         }
     };
+    if stdout_capture.exceeded || stderr_capture.exceeded {
+        return SupervisorResponse::output_limit();
+    }
     match (stdout_capture.finish(), stderr_capture.finish()) {
         (Ok(stdout), Ok(stderr)) => {
             SupervisorResponse::exited(status.code().unwrap_or(128), stdout, stderr)
