@@ -4,7 +4,10 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Write},
     os::fd::AsRawFd,
-    os::unix::fs::PermissionsExt,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex as StdMutex},
@@ -18,7 +21,10 @@ use sleepy_sdk::{
     CapabilityAvailability, ClipboardEntry, DesktopSessionCommand, LockState, RecordingState,
     RecordingStatus, UtilityCommand,
 };
-use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::mpsc,
+};
 use zeroize::Zeroize;
 
 use super::{
@@ -33,6 +39,7 @@ const LOGIN1_MANAGER: &str = "org.freedesktop.login1.Manager";
 const LOGIN1_SESSION: &str = "org.freedesktop.login1.Session";
 const LOGIND_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIND_STATE_TIMEOUT: Duration = Duration::from_millis(1_750);
+const LOCKER_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const UTILITY_REFRESH: Duration = Duration::from_secs(2);
 const RECORDING_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const GAME_MODE_DESTINATION: &str = "com.feralinteractive.GameMode";
@@ -1084,6 +1091,127 @@ fn availability_for_io(error: &io::Error) -> CapabilityAvailability {
     }
 }
 
+fn request_secure_lock() -> io::Result<()> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "XDG runtime directory is unavailable",
+            )
+        })?;
+    let socket = std::env::var_os("SLEEPY_LOCKER_SOCKET")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime.join("sleepy/locker.sock"));
+    request_secure_lock_at(&socket, &runtime, LOCKER_ACK_TIMEOUT)
+}
+
+fn request_secure_lock_at(socket: &Path, runtime: &Path, timeout: Duration) -> io::Result<()> {
+    validate_locker_path(socket, runtime)?;
+    let deadline = Instant::now() + timeout;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(io::Error::other)?;
+    runtime.block_on(async move {
+        tokio::time::timeout(timeout, async {
+            let mut stream = tokio::net::UnixStream::connect(socket).await?;
+            let peer_uid = crate::sessiond::private_socket::peer_uid(&stream)?;
+            if peer_uid != unsafe { libc::getuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "locker socket peer UID mismatch",
+                ));
+            }
+            stream.write_all(b"lock\n").await?;
+            stream.flush().await?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "locker did not confirm secure lock within its deadline",
+                ));
+            }
+            let mut reply = Vec::with_capacity(8);
+            stream.take(8).read_to_end(&mut reply).await?;
+            if reply != b"locked\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "locker returned an invalid secure-lock acknowledgement",
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "locker did not confirm secure lock within its deadline",
+            )
+        })?
+    })
+}
+
+fn validate_locker_path(socket: &Path, runtime: &Path) -> io::Result<()> {
+    fn clean_absolute(path: &Path) -> bool {
+        path.is_absolute()
+            && path.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+            && !path.as_os_str().as_bytes().contains(&0)
+    }
+
+    fn owned_directory(path: &Path, required_mode: Option<u32>) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        let mode = metadata.permissions().mode() & 0o777;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::getuid() }
+            || required_mode.is_some_and(|required| mode != required)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "locker runtime path is not a protected owned directory",
+            ));
+        }
+        Ok(())
+    }
+
+    if !clean_absolute(runtime) || !clean_absolute(socket) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "locker endpoint path is not clean and absolute",
+        ));
+    }
+    owned_directory(runtime, None)?;
+    let directory = runtime.join("sleepy");
+    owned_directory(&directory, Some(0o700))?;
+    if socket.parent() != Some(directory.as_path()) || socket.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "locker endpoint is outside the protected runtime directory",
+        ));
+    }
+    let metadata = fs::symlink_metadata(socket)?;
+    if !metadata.file_type().is_socket()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::getuid() }
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "locker endpoint is not an owned mode-0600 socket",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProductionLogind;
 
@@ -1140,28 +1268,21 @@ impl ProductionLogind {
 
     pub fn execute(self, command: DesktopSessionCommand) -> io::Result<Option<DesktopDomainState>> {
         let deadline = Instant::now() + LOGIND_ACTION_TIMEOUT;
-        let connection = dbus::blocking::Connection::new_system().map_err(dbus_error)?;
-        execute_logind_with(
-            command,
-            || session_locked_hint(&connection, deadline),
-            |command| invoke_logind_action(&connection, command, deadline),
-        )
+        execute_session_with(command, request_secure_lock, |command| {
+            let connection = dbus::blocking::Connection::new_system().map_err(dbus_error)?;
+            invoke_logind_action(&connection, command, deadline)
+        })
     }
 }
 
-fn execute_logind_with(
+fn execute_session_with(
     command: DesktopSessionCommand,
-    mut locked_hint: impl FnMut() -> io::Result<bool>,
+    mut request_lock: impl FnMut() -> io::Result<()>,
     mut invoke: impl FnMut(DesktopSessionCommand) -> io::Result<()>,
 ) -> io::Result<Option<DesktopDomainState>> {
     match command {
         DesktopSessionCommand::Lock => {
-            invoke(command)?;
-            if !locked_hint()? {
-                return Err(io::Error::other(
-                    "logind readback did not confirm the session lock",
-                ));
-            }
+            request_lock()?;
             DesktopDomainState::available(
                 DesktopDomainId::Lock,
                 DesktopDomainValue::Lock(LockState { secure: true }),
@@ -1169,7 +1290,7 @@ fn execute_logind_with(
             .map(Some)
         }
         DesktopSessionCommand::Suspend => {
-            validate_session_precondition(command, locked_hint()?)?;
+            request_lock()?;
             invoke(command)?;
             Ok(None)
         }
@@ -1194,9 +1315,10 @@ fn invoke_logind_action(
     );
     match command {
         DesktopSessionCommand::Lock => {
-            let _: () = manager
-                .method_call(LOGIN1_MANAGER, "LockSession", (required_session_id()?,))
-                .map_err(dbus_error)?;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "session lock is owned exclusively by the private locker endpoint",
+            ))
         }
         DesktopSessionCommand::Logout => {
             let _: () = manager
@@ -1297,26 +1419,6 @@ impl DesktopProducer for LogindProducer {
     }
 }
 
-fn session_locked_hint(
-    connection: &dbus::blocking::Connection,
-    deadline: Instant,
-) -> io::Result<bool> {
-    let manager = connection.with_proxy(
-        LOGIN1_DESTINATION,
-        LOGIN1_MANAGER_PATH,
-        remaining(deadline)?,
-    );
-    let session_id = required_session_id()?;
-    let (session_path,): (dbus::Path<'static>,) = manager
-        .method_call(LOGIN1_MANAGER, "GetSession", (session_id,))
-        .map_err(dbus_error)?;
-    let session = connection.with_proxy(LOGIN1_DESTINATION, session_path, remaining(deadline)?);
-    let locked: bool = session
-        .get(LOGIN1_SESSION, "LockedHint")
-        .map_err(dbus_error)?;
-    Ok(locked)
-}
-
 pub fn validate_session_precondition(
     command: DesktopSessionCommand,
     secure_lock: bool,
@@ -1360,12 +1462,98 @@ fn dbus_error(error: dbus::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, sync::Mutex};
+    use std::{cell::RefCell, io::Read, os::unix::net::UnixListener, sync::Mutex};
 
     use sleepy_sdk::StableId;
 
     use super::*;
     use crate::system::{CommandOutput, CommandRunner, RunnerError};
+
+    fn locker_fixture(
+        reply: Option<&'static [u8]>,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<Vec<u8>>) {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = runtime.path().join("sleepy");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.join("locker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 5];
+            stream.read_exact(&mut request).unwrap();
+            if let Some(reply) = reply {
+                stream.write_all(reply).unwrap();
+            } else {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            request.to_vec()
+        });
+        (runtime, socket, server)
+    }
+
+    #[test]
+    fn locker_client_sends_only_lock_and_requires_exact_secure_acknowledgement() {
+        let (runtime, socket, server) = locker_fixture(Some(b"locked\n"));
+
+        request_secure_lock_at(&socket, runtime.path(), Duration::from_secs(1)).unwrap();
+
+        assert_eq!(server.join().unwrap(), b"lock\n");
+    }
+
+    #[test]
+    fn locker_client_rejects_any_reply_other_than_exact_locked_line() {
+        for reply in [&b"error\n"[..], &b"locked\nextra"[..], &b"locked"[..]] {
+            let (runtime, socket, server) = locker_fixture(Some(reply));
+            let error = request_secure_lock_at(&socket, runtime.path(), Duration::from_secs(1))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(server.join().unwrap(), b"lock\n");
+        }
+    }
+
+    #[test]
+    fn locker_client_rejects_unprotected_or_out_of_runtime_socket_paths() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = runtime.path().join("sleepy");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.join("locker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(
+            request_secure_lock_at(&socket, runtime.path(), Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(listener);
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("locker.sock");
+        assert_eq!(
+            validate_locker_path(&outside_path, runtime.path())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn locker_client_bounds_unconfirmed_lock_wait() {
+        let (runtime, socket, server) = locker_fixture(None);
+
+        let started = Instant::now();
+        let error =
+            request_secure_lock_at(&socket, runtime.path(), Duration::from_millis(40)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(server.join().unwrap(), b"lock\n");
+    }
 
     fn scripted_status_child(
         script: &str,
@@ -1594,17 +1782,17 @@ mod tests {
     }
 
     #[test]
-    fn injected_logind_policy_confirms_lock_and_gates_suspend_before_action() {
+    fn injected_session_policy_uses_private_locker_and_gates_suspend_before_action() {
         let steps = RefCell::new(Vec::new());
-        let locked = execute_logind_with(
+        let locked = execute_session_with(
             DesktopSessionCommand::Lock,
             || {
-                steps.borrow_mut().push("locked-hint");
-                Ok(true)
+                steps.borrow_mut().push("locker-lock");
+                Ok(())
             },
             |command| {
                 steps.borrow_mut().push(match command {
-                    DesktopSessionCommand::Lock => "lock",
+                    DesktopSessionCommand::Lock => "unexpected-logind-lock",
                     _ => "unexpected",
                 });
                 Ok(())
@@ -1612,26 +1800,51 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(steps.into_inner(), ["lock", "locked-hint"]);
+        assert_eq!(steps.into_inner(), ["locker-lock"]);
         assert_eq!(locked.status(), CapabilityAvailability::Available);
 
-        let actions = RefCell::new(Vec::new());
-        let error = execute_logind_with(
+        let steps = RefCell::new(Vec::new());
+        let error = execute_session_with(
             DesktopSessionCommand::Suspend,
-            || Ok(false),
+            || {
+                steps.borrow_mut().push("locker-lock");
+                Err(io::Error::new(io::ErrorKind::TimedOut, "fixture timeout"))
+            },
             |command| {
-                actions.borrow_mut().push(command);
+                steps.borrow_mut().push(match command {
+                    DesktopSessionCommand::Suspend => "suspend",
+                    _ => "unexpected",
+                });
                 Ok(())
             },
         )
         .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(actions.into_inner().is_empty());
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(steps.into_inner(), ["locker-lock"]);
+
+        let steps = RefCell::new(Vec::new());
+        assert!(execute_session_with(
+            DesktopSessionCommand::Suspend,
+            || {
+                steps.borrow_mut().push("locker-lock");
+                Ok(())
+            },
+            |command| {
+                steps.borrow_mut().push(match command {
+                    DesktopSessionCommand::Suspend => "suspend",
+                    _ => "unexpected",
+                });
+                Ok(())
+            },
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(steps.into_inner(), ["locker-lock", "suspend"]);
 
         let actions = RefCell::new(Vec::new());
-        assert!(execute_logind_with(
+        assert!(execute_session_with(
             DesktopSessionCommand::Reboot,
-            || panic!("reboot does not query lock state"),
+            || panic!("reboot does not request the locker"),
             |command| {
                 actions.borrow_mut().push(command);
                 Ok(())
