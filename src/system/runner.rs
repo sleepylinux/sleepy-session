@@ -142,7 +142,7 @@ impl RunControl {
         }
     }
 
-    fn for_timeout(timeout: Duration) -> Self {
+    pub fn for_timeout(timeout: Duration) -> Self {
         Self {
             deadline: Instant::now() + timeout,
             generation: None,

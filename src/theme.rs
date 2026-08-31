@@ -230,6 +230,57 @@ impl ThemeManager {
         }
     }
 
+    /// Atomically select a validated theme for the v3 daemon authority. The
+    /// caller publishes the returned document as the confirmed readback.
+    pub fn activate_for_desktop(&mut self, id: &str) -> Result<ThemeDocument, ThemeError> {
+        let control = default_control();
+        let lock = self.mutation_lock_blocking("desktop theme activation", &control)?;
+        if self.has_journal()? {
+            return Err(ThemeError::new(
+                "a theme transaction already needs reconciliation",
+            ));
+        }
+        let candidate = self.theme(id)?;
+        self.atomic_state_write(CURRENT, &document_bytes(&candidate)?)?;
+        self.preview = None;
+        drop(lock);
+        Ok(candidate)
+    }
+
+    /// Persist v3 presentation preferences as a user document while retaining
+    /// the mature validated theme store and atomic current-document boundary.
+    pub fn set_desktop_effect_preferences(
+        &mut self,
+        reduced_motion: Option<bool>,
+        opaque: Option<bool>,
+    ) -> Result<ThemeDocument, ThemeError> {
+        let control = default_control();
+        let lock = self.mutation_lock_blocking("desktop theme preferences", &control)?;
+        if self.has_journal()? {
+            return Err(ThemeError::new(
+                "a theme transaction already needs reconciliation",
+            ));
+        }
+        let mut candidate = self.current()?;
+        if let Some(value) = reduced_motion {
+            candidate.reduced_motion = value;
+        }
+        if let Some(value) = opaque {
+            candidate.opaque_fallback = value;
+        }
+        if candidate.origin == ThemeOrigin::Builtin {
+            candidate.id = uuid::Uuid::new_v4().hyphenated().to_string();
+            candidate.name = format!("{} preferences", candidate.name);
+            candidate.origin = ThemeOrigin::User;
+        }
+        validate_document(&candidate)?;
+        self.write_user(&candidate)?;
+        self.atomic_state_write(CURRENT, &document_bytes(&candidate)?)?;
+        self.preview = None;
+        drop(lock);
+        Ok(candidate)
+    }
+
     pub fn list(&self) -> Result<Vec<ThemeDocument>, ThemeError> {
         let mut themes = [
             "builtin.sleepy-dark",

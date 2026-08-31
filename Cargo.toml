@@ -5,6 +5,8 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
+async-trait = "0.1"
+zeroize = "1.8"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 dbus = "0.9.12"
 fs2 = "0.4"

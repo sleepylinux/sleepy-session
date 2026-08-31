@@ -31,6 +31,7 @@ pub enum EndpointKind {
     Request,
     DesktopStream,
     DesktopRequest,
+    Secret,
 }
 
 impl fmt::Display for EndpointKind {
@@ -40,6 +41,7 @@ impl fmt::Display for EndpointKind {
             Self::Request => "request",
             Self::DesktopStream => "desktop-stream",
             Self::DesktopRequest => "desktop-request",
+            Self::Secret => "secret",
         })
     }
 }

@@ -1,7 +1,18 @@
 use std::{env, io, path::PathBuf, process::ExitCode, sync::Arc};
 
 use sleepy_sdk::{EventCause, EventCauseKind, ProviderEvent, SessionEvent};
+use sleepy_session::compositor::HyprlandAdapter;
 use sleepy_session::daily::{DailySocket, ProductionDailyBackend};
+use sleepy_session::desktop::appearance::AppearanceService;
+use sleepy_session::desktop::mutation::ProductionDesktopMutationExecutor;
+use sleepy_session::desktop::secret_agent::{
+    NetworkManagerSecretAgent, SecretBroker, SecretSocket,
+};
+use sleepy_session::desktop::utilities::ProductionUtilityService;
+use sleepy_session::desktop::{
+    production_registry, serve_control_stream, serve_event_stream, DesktopControlAuthority,
+    DesktopStateAuthority,
+};
 use sleepy_session::notifications::{
     FreedesktopNotificationProvider, NotificationDbusServer, NotificationEventService,
     NotificationSocket, NotificationStore,
@@ -9,14 +20,16 @@ use sleepy_session::notifications::{
 use sleepy_session::osd::{spawn_osd_runtime, OsdPublicationHub, OsdSocket};
 use sleepy_session::overview::overview_event_channel;
 use sleepy_session::sessiond::supervisor::{
-    ConnectionContext, DaemonLifecycle, PreparedDesktopSockets, StartupBarrier, SystemdNotifier,
+    DaemonLifecycle, PreparedDesktopSockets, StartupBarrier, SystemdNotifier,
 };
 use sleepy_session::sessiond::{
     full_snapshot_event, ControlSocket, EventHub, GenerationAllocator, GenerationAuthority,
     MutationPipeline, ProductionMutationBackend, ProductionSources, SessionSocket,
     ShutdownCoordinator,
 };
+use sleepy_session::system::{ProcessCommandRunner, SystemFacade};
 use sleepy_session::{theme::ThemeManager, theme_socket::ThemeSocket};
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -42,6 +55,9 @@ async fn run() -> io::Result<()> {
     let theme_socket_path = socket_dir.join("theme.sock");
     let notification_socket_path = socket_dir.join("notification.sock");
     let generation_path = state_dir.join("sleepy/session-generation");
+    let desktop_generation_path = state_dir.join("sleepy/desktop-generation");
+    let desktop_dedupe_path = state_dir.join("sleepy/desktop-dedupe.json");
+    let secret_socket_path = socket_dir.join("secret.sock");
     let (overview_sender, overview_events) = overview_event_channel(256);
     let daily_backend = Arc::new(ProductionDailyBackend::open_with_overview(
         &state_dir,
@@ -61,6 +77,76 @@ async fn run() -> io::Result<()> {
         notification_provider,
         authority.clone(),
     )));
+    // Complete the bounded v3 snapshot before exposing any socket path. This
+    // keeps Task 3's listener-visible startup handoff short and deterministic.
+    let desktop_config_dir = config_dir.clone();
+    let desktop_state_dir = state_dir.clone();
+    let desktop_theme_manager = tokio::task::spawn_blocking(move || {
+        ThemeManager::open(&desktop_config_dir, &desktop_state_dir)
+            .map_err(|error| io::Error::other(format!("desktop theme provider: {error}")))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("desktop theme worker failed: {error}")))??;
+    let desktop_system = Arc::new(SystemFacade::new(ProcessCommandRunner));
+    let capture_root = state_dir.join("sleepy/captures");
+    let desktop_utilities = Arc::new(
+        tokio::task::spawn_blocking(move || ProductionUtilityService::open(capture_root))
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("desktop utility worker failed: {error}"))
+            })??,
+    );
+    let desktop_cancellation = CancellationToken::new();
+    let appearance_state_dir = state_dir.clone();
+    let desktop_appearance = Arc::new(
+        tokio::task::spawn_blocking(move || {
+            AppearanceService::open(
+                Arc::new(tokio::sync::Mutex::new(desktop_theme_manager)),
+                &appearance_state_dir,
+            )
+        })
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("desktop appearance worker failed: {error}"))
+        })??,
+    );
+    let desktop_registry = production_registry(
+        Arc::clone(&desktop_system),
+        Arc::clone(&daily_backend),
+        Arc::clone(&notification_service),
+        Arc::clone(&desktop_appearance),
+        osd_hub.clone(),
+        Arc::clone(&desktop_utilities),
+        desktop_cancellation.child_token(),
+    )?;
+    let desktop_authority =
+        DesktopStateAuthority::open(Arc::clone(&desktop_registry), &desktop_generation_path, 256)
+            .await?;
+    desktop_authority.initialize().await?;
+    let desktop_hyprland = HyprlandAdapter::discover(desktop_cancellation.child_token()).ok();
+    let desktop_notification_actions = Arc::new(tokio::sync::Mutex::new(None));
+    let desktop_executor = Arc::new(ProductionDesktopMutationExecutor::new(
+        desktop_system,
+        Arc::clone(&daily_backend),
+        Arc::clone(&notification_service),
+        Arc::clone(&desktop_notification_actions),
+        desktop_hyprland,
+        desktop_utilities,
+        desktop_appearance,
+    ));
+    let desktop_control = DesktopControlAuthority::open(
+        Arc::clone(&desktop_authority),
+        desktop_executor,
+        &desktop_dedupe_path,
+        4096,
+    )
+    .await?;
+    let (_network_secret_agent, network_secret_exchange) =
+        tokio::task::spawn_blocking(NetworkManagerSecretAgent::start_if_available)
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("NetworkManager agent worker failed: {error}"))
+            })??;
     let notification_socket = NotificationSocket::bind(
         &notification_socket_path,
         unsafe { libc::geteuid() },
@@ -75,8 +161,9 @@ async fn run() -> io::Result<()> {
         Arc::new(ControlSocket::bind(&control_socket_path, expected_uid, mutation_pipeline).await?);
     let osd_socket =
         Arc::new(OsdSocket::bind(&osd_socket_path, expected_uid, osd_hub.clone()).await?);
-    let daily_socket =
-        Arc::new(DailySocket::bind(&daily_socket_path, expected_uid, daily_backend).await?);
+    let daily_socket = Arc::new(
+        DailySocket::bind(&daily_socket_path, expected_uid, Arc::clone(&daily_backend)).await?,
+    );
     let theme_manager = ThemeManager::open(&config_dir, &state_dir)
         .map_err(|error| io::Error::other(format!("theme provider: {error}")))?;
     let theme_socket = Arc::new(
@@ -89,6 +176,13 @@ async fn run() -> io::Result<()> {
         .await?,
     );
     let desktop_sockets = PreparedDesktopSockets::bind(&socket_dir, expected_uid).await?;
+    let secret_socket = SecretSocket::bind(
+        &secret_socket_path,
+        expected_uid,
+        SecretBroker::default(),
+        network_secret_exchange,
+    )
+    .await?;
 
     let mut startup = StartupBarrier::new();
     let session_startup = startup.required_task("session");
@@ -99,6 +193,7 @@ async fn run() -> io::Result<()> {
     let notification_startup = startup.required_task("notification");
     let desktop_events_startup = startup.required_task("desktop-events");
     let desktop_requests_startup = startup.required_task("desktop-requests");
+    let secret_startup = startup.required_task("network-secret");
     let notification_dbus_startup = startup.required_task("notification-dbus");
 
     // D-Bus ownership is acquired after all Unix listeners bind. Its worker
@@ -109,8 +204,10 @@ async fn run() -> io::Result<()> {
         tokio::runtime::Handle::current(),
         notification_dbus_startup,
     )?;
+    let notification_action_dispatcher = notification_bus.action_dispatcher();
+    *desktop_notification_actions.lock().await = Some(notification_action_dispatcher.clone());
     let notification_socket =
-        Arc::new(notification_socket.with_action_dispatcher(notification_bus.action_dispatcher()));
+        Arc::new(notification_socket.with_action_dispatcher(notification_action_dispatcher));
     let lifecycle = DaemonLifecycle::new(Arc::new(SystemdNotifier));
     let session_serving = Arc::clone(&socket);
     let mut session_task =
@@ -135,20 +232,29 @@ async fn run() -> io::Result<()> {
     });
     let desktop_events = desktop_sockets.events();
     let desktop_events_serving = Arc::clone(&desktop_events);
+    let desktop_event_authority = Arc::clone(&desktop_authority);
     let mut desktop_events_task = tokio::spawn(async move {
         desktop_events_serving
-            .serve_with_startup(desktop_events_startup, reject_prepared_desktop)
+            .serve_with_startup(desktop_events_startup, move |stream, context| {
+                serve_event_stream(stream, context, Arc::clone(&desktop_event_authority))
+            })
             .await
             .map(|_| ())
     });
     let desktop_requests = desktop_sockets.requests();
     let desktop_requests_serving = Arc::clone(&desktop_requests);
+    let desktop_control_authority = Arc::clone(&desktop_control);
     let mut desktop_requests_task = tokio::spawn(async move {
         desktop_requests_serving
-            .serve_with_startup(desktop_requests_startup, reject_prepared_desktop)
+            .serve_with_startup(desktop_requests_startup, move |stream, context| {
+                serve_control_stream(stream, context, Arc::clone(&desktop_control_authority))
+            })
             .await
             .map(|_| ())
     });
+    let secret_serving = Arc::clone(&secret_socket);
+    let mut secret_task =
+        tokio::spawn(async move { secret_serving.serve_with_startup(secret_startup).await });
 
     let desktop_paths = desktop_sockets.listener_paths();
     let producers = lifecycle
@@ -162,6 +268,7 @@ async fn run() -> io::Result<()> {
                 &notification_socket_path,
                 desktop_paths[0],
                 desktop_paths[1],
+                &secret_socket_path,
             ],
             &mut startup,
             || async {
@@ -180,15 +287,27 @@ async fn run() -> io::Result<()> {
                         publication_hub.publish(publication)?;
                     }
                 });
-                let sources =
-                    ProductionSources::start_with_overview(authority.clone(), overview_sender);
                 let shutdown =
                     ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
-                Ok((osd_runtime, sources, shutdown, osd_task, osd_bridge))
+                // Preserve Task 3's post-READY legacy source handoff before
+                // scheduling the independent v3 reconciliation actors. This keeps
+                // the v2 replay generation stable for clients reconnecting at READY.
+                let sources =
+                    ProductionSources::start_with_overview(authority.clone(), overview_sender);
+                let desktop_runtime =
+                    desktop_registry.start(Arc::clone(&desktop_authority), 256)?;
+                Ok((
+                    osd_runtime,
+                    sources,
+                    shutdown,
+                    osd_task,
+                    osd_bridge,
+                    desktop_runtime,
+                ))
             },
         )
         .await;
-    let (osd_runtime, sources, shutdown, osd_task, osd_bridge) = match producers {
+    let (osd_runtime, sources, shutdown, osd_task, osd_bridge, desktop_runtime) = match producers {
         Ok(producers) => producers,
         Err(error) => {
             let _ = tokio::join!(
@@ -200,6 +319,7 @@ async fn run() -> io::Result<()> {
                 &mut notification_task,
                 &mut desktop_events_task,
                 &mut desktop_requests_task,
+                &mut secret_task,
             );
             return Err(error);
         }
@@ -216,6 +336,7 @@ async fn run() -> io::Result<()> {
             result = &mut notification_task => socket_task_result(result, "notification socket"),
             result = &mut desktop_events_task => socket_task_result(result, "desktop stream socket"),
             result = &mut desktop_requests_task => socket_task_result(result, "desktop request socket"),
+            result = &mut secret_task => socket_task_result(result, "network secret socket"),
             bridge = osd_bridge.as_mut().expect("OSD bridge handle is present") => {
                 osd_bridge.take();
                 match bridge {
@@ -258,14 +379,25 @@ async fn run() -> io::Result<()> {
         .stop_and_drain(|| async move {
             let mut cleanup_error = None;
             drop(notification_bus);
-            let (desktop_events, desktop_requests) = tokio::join!(
+            desktop_cancellation.cancel();
+            if let Err(error) = desktop_runtime
+                .shutdown(std::time::Duration::from_secs(4))
+                .await
+            {
+                cleanup_error.get_or_insert(error);
+            }
+            let (desktop_events, desktop_requests, secret) = tokio::join!(
                 desktop_events.shutdown_and_drain(),
                 desktop_requests.shutdown_and_drain(),
+                secret_socket.shutdown_and_drain(),
             );
             if let Err(error) = desktop_events {
                 cleanup_error.get_or_insert(error);
             }
             if let Err(error) = desktop_requests {
+                cleanup_error.get_or_insert(error);
+            }
+            if let Err(error) = secret {
                 cleanup_error.get_or_insert(error);
             }
             if let Err(error) = control_socket
@@ -330,16 +462,6 @@ async fn run() -> io::Result<()> {
         })
         .await;
     result.and(cleanup)
-}
-
-async fn reject_prepared_desktop(
-    stream: tokio::net::UnixStream,
-    _context: ConnectionContext,
-) -> io::Result<()> {
-    // Task 5 injects strict v3 handlers here. Closing is fail-closed and avoids
-    // publishing a placeholder document that could violate the v3 schema.
-    drop(stream);
-    Ok(())
 }
 
 fn socket_task_result(
