@@ -651,6 +651,8 @@ pub struct DesktopStateAuthority {
     initialized: Notify,
     events: broadcast::Sender<DesktopEnvelope>,
     observation_revisions: Arc<BTreeMap<DesktopDomainId, Arc<AtomicU64>>>,
+    #[cfg(test)]
+    publication_hook_scope: Arc<()>,
 }
 
 struct DesktopAuthorityTransaction {
@@ -659,6 +661,21 @@ struct DesktopAuthorityTransaction {
     current_generation: u64,
     latest_snapshot: Option<DesktopEnvelope>,
 }
+
+struct PublicationEnvironment {
+    registry: Arc<DesktopRegistry>,
+    events: broadcast::Sender<DesktopEnvelope>,
+    observation_revisions: Arc<BTreeMap<DesktopDomainId, Arc<AtomicU64>>>,
+    hook_scope: PublicationHookScope,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PublicationHookScope(usize);
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct PublicationHookScope;
 
 enum InitializationAssembly {
     Existing(DesktopEnvelope),
@@ -946,7 +963,13 @@ impl DesktopStateAuthority {
             initialized: Notify::new(),
             events,
             observation_revisions,
+            #[cfg(test)]
+            publication_hook_scope: Arc::new(()),
         }))
+    }
+
+    fn publication_hook_scope(&self) -> PublicationHookScope {
+        publication_hook_scope(self)
     }
 
     pub async fn initialize(&self) -> io::Result<DesktopEnvelope> {
@@ -1071,12 +1094,16 @@ impl DesktopStateAuthority {
         let registry = Arc::clone(&self.registry);
         let events = self.events.clone();
         let observation_revisions = Arc::clone(&self.observation_revisions);
+        let hook_scope = self.publication_hook_scope();
         tokio::task::spawn_blocking(move || {
             publish_domain_transaction(
                 transaction,
-                registry,
-                events,
-                observation_revisions,
+                PublicationEnvironment {
+                    registry,
+                    events,
+                    observation_revisions,
+                    hook_scope,
+                },
                 DesktopDomainUpdate::unversioned(update),
                 cause,
                 None,
@@ -1097,13 +1124,17 @@ impl DesktopStateAuthority {
         let registry = Arc::clone(&self.registry);
         let events = self.events.clone();
         let observation_revisions = Arc::clone(&self.observation_revisions);
+        let hook_scope = self.publication_hook_scope();
         context
             .spawn_blocking(StdInstant::now() + INITIAL_DEADLINE, move |control| {
                 publish_domain_transaction(
                     transaction,
-                    registry,
-                    events,
-                    observation_revisions,
+                    PublicationEnvironment {
+                        registry,
+                        events,
+                        observation_revisions,
+                        hook_scope,
+                    },
                     update,
                     cause,
                     Some(&control),
@@ -1193,9 +1224,7 @@ impl DesktopStateAuthority {
 
 fn publish_domain_transaction(
     transaction: Arc<StdMutex<DesktopAuthorityTransaction>>,
-    registry: Arc<DesktopRegistry>,
-    events: broadcast::Sender<DesktopEnvelope>,
-    observation_revisions: Arc<BTreeMap<DesktopDomainId, Arc<AtomicU64>>>,
+    environment: PublicationEnvironment,
     update: DesktopDomainUpdate,
     cause: EventCause,
     control: Option<&crate::system::RunControl>,
@@ -1210,7 +1239,8 @@ fn publish_domain_transaction(
         )
     })?;
     let domain = update.state.domain();
-    let observation_revision = observation_revisions
+    let observation_revision = environment
+        .observation_revisions
         .get(&domain)
         .expect("registry domains have observation revisions");
     if update
@@ -1221,7 +1251,7 @@ fn publish_domain_transaction(
     }
     let mut staged = current.clone();
     staged.insert(domain, update.state);
-    let snapshot = match registry.assemble(&staged) {
+    let snapshot = match environment.registry.assemble(&staged) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             staged.insert(
@@ -1232,17 +1262,19 @@ fn publish_domain_transaction(
                     "producer.contract-invalid",
                 )?,
             );
-            registry.assemble(&staged)?
+            environment.registry.assemble(&staged)?
         }
     };
     ensure_publication_active(control)?;
+    let _commit = match control {
+        Some(control) => control.begin_commit()?,
+        None => None,
+    };
     let generation = match control {
-        Some(control) => transaction
-            .generations
-            .next_generation_controlled(control)?,
+        Some(control) => transaction.generations.next_generation_in_commit(control)?,
         None => transaction.generations.next_generation()?,
     };
-    ensure_publication_active(control)?;
+    after_desktop_generation_reserved(environment.hook_scope, control.is_some());
     let advances_observation_revision = cause.kind == EventCauseKind::Request;
     let incremental = validated_envelope(
         generation,
@@ -1257,44 +1289,53 @@ fn publish_domain_transaction(
         },
         DesktopEvent::FullSnapshot(Box::new(snapshot)),
     )?;
-    ensure_publication_active(control)?;
-    let _commit = match control {
-        Some(control) => control.begin_commit()?,
-        None => None,
-    };
-    before_desktop_publication_commit(control.is_some());
+    before_desktop_publication_commit(environment.hook_scope, control.is_some());
     if advances_observation_revision {
         observation_revision.fetch_add(1, Ordering::SeqCst);
     }
     transaction.states = Some(staged);
     transaction.latest_snapshot = Some(replay);
     transaction.current_generation = generation;
-    let _ = events.send(incremental.clone());
+    let _ = environment.events.send(incremental.clone());
     Ok(Some(incremental))
 }
 
 #[cfg(test)]
-type PublicationCommitHook = Box<dyn Fn() + Send + Sync + 'static>;
+type PublicationHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[cfg(test)]
 static BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK: std::sync::OnceLock<
-    StdMutex<Option<PublicationCommitHook>>,
+    StdMutex<Option<(PublicationHookScope, PublicationHook)>>,
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-static DESKTOP_PUBLICATION_COMMIT_HOOK_INSTALL_LOCK: std::sync::OnceLock<StdMutex<()>> =
+static AFTER_DESKTOP_GENERATION_RESERVED_HOOK: std::sync::OnceLock<
+    StdMutex<Option<(PublicationHookScope, PublicationHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static DESKTOP_PUBLICATION_HOOK_INSTALL_LOCK: std::sync::OnceLock<StdMutex<()>> =
     std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum PublicationHookSlot {
+    AfterGenerationReserved,
+    BeforeCommit,
+}
 
 #[cfg(test)]
 struct PublicationCommitHookGuard {
     _install: std::sync::MutexGuard<'static, ()>,
+    slot: PublicationHookSlot,
 }
 
 #[cfg(test)]
 impl Drop for PublicationCommitHookGuard {
     fn drop(&mut self) {
-        *BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
-            .get_or_init(|| StdMutex::new(None))
+        *self
+            .slot
+            .storage()
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
     }
@@ -1302,35 +1343,106 @@ impl Drop for PublicationCommitHookGuard {
 
 #[cfg(test)]
 fn install_before_desktop_publication_commit_hook(
-    hook: PublicationCommitHook,
+    authority: &DesktopStateAuthority,
+    hook: PublicationHook,
 ) -> PublicationCommitHookGuard {
-    let install = DESKTOP_PUBLICATION_COMMIT_HOOK_INSTALL_LOCK
-        .get_or_init(|| StdMutex::new(()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    *BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
-        .get_or_init(|| StdMutex::new(None))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(hook);
-    PublicationCommitHookGuard { _install: install }
+    install_publication_hook(
+        PublicationHookSlot::BeforeCommit,
+        authority.publication_hook_scope(),
+        hook,
+    )
 }
 
 #[cfg(test)]
-fn before_desktop_publication_commit(controlled: bool) {
+fn install_after_desktop_generation_reserved_hook(
+    authority: &DesktopStateAuthority,
+    hook: PublicationHook,
+) -> PublicationCommitHookGuard {
+    install_publication_hook(
+        PublicationHookSlot::AfterGenerationReserved,
+        authority.publication_hook_scope(),
+        hook,
+    )
+}
+
+#[cfg(test)]
+fn install_publication_hook(
+    slot: PublicationHookSlot,
+    scope: PublicationHookScope,
+    hook: PublicationHook,
+) -> PublicationCommitHookGuard {
+    let install = DESKTOP_PUBLICATION_HOOK_INSTALL_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *slot
+        .storage()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some((scope, hook));
+    PublicationCommitHookGuard {
+        _install: install,
+        slot,
+    }
+}
+
+#[cfg(test)]
+impl PublicationHookSlot {
+    fn storage(self) -> &'static StdMutex<Option<(PublicationHookScope, PublicationHook)>> {
+        match self {
+            Self::AfterGenerationReserved => {
+                AFTER_DESKTOP_GENERATION_RESERVED_HOOK.get_or_init(|| StdMutex::new(None))
+            }
+            Self::BeforeCommit => {
+                BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK.get_or_init(|| StdMutex::new(None))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn publication_hook_scope(authority: &DesktopStateAuthority) -> PublicationHookScope {
+    PublicationHookScope(Arc::as_ptr(&authority.publication_hook_scope) as usize)
+}
+
+#[cfg(not(test))]
+fn publication_hook_scope(_authority: &DesktopStateAuthority) -> PublicationHookScope {
+    PublicationHookScope
+}
+
+#[cfg(test)]
+fn run_publication_hook(slot: PublicationHookSlot, scope: PublicationHookScope, controlled: bool) {
     if controlled {
-        if let Some(hook) = BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
-            .get_or_init(|| StdMutex::new(None))
+        let hook = slot
+            .storage()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
-        {
+            .and_then(|(expected, hook)| (*expected == scope).then(|| Arc::clone(hook)));
+        if let Some(hook) = hook {
             hook();
         }
     }
 }
 
+#[cfg(test)]
+fn after_desktop_generation_reserved(scope: PublicationHookScope, controlled: bool) {
+    run_publication_hook(
+        PublicationHookSlot::AfterGenerationReserved,
+        scope,
+        controlled,
+    );
+}
+
+#[cfg(test)]
+fn before_desktop_publication_commit(scope: PublicationHookScope, controlled: bool) {
+    run_publication_hook(PublicationHookSlot::BeforeCommit, scope, controlled);
+}
+
 #[cfg(not(test))]
-fn before_desktop_publication_commit(_controlled: bool) {}
+fn after_desktop_generation_reserved(_scope: PublicationHookScope, _controlled: bool) {}
+
+#[cfg(not(test))]
+fn before_desktop_publication_commit(_scope: PublicationHookScope, _controlled: bool) {}
 
 fn lock_publication_transaction<'a>(
     transaction: &'a StdMutex<DesktopAuthorityTransaction>,
@@ -2774,9 +2886,12 @@ mod tests {
                 .unwrap();
         authority.initialize().await.unwrap();
         let (entered_commit, commit_entered) = std::sync::mpsc::channel();
-        let _hook = install_before_desktop_publication_commit_hook(Box::new(move || {
-            entered_commit.send(()).unwrap();
-        }));
+        let _hook = install_before_desktop_publication_commit_hook(
+            &authority,
+            Arc::new(move || {
+                entered_commit.send(()).unwrap();
+            }),
+        );
 
         authority
             .publish_domain(
@@ -2798,6 +2913,105 @@ mod tests {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout),
             "uncontrolled publication entered the controlled publication hook"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_publication_commit_guard_spans_generation_reservation_and_final_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority =
+            DesktopStateAuthority::open(test_registry(), temp.path().join("generation"), 8)
+                .await
+                .unwrap();
+        authority.initialize().await.unwrap();
+        for _ in 0..63 {
+            authority
+                .publish_domain(
+                    DesktopDomainState::available(
+                        DesktopDomainId::Network,
+                        DesktopDomainValue::empty(DesktopDomainId::Network),
+                    )
+                    .unwrap(),
+                    EventCause {
+                        kind: EventCauseKind::External,
+                        request_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let exhausted_generation = authority.current_generation();
+        assert_eq!(exhausted_generation, 64);
+        let revision = Arc::clone(
+            authority
+                .observation_revisions
+                .get(&DesktopDomainId::Network)
+                .unwrap(),
+        );
+        let context = DesktopProducerContext::for_domain(
+            CancellationToken::new(),
+            Arc::new(BlockingTaskTracker::default()),
+            DesktopDomainId::Network,
+            revision,
+        );
+        let update = context
+            .begin_observation()
+            .finish(
+                DesktopDomainState::available(
+                    DesktopDomainId::Network,
+                    DesktopDomainValue::empty(DesktopDomainId::Network),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (reserved_sender, reserved) = std::sync::mpsc::channel();
+        let commit_gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let hook_gate = Arc::clone(&commit_gate);
+        let _hook = install_after_desktop_generation_reserved_hook(
+            &authority,
+            Arc::new(move || {
+                reserved_sender.send(()).unwrap();
+                let (open, changed) = &*hook_gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = changed.wait(open).unwrap();
+                }
+            }),
+        );
+        let publishing_context = context.clone();
+        let publishing_authority = Arc::clone(&authority);
+        let publishing = tokio::spawn(async move {
+            publishing_authority
+                .publish_domain_controlled(
+                    update,
+                    EventCause {
+                        kind: EventCauseKind::External,
+                        request_id: None,
+                    },
+                    &publishing_context,
+                )
+                .await
+        });
+        reserved.recv_timeout(Duration::from_secs(1)).unwrap();
+        let cancelling_context = context.clone();
+        let (cancelled_sender, cancelled) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            cancelling_context.cancel();
+            cancelled_sender.send(()).unwrap();
+        });
+        let observed_cancellation = cancelled.recv_timeout(Duration::from_millis(20));
+        let (open, changed) = &*commit_gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+        cancellation.join().unwrap();
+        let publication = publishing.await.unwrap();
+
+        assert_eq!(
+            observed_cancellation,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "producer cancellation became observable between generation reservation and final publication"
+        );
+        assert!(publication.unwrap().is_some());
+        assert!(authority.current_generation() > exhausted_generation);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2833,14 +3047,17 @@ mod tests {
         let (entered_commit, commit_entered) = std::sync::mpsc::channel();
         let commit_gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
         let hook_gate = Arc::clone(&commit_gate);
-        let _hook = install_before_desktop_publication_commit_hook(Box::new(move || {
-            entered_commit.send(()).unwrap();
-            let (open, changed) = &*hook_gate;
-            let mut open = open.lock().unwrap();
-            while !*open {
-                open = changed.wait(open).unwrap();
-            }
-        }));
+        let _hook = install_before_desktop_publication_commit_hook(
+            &authority,
+            Arc::new(move || {
+                entered_commit.send(()).unwrap();
+                let (open, changed) = &*hook_gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = changed.wait(open).unwrap();
+                }
+            }),
+        );
         let publishing_context = context.clone();
         let publishing_authority = Arc::clone(&authority);
         let publishing = tokio::spawn(async move {

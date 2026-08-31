@@ -92,11 +92,11 @@ impl GenerationAllocator {
         Ok(generation)
     }
 
-    pub(crate) fn next_generation_controlled(&mut self, control: &RunControl) -> io::Result<u64> {
+    pub(crate) fn next_generation_in_commit(&mut self, control: &RunControl) -> io::Result<u64> {
         let cancelled = || control.is_cancelled() || control.remaining().is_zero();
         ensure_not_cancelled(&cancelled)?;
         if self.next == self.end {
-            self.reserve_block_with(&cancelled, || control.begin_commit())?;
+            self.reserve_block_with(&cancelled, || Ok(None))?;
         } else {
             ensure_not_cancelled(&cancelled)?;
         }
