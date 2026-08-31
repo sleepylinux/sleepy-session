@@ -1,6 +1,7 @@
 use std::{
     fmt,
-    io::Read,
+    io::{self, Read},
+    os::{fd::AsRawFd, unix::process::CommandExt},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -215,10 +216,12 @@ impl ProcessCommandRunner {
             .args(&spec.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .process_group(0);
         for (key, value) in &spec.env {
             command.env(key, value);
         }
+        ensure_process_subreaper()?;
         let started = Instant::now();
         let mut child = command.spawn().map_err(|error| {
             RunnerError::new(
@@ -226,29 +229,73 @@ impl ProcessCommandRunner {
                 format!("adapter executable is unavailable: {error}"),
             )
         })?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-        let capture_limit = spec.max_output_bytes;
-        let stdout_reader = thread::spawn(move || read_capped(stdout, capture_limit));
-        let stderr_reader = thread::spawn(move || read_capped(stderr, capture_limit));
+        let process_group = child.id() as libc::pid_t;
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        if let Err(error) = set_nonblocking(stdout.as_raw_fd()) {
+            terminate_process_boundary(&mut child, process_group);
+            return Err(output_error(error));
+        }
+        if let Err(error) = set_nonblocking(stderr.as_raw_fd()) {
+            terminate_process_boundary(&mut child, process_group);
+            return Err(output_error(error));
+        }
+        let mut stdout_capture = OutputCapture::new(spec.max_output_bytes);
+        let mut stderr_capture = OutputCapture::new(spec.max_output_bytes);
         let status = loop {
+            if let Err(error) = stdout_capture.read_available(&mut stdout) {
+                terminate_process_boundary(&mut child, process_group);
+                return Err(error);
+            }
+            if let Err(error) = stderr_capture.read_available(&mut stderr) {
+                terminate_process_boundary(&mut child, process_group);
+                return Err(error);
+            }
             if control.is_cancelled() {
-                terminate_and_reap(&mut child, stdout_reader, stderr_reader);
+                terminate_process_boundary(&mut child, process_group);
+                drain_closed_boundary(
+                    &mut stdout,
+                    &mut stderr,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
                 return Err(RunnerError::cancelled());
             }
             match child.try_wait() {
-                Ok(Some(status)) => break status,
+                Ok(Some(status)) => {
+                    kill_process_group(process_group);
+                    reap_process_group(process_group);
+                    drain_closed_boundary(
+                        &mut stdout,
+                        &mut stderr,
+                        &mut stdout_capture,
+                        &mut stderr_capture,
+                    );
+                    break status;
+                }
                 Ok(None) if started.elapsed() < spec.timeout && !control.remaining().is_zero() => {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Ok(None) => {
-                    terminate_and_reap(&mut child, stdout_reader, stderr_reader);
+                    terminate_process_boundary(&mut child, process_group);
+                    drain_closed_boundary(
+                        &mut stdout,
+                        &mut stderr,
+                        &mut stdout_capture,
+                        &mut stderr_capture,
+                    );
                     return Err(RunnerError::timeout(
                         "adapter command exceeded its deadline",
                     ));
                 }
                 Err(error) => {
-                    terminate_and_reap(&mut child, stdout_reader, stderr_reader);
+                    terminate_process_boundary(&mut child, process_group);
+                    drain_closed_boundary(
+                        &mut stdout,
+                        &mut stderr,
+                        &mut stdout_capture,
+                        &mut stderr_capture,
+                    );
                     return Err(RunnerError::new(
                         RunnerErrorKind::Io,
                         format!("could not wait for adapter command: {error}"),
@@ -256,12 +303,8 @@ impl ProcessCommandRunner {
                 }
             }
         };
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| RunnerError::new(RunnerErrorKind::Io, "stdout reader failed"))??;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| RunnerError::new(RunnerErrorKind::Io, "stderr reader failed"))??;
+        let stdout = stdout_capture.finish()?;
+        let stderr = stderr_capture.finish()?;
         Ok((
             CommandOutput {
                 status: status.code().unwrap_or(128),
@@ -273,40 +316,126 @@ impl ProcessCommandRunner {
     }
 }
 
-fn terminate_and_reap(
-    child: &mut std::process::Child,
-    stdout_reader: thread::JoinHandle<Result<Vec<u8>, RunnerError>>,
-    stderr_reader: thread::JoinHandle<Result<Vec<u8>, RunnerError>>,
-) {
+fn terminate_process_boundary(child: &mut std::process::Child, process_group: libc::pid_t) {
+    kill_process_group(process_group);
     let _ = child.kill();
     let _ = child.wait();
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    reap_process_group(process_group);
 }
 
-fn read_capped(mut reader: impl Read, limit: usize) -> Result<Vec<u8>, RunnerError> {
-    let mut bytes = Vec::new();
-    let mut exceeded = false;
-    let mut chunk = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut chunk).map_err(|error| {
-            RunnerError::new(
-                RunnerErrorKind::Io,
-                format!("could not read adapter output: {error}"),
-            )
-        })?;
-        if count == 0 {
-            break;
+fn kill_process_group(process_group: libc::pid_t) {
+    if process_group > 0 {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
         }
-        let remaining = limit.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&chunk[..count.min(remaining)]);
-        exceeded |= count > remaining;
     }
-    if exceeded {
-        return Err(RunnerError::new(
+}
+
+fn ensure_process_subreaper() -> Result<(), RunnerError> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(RunnerError::new(
             RunnerErrorKind::Io,
-            "adapter output exceeded the bounded capture limit",
-        ));
+            format!(
+                "could not establish the adapter process boundary: {}",
+                io::Error::last_os_error()
+            ),
+        ))
     }
-    Ok(bytes)
+}
+
+fn reap_process_group(process_group: libc::pid_t) {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(-process_group, &mut status, libc::WNOHANG) };
+        if reaped > 0 {
+            continue;
+        }
+        let group_exists = unsafe { libc::kill(-process_group, 0) } == 0;
+        if !group_exists || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn drain_closed_boundary(
+    stdout: &mut impl Read,
+    stderr: &mut impl Read,
+    stdout_capture: &mut OutputCapture,
+    stderr_capture: &mut OutputCapture,
+) {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        let stdout_closed = stdout_capture.read_available(stdout).unwrap_or(true);
+        let stderr_closed = stderr_capture.read_available(stderr).unwrap_or(true);
+        if stdout_closed && stderr_closed || Instant::now() >= deadline {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+struct OutputCapture {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl OutputCapture {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+
+    fn read_available(&mut self, reader: &mut impl Read) -> Result<bool, RunnerError> {
+        let mut chunk = [0_u8; 8192];
+        for _ in 0..16 {
+            match reader.read(&mut chunk) {
+                Ok(0) => return Ok(true),
+                Ok(count) => {
+                    let remaining = self.limit.saturating_sub(self.bytes.len());
+                    self.bytes.extend_from_slice(&chunk[..count.min(remaining)]);
+                    self.exceeded |= count > remaining;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(output_error(error)),
+            }
+        }
+        Ok(false)
+    }
+
+    fn finish(self) -> Result<Vec<u8>, RunnerError> {
+        if self.exceeded {
+            Err(RunnerError::new(
+                RunnerErrorKind::Io,
+                "adapter output exceeded the bounded capture limit",
+            ))
+        } else {
+            Ok(self.bytes)
+        }
+    }
+}
+
+fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn output_error(error: io::Error) -> RunnerError {
+    RunnerError::new(
+        RunnerErrorKind::Io,
+        format!("could not read adapter output: {error}"),
+    )
 }

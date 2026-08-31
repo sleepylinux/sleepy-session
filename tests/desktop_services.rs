@@ -1,15 +1,17 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    fs::OpenOptions,
     io,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
+use fs2::FileExt;
 use sleepy_sdk::{
     validate_desktop_envelope, validate_desktop_result, AppearanceCommand, AudioCommand,
     BluetoothCommand, CapabilityAvailability, CapabilityFailure, CapabilityRecord, CapabilityValue,
@@ -29,8 +31,8 @@ use sleepy_session::desktop::secret_agent::{
 use sleepy_session::desktop::{audio, bluetooth, display, media, network, power};
 use sleepy_session::desktop::{
     DesktopControlAuthority, DesktopDomainId, DesktopDomainState, DesktopDomainValue,
-    DesktopMutationExecutor, DesktopMutationOutcome, DesktopProducer, DesktopRegistry,
-    DesktopStateAuthority, ProducerError,
+    DesktopMutationExecutor, DesktopMutationOutcome, DesktopProducer, DesktopProducerContext,
+    DesktopRegistry, DesktopStateAuthority, ProducerError,
 };
 use sleepy_session::sessiond::supervisor::PreparedDesktopSockets;
 use sleepy_session::system::{
@@ -40,7 +42,6 @@ use sleepy_session::system::{
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 struct StaticProducer {
@@ -66,6 +67,18 @@ struct DrainTrackingProducer {
 
 struct UncooperativeAsyncProducer(DesktopDomainId);
 
+struct SingleUpdateProducer {
+    domain: DesktopDomainId,
+    update_sent: Arc<AtomicBool>,
+}
+
+struct RegisteredBlockingProducer {
+    domain: DesktopDomainId,
+    started: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    test_release: Arc<AtomicBool>,
+}
+
 #[async_trait]
 impl DesktopProducer for ReconnectingProducer {
     fn domain(&self) -> DesktopDomainId {
@@ -84,7 +97,7 @@ impl DesktopProducer for ReconnectingProducer {
     async fn run(
         &self,
         _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        cancellation: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
@@ -113,7 +126,7 @@ impl DesktopProducer for PanickingProducer {
     async fn run(
         &self,
         _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
-        _cancellation: CancellationToken,
+        _cancellation: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         panic!("fixture producer panic")
@@ -138,7 +151,7 @@ impl DesktopProducer for DrainTrackingProducer {
     async fn run(
         &self,
         _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        cancellation: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         cancellation.cancelled().await;
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -165,8 +178,69 @@ impl DesktopProducer for UncooperativeAsyncProducer {
     async fn run(
         &self,
         _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
-        _cancellation: CancellationToken,
+        _cancellation: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl DesktopProducer for SingleUpdateProducer {
+    fn domain(&self) -> DesktopDomainId {
+        self.domain
+    }
+
+    async fn initial(&self) -> DesktopDomainState {
+        DesktopDomainState::available(self.domain, DesktopDomainValue::empty(self.domain)).unwrap()
+    }
+
+    async fn run(
+        &self,
+        sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
+        cancellation: DesktopProducerContext,
+    ) -> Result<(), ProducerError> {
+        sender
+            .send(sleepy_session::desktop::DesktopDomainUpdate {
+                state: DesktopDomainState::available(
+                    self.domain,
+                    DesktopDomainValue::empty(self.domain),
+                )
+                .unwrap(),
+            })
+            .await
+            .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
+        self.update_sent.store(true, Ordering::SeqCst);
+        cancellation.cancelled().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DesktopProducer for RegisteredBlockingProducer {
+    fn domain(&self) -> DesktopDomainId {
+        self.domain
+    }
+
+    async fn initial(&self) -> DesktopDomainState {
+        DesktopDomainState::available(self.domain, DesktopDomainValue::empty(self.domain)).unwrap()
+    }
+
+    async fn run(
+        &self,
+        _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
+        cancellation: DesktopProducerContext,
+    ) -> Result<(), ProducerError> {
+        let started = Arc::clone(&self.started);
+        let finished = Arc::clone(&self.finished);
+        let test_release = Arc::clone(&self.test_release);
+        let _worker =
+            cancellation.spawn_blocking(Instant::now() + Duration::from_secs(30), move |control| {
+                started.store(true, Ordering::SeqCst);
+                while !control.is_cancelled() && !test_release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                finished.store(true, Ordering::SeqCst);
+            });
         std::future::pending().await
     }
 }
@@ -174,6 +248,12 @@ impl DesktopProducer for UncooperativeAsyncProducer {
 #[derive(Clone)]
 struct BlockingProcessRunner {
     pid_path: Arc<PathBuf>,
+}
+
+#[derive(Clone)]
+struct DescendantPipeRunner {
+    parent_pid_path: Arc<PathBuf>,
+    descendant_pid_path: Arc<PathBuf>,
 }
 
 impl CommandRunner for BlockingProcessRunner {
@@ -193,6 +273,32 @@ impl CommandRunner for BlockingProcessRunner {
                 "printf '%s' \"$$\" > \"$1\"; exec sleep 30".to_owned(),
                 "sleepy-producer-test".to_owned(),
                 self.pid_path.to_string_lossy().into_owned(),
+            ],
+        );
+        command.timeout = Duration::from_secs(30);
+        ProcessCommandRunner.run_controlled(&command, control)
+    }
+}
+
+impl CommandRunner for DescendantPipeRunner {
+    fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+        self.run_controlled(command, &RunControl::for_timeout(Duration::from_secs(30)))
+    }
+
+    fn run_controlled(
+        &self,
+        _command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        let mut command = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                "printf '%s' \"$$\" > \"$1\"; sleep 30 & printf '%s' \"$!\" > \"$2\"; wait"
+                    .to_owned(),
+                "sleepy-producer-descendant-test".to_owned(),
+                self.parent_pid_path.to_string_lossy().into_owned(),
+                self.descendant_pid_path.to_string_lossy().into_owned(),
             ],
         );
         command.timeout = Duration::from_secs(30);
@@ -248,7 +354,7 @@ impl DesktopProducer for StaticProducer {
     async fn run(
         &self,
         _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        cancellation: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         cancellation.cancelled().await;
         Ok(())
@@ -1486,6 +1592,256 @@ async fn runtime_timeout_is_bounded_and_reaps_a_production_command_child() {
     assert!(before.elapsed() < Duration::from_millis(250));
     assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+}
+
+#[tokio::test]
+async fn shutdown_sets_the_registered_blocking_control_before_an_immediate_attempt_abort() {
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let test_release = Arc::new(AtomicBool::new(false));
+    let core = Arc::new(RegisteredBlockingProducer {
+        domain: DesktopDomainId::Network,
+        started: Arc::clone(&started),
+        finished: Arc::clone(&finished),
+        test_release: Arc::clone(&test_release),
+    }) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Network,
+            core,
+        ))))
+        .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let authority =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let runtime = registry.start(authority, 16).unwrap();
+    let start_deadline = Instant::now() + Duration::from_secs(3);
+    while !started.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < start_deadline,
+            "blocking producer seam did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    let shutdown =
+        tokio::time::timeout(Duration::from_millis(350), runtime.shutdown(Duration::ZERO)).await;
+    let finished_before_test_release = finished.load(Ordering::SeqCst);
+    test_release.store(true, Ordering::SeqCst);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    while !finished.load(Ordering::SeqCst) && Instant::now() < cleanup_deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    assert!(
+        shutdown.is_ok(),
+        "shutdown exceeded its fixed reap tolerance"
+    );
+    assert!(
+        finished_before_test_release,
+        "runtime abort detached the registered blocking producer worker"
+    );
+}
+
+#[tokio::test]
+async fn process_cancellation_kills_the_pipe_owning_group_and_reaps_descendant_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent_pid_path = Arc::new(temp.path().join("producer-parent.pid"));
+    let descendant_pid_path = Arc::new(temp.path().join("producer-descendant.pid"));
+    let core = Arc::new(
+        CoreSystemProducer::new(
+            DesktopDomainId::Network,
+            Arc::new(SystemFacade::new(DescendantPipeRunner {
+                parent_pid_path: Arc::clone(&parent_pid_path),
+                descendant_pid_path: Arc::clone(&descendant_pid_path),
+            })),
+        )
+        .unwrap(),
+    ) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Network,
+            core,
+        ))))
+        .unwrap(),
+    );
+    let authority =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let runtime = registry.start(authority, 16).unwrap();
+    let child_start_deadline = Instant::now() + Duration::from_secs(3);
+    while !parent_pid_path.exists() || !descendant_pid_path.exists() {
+        assert!(
+            Instant::now() < child_start_deadline,
+            "pipe-owning process group did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let parent_pid = std::fs::read_to_string(parent_pid_path.as_ref())
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let descendant_pid = std::fs::read_to_string(descendant_pid_path.as_ref())
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+
+    let shutdown = tokio::time::timeout(
+        Duration::from_millis(400),
+        runtime.shutdown(Duration::from_millis(100)),
+    )
+    .await;
+    let parent_alive = unsafe { libc::kill(parent_pid, 0) } == 0;
+    let descendant_alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
+    if descendant_alive {
+        unsafe {
+            libc::kill(descendant_pid, libc::SIGKILL);
+        }
+    }
+
+    assert!(!parent_alive, "direct command child was not reaped");
+    assert!(
+        !descendant_alive,
+        "pipe-owning command descendant survived cancellation"
+    );
+    assert!(shutdown.is_ok(), "shutdown hung on descendant-held pipes");
+    assert!(shutdown.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn shutdown_drains_an_in_flight_publication_before_it_can_advance_after_return() {
+    let temp = tempfile::tempdir().unwrap();
+    let generation_path = temp.path().join("generation");
+    let authority = DesktopStateAuthority::open(available_registry(), &generation_path, 16)
+        .await
+        .unwrap();
+    authority.initialize().await.unwrap();
+    for enabled in (0..63).map(|index| index % 2 == 0) {
+        authority
+            .publish_domain(
+                DesktopDomainState::available(
+                    DesktopDomainId::GameMode,
+                    DesktopDomainValue::GameMode(enabled),
+                )
+                .unwrap(),
+                EventCause {
+                    kind: EventCauseKind::External,
+                    request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let baseline_generation = authority.current_generation();
+    let generation_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp.path().join("generation.lock"))
+        .unwrap();
+    FileExt::lock_exclusive(&generation_lock).unwrap();
+
+    let update_sent = Arc::new(AtomicBool::new(false));
+    let updating = Arc::new(SingleUpdateProducer {
+        domain: DesktopDomainId::Network,
+        update_sent: Arc::clone(&update_sent),
+    }) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Network,
+            updating,
+        ))))
+        .unwrap(),
+    );
+    let runtime = registry.start(Arc::clone(&authority), 16).unwrap();
+    let update_deadline = Instant::now() + Duration::from_secs(3);
+    while !update_sent.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < update_deadline,
+            "publication fixture did not enqueue its update"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let shutdown = tokio::time::timeout(
+        Duration::from_millis(400),
+        runtime.shutdown(Duration::from_millis(100)),
+    )
+    .await;
+    FileExt::unlock(&generation_lock).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let generation_after_return = authority.current_generation();
+
+    assert_eq!(generation_after_return, baseline_generation);
+    assert!(
+        shutdown.is_ok(),
+        "publication shutdown exceeded its hard bound"
+    );
+    assert!(shutdown.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn appearance_poll_contention_cannot_overwrite_a_confirmed_authority_readback() {
+    use sleepy_session::desktop::appearance::AppearanceService;
+    use sleepy_session::theme::ThemeManager;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config");
+    let state = temp.path().join("state");
+    let manager = Arc::new(tokio::sync::Mutex::new(
+        ThemeManager::open(&config, &state).unwrap(),
+    ));
+    let service = Arc::new(AppearanceService::open(Arc::clone(&manager), &state).unwrap());
+    let appearance = Arc::new(AppearanceProducer::new(service)) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Appearance,
+            appearance,
+        ))))
+        .unwrap(),
+    );
+    let authority =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let mut events = authority.subscribe().await.unwrap();
+    events.recv().await.unwrap();
+    let held_theme_lock = manager.lock().await;
+    let runtime = registry.start(Arc::clone(&authority), 16).unwrap();
+    tokio::time::sleep(Duration::from_millis(1_850)).await;
+    let confirmed = authority
+        .publish_domain(
+            DesktopDomainState::available(
+                DesktopDomainId::Appearance,
+                DesktopDomainValue::empty(DesktopDomainId::Appearance),
+            )
+            .unwrap(),
+            EventCause {
+                kind: EventCauseKind::Request,
+                request_id: Some("00000000-0000-4000-8000-000000000099".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.recv().await.unwrap(), confirmed);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let contention_update = tokio::time::timeout(Duration::from_millis(25), events.recv()).await;
+    let generation_after_poll = authority.current_generation();
+    drop(held_theme_lock);
+    runtime.shutdown(Duration::from_secs(1)).await.unwrap();
+
+    assert!(
+        contention_update.is_err(),
+        "periodic lock contention emitted an authoritative update"
+    );
+    assert_eq!(generation_after_poll, confirmed.generation);
 }
 
 #[tokio::test]

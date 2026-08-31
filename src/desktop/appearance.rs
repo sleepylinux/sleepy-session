@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sleepy_sdk::{AppearanceCommand, DesktopAppearanceSnapshot, StableId};
 use tokio::sync::Mutex;
 
-use crate::{store::SecureDir, theme::ThemeManager};
+use crate::{desktop::DesktopProducerContext, store::SecureDir, theme::ThemeManager};
 
 const APPEARANCE_FILE: &str = "desktop-appearance.json";
 const DEFAULT_WALLPAPER: &str = "builtin.sleepy-default";
@@ -52,24 +52,45 @@ impl AppearanceService {
         .map_err(|error| io::Error::other(format!("appearance worker failed: {error}")))?
     }
 
-    pub(crate) async fn polling_snapshot(&self) -> io::Result<DesktopAppearanceSnapshot> {
+    pub(crate) async fn polling_snapshot(
+        &self,
+        context: &DesktopProducerContext,
+    ) -> io::Result<DesktopAppearanceSnapshot> {
         let manager = Arc::clone(&self.manager);
         let state = self.state.clone();
-        tokio::task::spawn_blocking(move || {
-            let theme = manager
-                .try_lock()
-                .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "theme manager is busy"))?
-                .current()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let wallpaper_id = read_wallpaper(&state)?;
-            Ok(DesktopAppearanceSnapshot {
-                availability: super::available_producer(),
-                theme,
-                wallpaper_id,
-            })
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("appearance worker failed: {error}")))?
+        context
+            .spawn_blocking(
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+                move |control| {
+                    if control.is_cancelled() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "appearance polling was cancelled",
+                        ));
+                    }
+                    let theme = manager
+                        .try_lock()
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::WouldBlock, "theme manager is busy")
+                        })?
+                        .current()
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    let wallpaper_id = read_wallpaper(&state)?;
+                    if control.is_cancelled() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "appearance polling was cancelled",
+                        ));
+                    }
+                    Ok(DesktopAppearanceSnapshot {
+                        availability: super::available_producer(),
+                        theme,
+                        wallpaper_id,
+                    })
+                },
+            )
+            .await
+            .map_err(|error| io::Error::other(format!("appearance worker failed: {error}")))?
     }
 
     pub async fn apply(

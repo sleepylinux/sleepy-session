@@ -9,11 +9,10 @@ use sleepy_sdk::{
     LauncherEntry, WeatherLocation, WeatherSnapshot,
 };
 use tokio::sync::{mpsc, Mutex};
-use tokio_util::sync::CancellationToken;
 
 use super::{
     DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue, DesktopProducer,
-    ProducerError,
+    DesktopProducerContext, ProducerError,
 };
 use crate::{
     compositor::{CompositorError, CompositorErrorKind, HyprlandAdapter, HyprlandEvent},
@@ -60,9 +59,9 @@ impl DesktopProducer for TerminalProducer {
     async fn run(
         &self,
         _sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
-        cancellation.cancelled().await;
+        context.cancelled().await;
         Ok(())
     }
 }
@@ -106,7 +105,7 @@ impl DesktopProducer for HyprlandProducer {
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         let (events, mut received) = mpsc::channel::<HyprlandEvent>(64);
         let adapter = self.adapter.clone();
@@ -114,7 +113,7 @@ impl DesktopProducer for HyprlandProducer {
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => {
+                _ = context.cancelled() => {
                     event_task.abort();
                     let _ = event_task.await;
                     return Ok(());
@@ -174,9 +173,9 @@ impl DesktopProducer for NotificationProducer {
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
-        poll_updates(self, sender, cancellation, Duration::from_secs(1)).await
+        poll_updates(self, sender, context, Duration::from_secs(1)).await
     }
 }
 
@@ -189,23 +188,39 @@ impl AppearanceProducer {
         Self { service }
     }
 
-    async fn snapshot(&self) -> DesktopDomainState {
-        match self.service.polling_snapshot().await {
-            Ok(snapshot) => DesktopDomainState::available(
-                DesktopDomainId::Appearance,
-                DesktopDomainValue::Appearance {
-                    theme: snapshot.theme,
-                    wallpaper_id: snapshot.wallpaper_id,
-                },
-            )
-            .expect("matching appearance domain"),
-            Err(error) => DesktopDomainState::terminal(
-                DesktopDomainId::Appearance,
-                CapabilityAvailability::Error,
-                error.to_string(),
-            )
-            .expect("theme errors have diagnostics"),
+    async fn initial_snapshot(&self) -> DesktopDomainState {
+        appearance_state(self.service.snapshot().await)
+    }
+
+    async fn polling_snapshot(
+        &self,
+        context: &DesktopProducerContext,
+    ) -> Option<DesktopDomainState> {
+        match self.service.polling_snapshot(context).await {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+            result => Some(appearance_state(result)),
         }
+    }
+}
+
+fn appearance_state(
+    result: io::Result<sleepy_sdk::DesktopAppearanceSnapshot>,
+) -> DesktopDomainState {
+    match result {
+        Ok(snapshot) => DesktopDomainState::available(
+            DesktopDomainId::Appearance,
+            DesktopDomainValue::Appearance {
+                theme: snapshot.theme,
+                wallpaper_id: snapshot.wallpaper_id,
+            },
+        )
+        .expect("matching appearance domain"),
+        Err(error) => DesktopDomainState::terminal(
+            DesktopDomainId::Appearance,
+            CapabilityAvailability::Error,
+            error.to_string(),
+        )
+        .expect("theme errors have diagnostics"),
     }
 }
 
@@ -216,15 +231,15 @@ impl DesktopProducer for AppearanceProducer {
     }
 
     async fn initial(&self) -> DesktopDomainState {
-        self.snapshot().await
+        self.initial_snapshot().await
     }
 
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
-        poll_updates(self, sender, cancellation, Duration::from_secs(2)).await
+        poll_updates(self, sender, context, Duration::from_secs(2)).await
     }
 }
 
@@ -252,7 +267,7 @@ impl<B: DailyBackend> DailyProducer<B> {
         })
     }
 
-    async fn snapshot(&self) -> DesktopDomainState {
+    async fn snapshot(&self, context: Option<&DesktopProducerContext>) -> DesktopDomainState {
         if self.domain == DesktopDomainId::Weather && self.weather_location.is_none() {
             return DesktopDomainState::terminal(
                 self.domain,
@@ -264,14 +279,28 @@ impl<B: DailyBackend> DailyProducer<B> {
         let domain = self.domain;
         let backend = Arc::clone(&self.backend);
         let location = self.weather_location.clone();
-        match tokio::task::spawn_blocking(move || {
-            let operation = daily_operation(domain, location)?;
-            let value = backend
-                .handle_controlled(operation, &RunControl::for_timeout(Duration::from_secs(2)))?;
-            daily_value(domain, value)
-        })
-        .await
-        {
+        let result = match context {
+            Some(context) => {
+                context
+                    .spawn_blocking(
+                        std::time::Instant::now() + Duration::from_secs(2),
+                        move |control| daily_probe(domain, backend, location, &control),
+                    )
+                    .await
+            }
+            None => {
+                tokio::task::spawn_blocking(move || {
+                    daily_probe(
+                        domain,
+                        backend,
+                        location,
+                        &RunControl::for_timeout(Duration::from_secs(2)),
+                    )
+                })
+                .await
+            }
+        };
+        match result {
             Ok(Ok(value)) => DesktopDomainState::available(domain, value)
                 .unwrap_or_else(|error| terminal(domain, CapabilityAvailability::Parse, error)),
             Ok(Err(error)) => terminal(domain, availability_for_io(&error), error),
@@ -287,15 +316,15 @@ impl<B: DailyBackend> DesktopProducer for DailyProducer<B> {
     }
 
     async fn initial(&self) -> DesktopDomainState {
-        self.snapshot().await
+        self.snapshot(None).await
     }
 
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
-        poll_updates(self, sender, cancellation, Duration::from_secs(30)).await
+        poll_updates(self, sender, context, Duration::from_secs(30)).await
     }
 }
 
@@ -332,7 +361,7 @@ impl DesktopProducer for OsdProducer {
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         let mut subscriber = self
             .hub
@@ -341,7 +370,7 @@ impl DesktopProducer for OsdProducer {
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(()),
+                _ = context.cancelled() => return Ok(()),
                 publication = subscriber.recv() => {
                     let publication = publication.map_err(|error| ProducerError::new(error.to_string()))?;
                     sender.send(DesktopDomainUpdate { state: osd_state(publication.visible) })
@@ -355,34 +384,46 @@ impl DesktopProducer for OsdProducer {
 
 #[async_trait]
 trait PollingState {
-    async fn polling_snapshot(&self) -> DesktopDomainState;
+    async fn polling_snapshot(
+        &self,
+        context: &DesktopProducerContext,
+    ) -> Option<DesktopDomainState>;
 }
 
 #[async_trait]
 impl PollingState for NotificationProducer {
-    async fn polling_snapshot(&self) -> DesktopDomainState {
-        self.snapshot().await
+    async fn polling_snapshot(
+        &self,
+        _context: &DesktopProducerContext,
+    ) -> Option<DesktopDomainState> {
+        Some(self.snapshot().await)
     }
 }
 
 #[async_trait]
 impl PollingState for AppearanceProducer {
-    async fn polling_snapshot(&self) -> DesktopDomainState {
-        self.snapshot().await
+    async fn polling_snapshot(
+        &self,
+        context: &DesktopProducerContext,
+    ) -> Option<DesktopDomainState> {
+        self.polling_snapshot(context).await
     }
 }
 
 #[async_trait]
 impl<B: DailyBackend> PollingState for DailyProducer<B> {
-    async fn polling_snapshot(&self) -> DesktopDomainState {
-        self.snapshot().await
+    async fn polling_snapshot(
+        &self,
+        context: &DesktopProducerContext,
+    ) -> Option<DesktopDomainState> {
+        Some(self.snapshot(Some(context)).await)
     }
 }
 
 async fn poll_updates<P: PollingState + Sync>(
     producer: &P,
     sender: mpsc::Sender<DesktopDomainUpdate>,
-    cancellation: CancellationToken,
+    context: DesktopProducerContext,
     period: Duration,
 ) -> Result<(), ProducerError> {
     let mut previous = None;
@@ -392,9 +433,11 @@ async fn poll_updates<P: PollingState + Sync>(
     loop {
         tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Ok(()),
+            _ = context.cancelled() => return Ok(()),
             _ = interval.tick() => {
-                let current = producer.polling_snapshot().await;
+                let Some(current) = producer.polling_snapshot(&context).await else {
+                    continue;
+                };
                 if previous.as_ref() != Some(&current) {
                     sender.send(DesktopDomainUpdate { state: current.clone() })
                         .await
@@ -404,6 +447,17 @@ async fn poll_updates<P: PollingState + Sync>(
             }
         }
     }
+}
+
+fn daily_probe<B: DailyBackend>(
+    domain: DesktopDomainId,
+    backend: Arc<B>,
+    location: Option<WeatherLocation>,
+    control: &RunControl,
+) -> io::Result<DesktopDomainValue> {
+    let operation = daily_operation(domain, location)?;
+    let value = backend.handle_controlled(operation, control)?;
+    daily_value(domain, value)
 }
 
 fn daily_operation(

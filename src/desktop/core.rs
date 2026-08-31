@@ -2,13 +2,18 @@
 
 use std::{
     io,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use super::{
+    DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue, DesktopProducer,
+    DesktopProducerContext, ProducerError,
+};
+use crate::system::{
+    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunControl, RunnerError,
+    SystemFacade,
+};
 use async_trait::async_trait;
 use sleepy_sdk::{
     AudioNode, AudioNodeKind, AudioSnapshot, BluetoothDevice, BluetoothSnapshot,
@@ -17,16 +22,6 @@ use sleepy_sdk::{
     RuntimeCapabilityId,
 };
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
-
-use super::{
-    DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue, DesktopProducer,
-    ProducerError,
-};
-use crate::system::{
-    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunControl, RunnerError,
-    SystemFacade,
-};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_DEADLINE: Duration = Duration::from_millis(1_750);
@@ -112,15 +107,13 @@ impl<R: CommandRunner> CoreSystemProducer<R> {
 
     async fn probe_until_cancelled(
         &self,
-        cancellation: &CancellationToken,
+        context: &DesktopProducerContext,
     ) -> Option<DesktopDomainState> {
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let control =
-            RunControl::for_request(Instant::now() + PROBE_DEADLINE, Arc::clone(&interrupted));
         let facade = Arc::clone(&self.facade);
         let domain = self.domain;
-        let mut worker =
-            tokio::task::spawn_blocking(move || probe_domain_controlled(&facade, domain, control));
+        let mut worker = context.spawn_blocking(Instant::now() + PROBE_DEADLINE, move |control| {
+            probe_domain_controlled(&facade, domain, control)
+        });
         tokio::select! {
             result = &mut worker => Some(result.unwrap_or_else(|_| {
                 DesktopDomainState::terminal(
@@ -130,8 +123,7 @@ impl<R: CommandRunner> CoreSystemProducer<R> {
                 )
                 .expect("static diagnostic")
             })),
-            _ = cancellation.cancelled() => {
-                interrupted.store(true, Ordering::SeqCst);
+            _ = context.cancelled() => {
                 let _ = worker.await;
                 None
             }
@@ -152,7 +144,7 @@ impl<R: CommandRunner> DesktopProducer for CoreSystemProducer<R> {
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         let mut previous = None;
         let mut interval = tokio::time::interval(REFRESH_INTERVAL);
@@ -161,9 +153,9 @@ impl<R: CommandRunner> DesktopProducer for CoreSystemProducer<R> {
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(()),
+                _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
-                    let Some(current) = self.probe_until_cancelled(&cancellation).await else {
+                    let Some(current) = self.probe_until_cancelled(&context).await else {
                         return Ok(());
                     };
                     if previous.as_ref() != Some(&current) {

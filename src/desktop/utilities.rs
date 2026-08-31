@@ -19,12 +19,11 @@ use sleepy_sdk::{
     RecordingStatus, UtilityCommand,
 };
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
 use super::{
     DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue, DesktopProducer,
-    ProducerError,
+    DesktopProducerContext, ProducerError,
 };
 use crate::system::{CommandSpec, ProcessCommandRunner};
 
@@ -215,18 +214,28 @@ impl ProductionUtilityService {
         }
     }
 
-    fn state_for_poll(&self, domain: DesktopDomainId) -> DesktopDomainState {
-        if domain != DesktopDomainId::Recording {
-            return self.state(domain);
-        }
-        match self
-            .recording_snapshot_for_poll()
-            .map(DesktopDomainValue::Recording)
-        {
-            Ok(value) => DesktopDomainState::available(domain, value).unwrap_or_else(|error| {
-                terminal(domain, CapabilityAvailability::Parse, error.to_string())
-            }),
-            Err(error) => terminal(domain, availability_for_io(&error), error.to_string()),
+    fn state_for_poll(&self, domain: DesktopDomainId) -> io::Result<DesktopDomainState> {
+        let result = match domain {
+            DesktopDomainId::Recording => self
+                .recording_snapshot_for_poll()
+                .map(DesktopDomainValue::Recording),
+            DesktopDomainId::IdleInhibit => self
+                .idle_snapshot_for_poll()
+                .map(DesktopDomainValue::IdleInhibit),
+            _ => return Ok(self.state(domain)),
+        };
+        match result {
+            Ok(value) => Ok(
+                DesktopDomainState::available(domain, value).unwrap_or_else(|error| {
+                    terminal(domain, CapabilityAvailability::Parse, error.to_string())
+                }),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
+            Err(error) => Ok(terminal(
+                domain,
+                availability_for_io(&error),
+                error.to_string(),
+            )),
         }
     }
 
@@ -477,6 +486,23 @@ impl ProductionUtilityService {
             .is_some())
     }
 
+    fn idle_snapshot_for_poll(&self) -> io::Result<bool> {
+        let inhibited = self
+            .idle_inhibitor
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::Poisoned(_) => {
+                    io::Error::other("idle inhibitor lock poisoned")
+                }
+                std::sync::TryLockError::WouldBlock => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "idle inhibitor state is busy")
+                }
+            })?
+            .is_some();
+        require_bus_name(true, LOGIN1_DESTINATION)?;
+        Ok(inhibited)
+    }
+
     fn set_idle_inhibited(&self, enabled: bool) -> io::Result<()> {
         let mut inhibitor = self
             .idle_inhibitor
@@ -648,10 +674,10 @@ impl UtilityProducer {
         Ok(Self { domain, service })
     }
 
-    async fn probe(&self) -> DesktopDomainState {
+    async fn initial_probe(&self) -> DesktopDomainState {
         let service = Arc::clone(&self.service);
         let domain = self.domain;
-        tokio::task::spawn_blocking(move || service.state_for_poll(domain))
+        tokio::task::spawn_blocking(move || service.state(domain))
             .await
             .unwrap_or_else(|_| {
                 terminal(
@@ -660,6 +686,48 @@ impl UtilityProducer {
                     "utility probe worker failed",
                 )
             })
+    }
+
+    async fn polling_probe(&self, context: &DesktopProducerContext) -> Option<DesktopDomainState> {
+        let service = Arc::clone(&self.service);
+        let domain = self.domain;
+        let result = context
+            .spawn_blocking(Instant::now() + Duration::from_secs(2), move |control| {
+                if control.is_cancelled() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "utility polling was cancelled",
+                    ));
+                }
+                let state = service.state_for_poll(domain)?;
+                if control.is_cancelled() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "utility polling was cancelled",
+                    ));
+                }
+                Ok(state)
+            })
+            .await;
+        match result {
+            Ok(Ok(state)) => Some(state),
+            Ok(Err(error))
+                if error.kind() == io::ErrorKind::WouldBlock || context.is_cancelled() =>
+            {
+                None
+            }
+            Ok(Err(error)) => Some(terminal(
+                domain,
+                availability_for_io(&error),
+                error.to_string(),
+            )),
+            Err(_) if context.is_cancelled() => None,
+            Err(_) => Some(terminal(
+                domain,
+                CapabilityAvailability::Error,
+                "utility probe worker failed",
+            )),
+        }
     }
 }
 
@@ -670,13 +738,13 @@ impl DesktopProducer for UtilityProducer {
     }
 
     async fn initial(&self) -> DesktopDomainState {
-        self.probe().await
+        self.initial_probe().await
     }
 
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         let mut previous = None;
         let mut interval = tokio::time::interval(UTILITY_REFRESH);
@@ -685,9 +753,11 @@ impl DesktopProducer for UtilityProducer {
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(()),
+                _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
-                    let current = self.probe().await;
+                    let Some(current) = self.polling_probe(&context).await else {
+                        continue;
+                    };
                     if previous.as_ref() != Some(&current) {
                         sender.send(DesktopDomainUpdate { state: current.clone() })
                             .await
@@ -1045,8 +1115,18 @@ fn invoke_logind_action(
 pub struct LogindProducer;
 
 impl LogindProducer {
-    async fn probe(&self) -> DesktopDomainState {
-        match tokio::task::spawn_blocking(|| ProductionLogind.state()).await {
+    async fn probe(&self, context: Option<&DesktopProducerContext>) -> DesktopDomainState {
+        let result = match context {
+            Some(context) => {
+                context
+                    .spawn_blocking(Instant::now() + LOGIND_STATE_TIMEOUT, |_control| {
+                        ProductionLogind.state()
+                    })
+                    .await
+            }
+            None => tokio::task::spawn_blocking(|| ProductionLogind.state()).await,
+        };
+        match result {
             Ok(Ok(state)) => state,
             Ok(Err(error)) => terminal(
                 DesktopDomainId::Lock,
@@ -1069,13 +1149,13 @@ impl DesktopProducer for LogindProducer {
     }
 
     async fn initial(&self) -> DesktopDomainState {
-        self.probe().await
+        self.probe(None).await
     }
 
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         let mut previous = None;
         let mut interval = tokio::time::interval(Duration::from_secs(2));
@@ -1084,9 +1164,9 @@ impl DesktopProducer for LogindProducer {
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(()),
+                _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
-                    let current = self.probe().await;
+                    let current = self.probe(Some(&context)).await;
                     if previous.as_ref() != Some(&current) {
                         sender.send(DesktopDomainUpdate { state: current.clone() })
                             .await
@@ -1221,6 +1301,55 @@ mod tests {
             service.recording_snapshot_for_poll().unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn polling_idle_state_never_waits_for_a_mutation_owned_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = ProductionUtilityService::open(temp.path().join("captures")).unwrap();
+        let _held_mutation = service.idle_inhibitor.lock().unwrap();
+
+        assert_eq!(
+            service.idle_snapshot_for_poll().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_poll_contention_emits_no_producer_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let service =
+            Arc::new(ProductionUtilityService::open(temp.path().join("captures")).unwrap());
+        let producer =
+            UtilityProducer::new(DesktopDomainId::Recording, Arc::clone(&service)).unwrap();
+        let held_service = Arc::clone(&service);
+        let (held, held_observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held_mutation = held_service.recording.lock().unwrap();
+            held.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        held_observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let context = DesktopProducerContext::new(
+            cancellation.clone(),
+            Arc::new(super::super::BlockingTaskTracker::default()),
+        );
+        let task = tokio::spawn(async move { producer.run(sender, context).await });
+
+        tokio::time::sleep(UTILITY_REFRESH + Duration::from_millis(50)).await;
+        let contention_update = receiver.try_recv();
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+
+        assert!(matches!(
+            contention_update,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

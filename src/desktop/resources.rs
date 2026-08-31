@@ -5,11 +5,10 @@ use std::{io, sync::Mutex, time::Duration};
 use async_trait::async_trait;
 use sleepy_sdk::{CapabilityAvailability, ResourceSample};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use super::{
     DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue, DesktopProducer,
-    ProducerError,
+    DesktopProducerContext, ProducerError,
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
@@ -33,8 +32,33 @@ impl Default for ResourceProducer {
 }
 
 impl ResourceProducer {
-    async fn probe(&self) -> DesktopDomainState {
-        let reading = tokio::task::spawn_blocking(read_host_resources).await;
+    async fn probe(&self, context: Option<&DesktopProducerContext>) -> DesktopDomainState {
+        let reading = match context {
+            Some(context) => {
+                context
+                    .spawn_blocking(
+                        std::time::Instant::now() + Duration::from_secs(2),
+                        |control| {
+                            if control.is_cancelled() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "resource polling was cancelled",
+                                ));
+                            }
+                            let reading = read_host_resources()?;
+                            if control.is_cancelled() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "resource polling was cancelled",
+                                ));
+                            }
+                            Ok(reading)
+                        },
+                    )
+                    .await
+            }
+            None => tokio::task::spawn_blocking(read_host_resources).await,
+        };
         match reading {
             Ok(Ok((current, memory_usage, load_one))) => {
                 let cpu_usage = {
@@ -77,13 +101,13 @@ impl DesktopProducer for ResourceProducer {
     }
 
     async fn initial(&self) -> DesktopDomainState {
-        self.probe().await
+        self.probe(None).await
     }
 
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError> {
         let mut interval = tokio::time::interval(REFRESH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -91,9 +115,9 @@ impl DesktopProducer for ResourceProducer {
         loop {
             tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => return Ok(()),
+                _ = context.cancelled() => return Ok(()),
                 _ = interval.tick() => {
-                    sender.send(DesktopDomainUpdate { state: self.probe().await })
+                    sender.send(DesktopDomainUpdate { state: self.probe(Some(&context)).await })
                         .await
                         .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
                 }

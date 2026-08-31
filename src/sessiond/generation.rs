@@ -70,9 +70,18 @@ impl GenerationAllocator {
     }
 
     pub fn next_generation(&mut self) -> io::Result<u64> {
+        self.next_generation_while(|| false)
+    }
+
+    pub(crate) fn next_generation_while(
+        &mut self,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> io::Result<u64> {
+        ensure_not_cancelled(&mut cancelled)?;
         if self.next == self.end {
-            self.reserve_block()?;
+            self.reserve_block_while(&mut cancelled)?;
         }
+        ensure_not_cancelled(&mut cancelled)?;
         let generation = self.next;
         self.next = self
             .next
@@ -94,13 +103,27 @@ impl GenerationAllocator {
     }
 
     fn reserve_block(&mut self) -> io::Result<()> {
+        self.reserve_block_while(&mut || false)
+    }
+
+    fn reserve_block_while(&mut self, cancelled: &mut impl FnMut() -> bool) -> io::Result<()> {
         let lock = self
             .directory
             .open_lock(&self.lock_name)
             .map_err(store_error)?;
         validate_private_file(&lock)?;
-        lock.lock_exclusive()?;
+        loop {
+            ensure_not_cancelled(cancelled)?;
+            match FileExt::try_lock_exclusive(&lock) {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
+        ensure_not_cancelled(cancelled)?;
         self.directory
             .validate_private_file_if_present(&self.state_name)
             .map_err(store_error)?;
@@ -108,6 +131,7 @@ impl GenerationAllocator {
         let end = start
             .checked_add(self.block_size)
             .ok_or_else(|| io::Error::other("generation range exhausted"))?;
+        ensure_not_cancelled(cancelled)?;
         atomic_write(
             &self.directory,
             &self.state_name,
@@ -117,6 +141,17 @@ impl GenerationAllocator {
 
         self.next = start;
         self.end = end;
+        Ok(())
+    }
+}
+
+fn ensure_not_cancelled(cancelled: &mut impl FnMut() -> bool) -> io::Result<()> {
+    if cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "generation allocation was cancelled",
+        ))
+    } else {
         Ok(())
     }
 }

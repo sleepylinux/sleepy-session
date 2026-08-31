@@ -3,7 +3,10 @@ use std::{
     ffi::OsString,
     fmt, io,
     path::Path,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::{Duration, Instant as StdInstant},
 };
 
@@ -340,8 +343,117 @@ pub trait DesktopProducer: Send + Sync {
     async fn run(
         &self,
         sender: mpsc::Sender<DesktopDomainUpdate>,
-        cancellation: CancellationToken,
+        context: DesktopProducerContext,
     ) -> Result<(), ProducerError>;
+}
+
+#[derive(Clone)]
+pub struct DesktopProducerContext {
+    cancellation: CancellationToken,
+    blocking_cancelled: Arc<AtomicBool>,
+    blocking_tasks: Arc<BlockingTaskTracker>,
+}
+
+impl DesktopProducerContext {
+    fn new(cancellation: CancellationToken, blocking_tasks: Arc<BlockingTaskTracker>) -> Self {
+        Self {
+            cancellation,
+            blocking_cancelled: Arc::new(AtomicBool::new(false)),
+            blocking_tasks,
+        }
+    }
+
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.blocking_cancelled.load(Ordering::SeqCst) || self.cancellation.is_cancelled()
+    }
+
+    pub fn spawn_blocking<F, T>(
+        &self,
+        deadline: StdInstant,
+        operation: F,
+    ) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce(crate::system::RunControl) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.cancellation.is_cancelled() || self.blocking_tasks.is_cancelled() {
+            self.blocking_cancelled.store(true, Ordering::SeqCst);
+        }
+        let control =
+            crate::system::RunControl::for_request(deadline, Arc::clone(&self.blocking_cancelled));
+        let worker = tokio::task::spawn_blocking(move || operation(control));
+        self.blocking_tasks
+            .register(worker.abort_handle(), Arc::clone(&self.blocking_cancelled));
+        worker
+    }
+
+    fn cancel(&self) {
+        self.blocking_cancelled.store(true, Ordering::SeqCst);
+        self.cancellation.cancel();
+    }
+}
+
+#[derive(Default)]
+struct BlockingTaskTracker {
+    cancelled: AtomicBool,
+    tasks: StdMutex<Vec<BlockingTask>>,
+}
+
+struct BlockingTask {
+    abort: tokio::task::AbortHandle,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl BlockingTaskTracker {
+    fn register(&self, abort: tokio::task::AbortHandle, cancelled: Arc<AtomicBool>) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        tasks.retain(|task| !task.abort.is_finished());
+        if self.cancelled.load(Ordering::SeqCst) {
+            cancelled.store(true, Ordering::SeqCst);
+            abort.abort();
+        }
+        tasks.push(BlockingTask { abort, cancelled });
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn cancel_and_abort_queued(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        tasks.retain(|task| {
+            if task.abort.is_finished() {
+                false
+            } else {
+                task.cancelled.store(true, Ordering::SeqCst);
+                task.abort.abort();
+                true
+            }
+        });
+    }
+
+    fn is_idle(&self) -> bool {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
+        tasks.retain(|task| !task.abort.is_finished());
+        tasks.is_empty()
+    }
+
+    async fn wait_until_idle(&self, deadline: tokio::time::Instant) -> bool {
+        loop {
+            if self.is_idle() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 }
 
 pub struct DesktopRegistry {
@@ -352,11 +464,99 @@ pub struct DesktopProducerRuntime {
     cancellation: CancellationToken,
     tasks: Vec<ProducerTask>,
     aggregator: tokio::task::JoinHandle<io::Result<()>>,
+    aggregator_context: DesktopProducerContext,
+    aggregator_blocking_tasks: Arc<BlockingTaskTracker>,
 }
 
 struct ProducerTask {
     wrapper: tokio::task::JoinHandle<()>,
-    active_attempt: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
+    active_attempt: Arc<ActiveAttemptSlot>,
+    blocking_tasks: Arc<BlockingTaskTracker>,
+}
+
+struct ActiveAttemptSlot {
+    next_id: AtomicU64,
+    active: StdMutex<Option<ActiveAttempt>>,
+}
+
+struct ActiveAttempt {
+    id: u64,
+    abort: tokio::task::AbortHandle,
+    context: DesktopProducerContext,
+}
+
+impl ActiveAttemptSlot {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            active: StdMutex::new(None),
+        }
+    }
+
+    fn begin<T>(
+        &self,
+        parent: &CancellationToken,
+        blocking_tasks: Arc<BlockingTaskTracker>,
+        spawn: impl FnOnce(DesktopProducerContext) -> tokio::task::JoinHandle<T>,
+    ) -> Option<(u64, tokio::task::JoinHandle<T>)>
+    where
+        T: Send + 'static,
+    {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if parent.is_cancelled() {
+            return None;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let context = DesktopProducerContext::new(parent.child_token(), blocking_tasks);
+        let attempt = spawn(context.clone());
+        *active = Some(ActiveAttempt {
+            id,
+            abort: attempt.abort_handle(),
+            context,
+        });
+        Some((id, attempt))
+    }
+
+    fn finish(&self, id: u64) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active.as_ref().is_some_and(|attempt| attempt.id == id) {
+            active
+                .as_ref()
+                .expect("active attempt checked")
+                .context
+                .cancel();
+            active.take();
+        }
+    }
+
+    fn cancel(&self) {
+        if let Some(attempt) = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            attempt.context.cancel();
+        }
+    }
+
+    fn cancel_and_abort(&self) {
+        if let Some(attempt) = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            attempt.context.cancel();
+            attempt.abort.abort();
+        }
+    }
 }
 
 pub struct DesktopStateAuthority {
@@ -779,54 +979,34 @@ impl DesktopStateAuthority {
         let registry = Arc::clone(&self.registry);
         let events = self.events.clone();
         tokio::task::spawn_blocking(move || {
-            let mut transaction = transaction
-                .lock()
-                .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?;
-            let current = transaction.states.as_ref().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "desktop authority has not initialized",
-                )
-            })?;
-            let domain = update.domain();
-            let mut staged = current.clone();
-            staged.insert(domain, update);
-            let snapshot = match registry.assemble(&staged) {
-                Ok(snapshot) => snapshot,
-                Err(_) => {
-                    staged.insert(
-                        domain,
-                        DesktopDomainState::terminal(
-                            domain,
-                            CapabilityAvailability::Parse,
-                            "producer.contract-invalid",
-                        )?,
-                    );
-                    registry.assemble(&staged)?
-                }
-            };
-            let generation = transaction.generations.next_generation()?;
-            let incremental = validated_envelope(
-                generation,
-                cause,
-                DesktopEvent::DomainUpdate(domain_update(domain, &snapshot)),
-            )?;
-            let replay = validated_envelope(
-                generation,
-                EventCause {
-                    kind: EventCauseKind::Replay,
-                    request_id: None,
-                },
-                DesktopEvent::FullSnapshot(Box::new(snapshot)),
-            )?;
-            transaction.states = Some(staged);
-            transaction.latest_snapshot = Some(replay);
-            transaction.current_generation = generation;
-            let _ = events.send(incremental.clone());
-            Ok(incremental)
+            publish_domain_transaction(transaction, registry, events, update, cause, None)
         })
         .await
         .map_err(join_error)?
+    }
+
+    async fn publish_domain_controlled(
+        &self,
+        update: DesktopDomainState,
+        cause: EventCause,
+        context: &DesktopProducerContext,
+    ) -> io::Result<DesktopEnvelope> {
+        let transaction = Arc::clone(&self.transaction);
+        let registry = Arc::clone(&self.registry);
+        let events = self.events.clone();
+        context
+            .spawn_blocking(StdInstant::now() + INITIAL_DEADLINE, move |control| {
+                publish_domain_transaction(
+                    transaction,
+                    registry,
+                    events,
+                    update,
+                    cause,
+                    Some(&control),
+                )
+            })
+            .await
+            .map_err(join_error)?
     }
 
     pub async fn publish_command_result(
@@ -904,6 +1084,108 @@ impl DesktopStateAuthority {
         })
         .await
         .map_err(join_error)?
+    }
+}
+
+fn publish_domain_transaction(
+    transaction: Arc<StdMutex<DesktopAuthorityTransaction>>,
+    registry: Arc<DesktopRegistry>,
+    events: broadcast::Sender<DesktopEnvelope>,
+    update: DesktopDomainState,
+    cause: EventCause,
+    control: Option<&crate::system::RunControl>,
+) -> io::Result<DesktopEnvelope> {
+    ensure_publication_active(control)?;
+    let mut transaction = lock_publication_transaction(&transaction, control)?;
+    ensure_publication_active(control)?;
+    let current = transaction.states.as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "desktop authority has not initialized",
+        )
+    })?;
+    let domain = update.domain();
+    let mut staged = current.clone();
+    staged.insert(domain, update);
+    let snapshot = match registry.assemble(&staged) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            staged.insert(
+                domain,
+                DesktopDomainState::terminal(
+                    domain,
+                    CapabilityAvailability::Parse,
+                    "producer.contract-invalid",
+                )?,
+            );
+            registry.assemble(&staged)?
+        }
+    };
+    ensure_publication_active(control)?;
+    let generation = match control {
+        Some(control) => transaction
+            .generations
+            .next_generation_while(|| control.is_cancelled())?,
+        None => transaction.generations.next_generation()?,
+    };
+    ensure_publication_active(control)?;
+    let incremental = validated_envelope(
+        generation,
+        cause,
+        DesktopEvent::DomainUpdate(domain_update(domain, &snapshot)),
+    )?;
+    let replay = validated_envelope(
+        generation,
+        EventCause {
+            kind: EventCauseKind::Replay,
+            request_id: None,
+        },
+        DesktopEvent::FullSnapshot(Box::new(snapshot)),
+    )?;
+    ensure_publication_active(control)?;
+    transaction.states = Some(staged);
+    transaction.latest_snapshot = Some(replay);
+    transaction.current_generation = generation;
+    let _ = events.send(incremental.clone());
+    Ok(incremental)
+}
+
+fn lock_publication_transaction<'a>(
+    transaction: &'a StdMutex<DesktopAuthorityTransaction>,
+    control: Option<&crate::system::RunControl>,
+) -> io::Result<std::sync::MutexGuard<'a, DesktopAuthorityTransaction>> {
+    let Some(control) = control else {
+        return transaction
+            .lock()
+            .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"));
+    };
+    loop {
+        ensure_publication_active(Some(control))?;
+        match transaction.try_lock() {
+            Ok(transaction) => return Ok(transaction),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(io::Error::other(
+                    "desktop authority transaction lock poisoned",
+                ));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn ensure_publication_active(control: Option<&crate::system::RunControl>) -> io::Result<()> {
+    match control {
+        Some(control) if control.is_cancelled() => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "desktop publication was cancelled",
+        )),
+        Some(control) if control.remaining().is_zero() => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "desktop publication exceeded its deadline",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1200,8 +1482,10 @@ impl DesktopRegistry {
             let producer = Arc::clone(producer);
             let sender = sender.clone();
             let token = cancellation.child_token();
-            let active_attempt = Arc::new(StdMutex::new(None));
+            let active_attempt = Arc::new(ActiveAttemptSlot::new());
+            let blocking_tasks = Arc::new(BlockingTaskTracker::default());
             let attempt_slot = Arc::clone(&active_attempt);
+            let attempt_blocking_tasks = Arc::clone(&blocking_tasks);
             let wrapper = tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(100);
                 loop {
@@ -1211,16 +1495,17 @@ impl DesktopRegistry {
                     }
                     let run_producer = Arc::clone(&producer);
                     let run_sender = sender.clone();
-                    let run_token = token.child_token();
-                    let attempt =
-                        tokio::spawn(async move { run_producer.run(run_sender, run_token).await });
-                    if let Ok(mut active) = attempt_slot.lock() {
-                        *active = Some(attempt.abort_handle());
-                    }
+                    let Some((attempt_id, attempt)) = attempt_slot.begin(
+                        &token,
+                        Arc::clone(&attempt_blocking_tasks),
+                        move |context| {
+                            tokio::spawn(async move { run_producer.run(run_sender, context).await })
+                        },
+                    ) else {
+                        return;
+                    };
                     let result = attempt.await;
-                    if let Ok(mut active) = attempt_slot.lock() {
-                        active.take();
-                    }
+                    attempt_slot.finish(attempt_id);
                     if token.is_cancelled() {
                         return;
                     }
@@ -1253,21 +1538,34 @@ impl DesktopRegistry {
             tasks.push(ProducerTask {
                 wrapper,
                 active_attempt,
+                blocking_tasks,
             });
         }
         drop(sender);
         let token = cancellation.child_token();
+        let aggregator_blocking_tasks = Arc::new(BlockingTaskTracker::default());
+        let aggregator_context = DesktopProducerContext::new(
+            token.child_token(),
+            Arc::clone(&aggregator_blocking_tasks),
+        );
+        let run_aggregator_context = aggregator_context.clone();
         let aggregator = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
-                    _ = token.cancelled() => return Ok(()),
+                    _ = run_aggregator_context.cancelled() => return Ok(()),
                     update = receiver.recv() => {
                         let Some(update) = update else { return Ok(()); };
-                        authority.publish_domain(
+                        let publication = authority.publish_domain_controlled(
                             update.state,
                             EventCause { kind: EventCauseKind::External, request_id: None },
-                        ).await?;
+                            &run_aggregator_context,
+                        ).await;
+                        match publication {
+                            Ok(_) => {}
+                            Err(_) if run_aggregator_context.is_cancelled() => return Ok(()),
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
             }
@@ -1276,6 +1574,8 @@ impl DesktopRegistry {
             cancellation,
             tasks,
             aggregator,
+            aggregator_context,
+            aggregator_blocking_tasks,
         })
     }
 }
@@ -1283,6 +1583,12 @@ impl DesktopRegistry {
 impl DesktopProducerRuntime {
     pub async fn shutdown(mut self, timeout: Duration) -> io::Result<()> {
         self.cancellation.cancel();
+        for task in &self.tasks {
+            task.active_attempt.cancel();
+            task.blocking_tasks.cancel_and_abort_queued();
+        }
+        self.aggregator_context.cancel();
+        self.aggregator_blocking_tasks.cancel_and_abort_queued();
         let deadline = tokio::time::Instant::now() + timeout;
         let reap_deadline = deadline + PRODUCER_SHUTDOWN_TOLERANCE;
         let mut failure = None;
@@ -1301,11 +1607,8 @@ impl DesktopProducerRuntime {
                         io::Error::new(io::ErrorKind::TimedOut, "desktop producers did not drain")
                     });
                     for task in &mut self.tasks[index..] {
-                        if let Ok(mut active) = task.active_attempt.lock() {
-                            if let Some(attempt) = active.take() {
-                                attempt.abort();
-                            }
-                        }
+                        task.active_attempt.cancel_and_abort();
+                        task.blocking_tasks.cancel_and_abort_queued();
                     }
                     for task in &mut self.tasks[index..] {
                         match tokio::time::timeout_at(reap_deadline, &mut task.wrapper).await {
@@ -1343,6 +1646,8 @@ impl DesktopProducerRuntime {
                 });
             }
             Err(_) => {
+                self.aggregator_context.cancel();
+                self.aggregator_blocking_tasks.cancel_and_abort_queued();
                 self.aggregator.abort();
                 let _ = (&mut self.aggregator).await;
                 failure.get_or_insert_with(|| {
@@ -1352,6 +1657,28 @@ impl DesktopProducerRuntime {
                     )
                 });
             }
+        }
+        for task in &self.tasks {
+            if !task.blocking_tasks.wait_until_idle(reap_deadline).await {
+                failure.get_or_insert_with(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "desktop producer blocking workers did not drain",
+                    )
+                });
+            }
+        }
+        if !self
+            .aggregator_blocking_tasks
+            .wait_until_idle(reap_deadline)
+            .await
+        {
+            failure.get_or_insert_with(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "desktop publication worker did not drain",
+                )
+            });
         }
         match failure {
             Some(error) => Err(error),
@@ -2187,6 +2514,55 @@ mod tests {
 
     struct TestProducer(DesktopDomainId);
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_attempt_slot_handoff_cannot_install_after_shutdown_cancellation() {
+        let slot = Arc::new(ActiveAttemptSlot::new());
+        let parent = CancellationToken::new();
+        let blocking_tasks = Arc::new(BlockingTaskTracker::default());
+        let runtime = tokio::runtime::Handle::current();
+        let (spawn_entered, spawn_observed) = std::sync::mpsc::channel();
+        let spawn_gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let begin_slot = Arc::clone(&slot);
+        let begin_gate = Arc::clone(&spawn_gate);
+        let begin = std::thread::spawn(move || {
+            begin_slot.begin(&parent, blocking_tasks, move |context| {
+                spawn_entered.send(()).unwrap();
+                let (open, changed) = &*begin_gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = changed.wait(open).unwrap();
+                }
+                runtime.spawn(async move { context.cancelled().await })
+            })
+        });
+        spawn_observed.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let cancel_slot = Arc::clone(&slot);
+        let (cancelled, cancellation_observed) = std::sync::mpsc::channel();
+        let cancel = std::thread::spawn(move || {
+            cancel_slot.cancel();
+            cancelled.send(()).unwrap();
+        });
+        assert_eq!(
+            cancellation_observed.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "shutdown escaped while an attempt was being installed"
+        );
+
+        let (open, changed) = &*spawn_gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+        let (_, attempt) = begin.join().unwrap().unwrap();
+        cancellation_observed
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        cancel.join().unwrap();
+        tokio::time::timeout(Duration::from_millis(100), attempt)
+            .await
+            .expect("installed attempt missed shutdown cancellation")
+            .unwrap();
+    }
+
     #[async_trait]
     impl DesktopProducer for TestProducer {
         fn domain(&self) -> DesktopDomainId {
@@ -2200,7 +2576,7 @@ mod tests {
         async fn run(
             &self,
             _sender: mpsc::Sender<DesktopDomainUpdate>,
-            cancellation: CancellationToken,
+            cancellation: DesktopProducerContext,
         ) -> Result<(), ProducerError> {
             cancellation.cancelled().await;
             Ok(())
