@@ -1262,7 +1262,7 @@ fn publish_domain_transaction(
         Some(control) => control.begin_commit()?,
         None => None,
     };
-    before_desktop_publication_commit();
+    before_desktop_publication_commit(control.is_some());
     if advances_observation_revision {
         observation_revision.fetch_add(1, Ordering::SeqCst);
     }
@@ -1282,7 +1282,13 @@ static BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-struct PublicationCommitHookGuard;
+static DESKTOP_PUBLICATION_COMMIT_HOOK_INSTALL_LOCK: std::sync::OnceLock<StdMutex<()>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct PublicationCommitHookGuard {
+    _install: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(test)]
 impl Drop for PublicationCommitHookGuard {
@@ -1298,27 +1304,33 @@ impl Drop for PublicationCommitHookGuard {
 fn install_before_desktop_publication_commit_hook(
     hook: PublicationCommitHook,
 ) -> PublicationCommitHookGuard {
+    let install = DESKTOP_PUBLICATION_COMMIT_HOOK_INSTALL_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     *BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
         .get_or_init(|| StdMutex::new(None))
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(hook);
-    PublicationCommitHookGuard
+    PublicationCommitHookGuard { _install: install }
 }
 
 #[cfg(test)]
-fn before_desktop_publication_commit() {
-    if let Some(hook) = BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
-        .get_or_init(|| StdMutex::new(None))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_ref()
-    {
-        hook();
+fn before_desktop_publication_commit(controlled: bool) {
+    if controlled {
+        if let Some(hook) = BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            hook();
+        }
     }
 }
 
 #[cfg(not(test))]
-fn before_desktop_publication_commit() {}
+fn before_desktop_publication_commit(_controlled: bool) {}
 
 fn lock_publication_transaction<'a>(
     transaction: &'a StdMutex<DesktopAuthorityTransaction>,
@@ -2751,6 +2763,41 @@ mod tests {
             .await
             .expect("installed attempt missed shutdown cancellation")
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uncontrolled_publications_do_not_enter_controlled_commit_hook() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority =
+            DesktopStateAuthority::open(test_registry(), temp.path().join("generation"), 8)
+                .await
+                .unwrap();
+        authority.initialize().await.unwrap();
+        let (entered_commit, commit_entered) = std::sync::mpsc::channel();
+        let _hook = install_before_desktop_publication_commit_hook(Box::new(move || {
+            entered_commit.send(()).unwrap();
+        }));
+
+        authority
+            .publish_domain(
+                DesktopDomainState::available(
+                    DesktopDomainId::Network,
+                    DesktopDomainValue::empty(DesktopDomainId::Network),
+                )
+                .unwrap(),
+                EventCause {
+                    kind: EventCauseKind::External,
+                    request_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            commit_entered.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "uncontrolled publication entered the controlled publication hook"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
