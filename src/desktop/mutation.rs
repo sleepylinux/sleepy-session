@@ -59,18 +59,6 @@ impl<B: DailyBackend> ProductionDesktopMutationExecutor<B> {
         _generation: u64,
         command: &DesktopSystemCommand,
     ) -> Result<Vec<DesktopDomainState>, ProducerError> {
-        if let DesktopSystemCommand::Domain(DesktopSystemMutation::Display(
-            DisplayCommand::SetBrightness { output_id, .. },
-        )) = command
-        {
-            self.validate_output(output_id.as_str()).await?;
-            return Ok(vec![DesktopDomainState::terminal(
-                DesktopDomainId::Brightness,
-                sleepy_sdk::CapabilityAvailability::Unsupported,
-                "brightness.output-target-unmapped",
-            )
-            .expect("static diagnostic")]);
-        }
         let runner = self.system.runner();
         let command = command.clone();
         let state = tokio::task::spawn_blocking(move || execute_system_command(&runner, command))
@@ -217,6 +205,13 @@ impl<B: DailyBackend> DesktopMutationExecutor for ProductionDesktopMutationExecu
         &self,
         request: &DesktopRequest,
     ) -> Result<DesktopMutationOutcome, ProducerError> {
+        if let DesktopCommand::System(DesktopSystemCommand::Domain(
+            DesktopSystemMutation::Display(DisplayCommand::SetBrightness { output_id, .. }),
+        )) = &request.command
+        {
+            self.validate_output(output_id.as_str()).await?;
+            return Ok(unmapped_brightness_failure());
+        }
         let readbacks = match &request.command {
             DesktopCommand::System(command) => {
                 self.execute_system(request.expected_generation, command)
@@ -295,6 +290,13 @@ impl<B: DailyBackend> DesktopMutationExecutor for ProductionDesktopMutationExecu
                 diagnostic_code: "mutation.readback-terminal".into(),
             })
         }
+    }
+}
+
+fn unmapped_brightness_failure() -> DesktopMutationOutcome {
+    DesktopMutationOutcome::TerminalFailure {
+        readbacks: Vec::new(),
+        diagnostic_code: "brightness.output-target-unmapped".into(),
     }
 }
 
@@ -379,4 +381,22 @@ fn execute_system_command(
         },
     };
     DesktopDomainState::available(domain, value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_target_unmapped_rejection_has_no_producer_readback_and_keeps_specific_code() {
+        let DesktopMutationOutcome::TerminalFailure {
+            readbacks,
+            diagnostic_code,
+        } = unmapped_brightness_failure()
+        else {
+            panic!("unmapped brightness must be a terminal command rejection");
+        };
+        assert!(readbacks.is_empty());
+        assert_eq!(diagnostic_code, "brightness.output-target-unmapped");
+    }
 }

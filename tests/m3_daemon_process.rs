@@ -34,7 +34,6 @@ fn daemon_and_watch_client_replay_a_full_snapshot_and_children_are_reaped() {
     let state = temp.path().join("state");
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::create_dir_all(&state).unwrap();
-
     let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
         .env("XDG_RUNTIME_DIR", &runtime)
@@ -108,6 +107,11 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let state = temp.path().join("state");
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::create_dir_all(&state).unwrap();
+    let notify_path = temp.path().join("notify.sock");
+    let notify = std::os::unix::net::UnixDatagram::bind(&notify_path).unwrap();
+    notify
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let daemon = Command::new(env!("CARGO_BIN_EXE_sleepy-sessiond"))
         .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
@@ -116,6 +120,7 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_DATA_HOME", temp.path().join("data"))
+        .env("NOTIFY_SOCKET", &notify_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -128,18 +133,36 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let desktop_socket = runtime.join("sleepy/desktop.sock");
     let desktop_control_socket = runtime.join("sleepy/desktop-control.sock");
     let secret_socket = runtime.join("sleepy/secret.sock");
-    wait_for_path(&socket, Duration::from_secs(2));
-    wait_for_path(&osd_socket, Duration::from_secs(2));
-    wait_for_path(&theme_socket, Duration::from_secs(2));
-    wait_for_path(&desktop_socket, Duration::from_secs(2));
-    wait_for_path(&desktop_control_socket, Duration::from_secs(2));
-    wait_for_path(&secret_socket, Duration::from_secs(2));
+    assert_eq!(recv_notify(&notify), "READY=1");
+    for path in [
+        &socket,
+        &osd_socket,
+        &theme_socket,
+        &desktop_socket,
+        &desktop_control_socket,
+        &secret_socket,
+    ] {
+        assert!(
+            path.exists(),
+            "{} did not exist when READY arrived",
+            path.display()
+        );
+    }
+    for path in [&desktop_socket, &desktop_control_socket, &secret_socket] {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{} was not private when READY arrived",
+            path.display()
+        );
+    }
 
     // Keep v3 clients deliberately idle across STOPPING. The daemon must cancel
     // their handlers, drain them, and remove every startup-barrier socket.
     let _slow_desktop = std::os::unix::net::UnixStream::connect(&desktop_socket).unwrap();
     let _slow_desktop_control =
         std::os::unix::net::UnixStream::connect(&desktop_control_socket).unwrap();
+    let _slow_secret = std::os::unix::net::UnixStream::connect(&secret_socket).unwrap();
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_sleepyctl"))
         .args(["events", "watch", "--format", "ndjson"])
@@ -174,6 +197,7 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
 
     let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);
+    assert_eq!(recv_notify(&notify), "STOPPING=1");
 
     let stopping = loop {
         let event = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
@@ -514,4 +538,13 @@ fn wait_for_path(path: &Path, deadline: Duration) {
         assert!(start.elapsed() < deadline, "daemon socket did not appear");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn recv_notify(socket: &std::os::unix::net::UnixDatagram) -> String {
+    let mut bytes = [0_u8; 256];
+    let length = socket.recv(&mut bytes).unwrap();
+    std::str::from_utf8(&bytes[..length])
+        .unwrap()
+        .trim_end()
+        .to_owned()
 }

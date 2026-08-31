@@ -34,6 +34,15 @@ pub fn mutation_spec(command: &MediaCommand) -> io::Result<CommandSpec> {
 }
 
 pub fn probe<R: CommandRunner>(runner: &R) -> io::Result<MediaSnapshot> {
+    Ok(probe_observation(runner)?.snapshot)
+}
+
+struct MediaObservation {
+    snapshot: MediaSnapshot,
+    track_ids: BTreeMap<String, Option<String>>,
+}
+
+fn probe_observation<R: CommandRunner>(runner: &R) -> io::Result<MediaObservation> {
     let players = super::network::run(runner, CommandSpec::new("playerctl", ["--list-all"]))?;
     let mut metadata = BTreeMap::new();
     for player in player_names(&players)? {
@@ -46,29 +55,31 @@ pub fn probe<R: CommandRunner>(runner: &R) -> io::Result<MediaSnapshot> {
                     player.as_str(),
                     "metadata",
                     "--format",
-                    "{{playerName}}\\t{{title}}\\t{{artist}}\\t{{status}}\\t{{position}}\\t{{mpris:length}}",
+                    "{{playerName}}\\t{{title}}\\t{{artist}}\\t{{status}}\\t{{position}}\\t{{mpris:length}}\\t{{mpris:trackid}}",
                 ],
             ),
         )?;
         metadata.insert(player, output);
     }
-    parse_snapshot(&players, &metadata)
+    parse_observation(&players, &metadata)
 }
 
 pub fn mutate<R: CommandRunner>(runner: &R, command: &MediaCommand) -> io::Result<MediaSnapshot> {
-    let before = probe(runner)?;
+    let before = probe_observation(runner)?;
     let MediaCommand::Transport {
         player_id,
         transport,
     } = command;
     let before_player = before
+        .snapshot
         .players
         .iter()
         .find(|player| player.id == player_id.as_str())
         .ok_or_else(|| io::Error::other("MPRIS pre-state omitted the targeted player"))?;
     super::network::run(runner, mutation_spec(command)?)?;
-    let snapshot = probe(runner)?;
-    let after_player = snapshot
+    let after = probe_observation(runner)?;
+    let after_player = after
+        .snapshot
         .players
         .iter()
         .find(|player| player.id == player_id.as_str())
@@ -76,9 +87,13 @@ pub fn mutate<R: CommandRunner>(runner: &R, command: &MediaCommand) -> io::Resul
     let confirmed = match transport {
         MediaTransport::PlayPause => before_player.playing != after_player.playing,
         MediaTransport::Next | MediaTransport::Previous => {
-            before_player.title != after_player.title
-                || before_player.artist != after_player.artist
-                || (before_player.progress - after_player.progress).abs() > f64::EPSILON
+            matches!(
+                (
+                    before.track_ids.get(player_id.as_str()).and_then(Option::as_ref),
+                    after.track_ids.get(player_id.as_str()).and_then(Option::as_ref),
+                ),
+                (Some(before), Some(after)) if before != after
+            )
         }
     };
     if !confirmed {
@@ -86,7 +101,7 @@ pub fn mutate<R: CommandRunner>(runner: &R, command: &MediaCommand) -> io::Resul
             "MPRIS readback did not confirm the requested transport",
         ));
     }
-    Ok(snapshot)
+    Ok(after.snapshot)
 }
 
 pub fn mutate_legacy<R: CommandRunner>(
@@ -113,11 +128,19 @@ pub fn parse_snapshot(
     players: &[u8],
     metadata: &BTreeMap<String, Vec<u8>>,
 ) -> io::Result<MediaSnapshot> {
+    Ok(parse_observation(players, metadata)?.snapshot)
+}
+
+fn parse_observation(
+    players: &[u8],
+    metadata: &BTreeMap<String, Vec<u8>>,
+) -> io::Result<MediaObservation> {
     let names = player_names(players)?;
     if names.len() > 256 {
         return invalid("too many MPRIS players");
     }
     let mut parsed = Vec::with_capacity(names.len());
+    let mut track_ids = BTreeMap::new();
     for name in names {
         let bytes = metadata
             .get(&name)
@@ -125,8 +148,8 @@ pub fn parse_snapshot(
         let text = std::str::from_utf8(bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "MPRIS metadata is not UTF-8"))?
             .trim_end();
-        let fields = text.splitn(6, '\t').collect::<Vec<_>>();
-        if fields.len() != 6 || fields[0].trim().is_empty() {
+        let fields = text.splitn(7, '\t').collect::<Vec<_>>();
+        if !(fields.len() == 6 || fields.len() == 7) || fields[0].trim().is_empty() {
             return invalid("MPRIS metadata row is malformed");
         }
         if fields[0].len() > 256 || fields[1].len() > 4_096 || fields[2].len() > 2_048 {
@@ -147,8 +170,20 @@ pub fn parse_snapshot(
         if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {
             return invalid("MPRIS normalized progress is invalid");
         }
+        let track_id = fields
+            .get(6)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if value.len() > 4_096 || !value.starts_with('/') {
+                    return invalid("MPRIS track identity is malformed or exceeds its bound");
+                }
+                Ok((*value).to_owned())
+            })
+            .transpose()?;
+        let stable_player_id = player_id(&name)?;
+        track_ids.insert(stable_player_id.clone(), track_id);
         parsed.push(MediaPlayer {
-            id: player_id(&name)?,
+            id: stable_player_id,
             identity: fields[0].to_owned(),
             title: fields[1].to_owned(),
             artist: fields[2].to_owned(),
@@ -156,7 +191,10 @@ pub fn parse_snapshot(
             progress,
         });
     }
-    Ok(MediaSnapshot { players: parsed })
+    Ok(MediaObservation {
+        snapshot: MediaSnapshot { players: parsed },
+        track_ids,
+    })
 }
 
 pub(crate) fn player_id(value: &str) -> io::Result<String> {

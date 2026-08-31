@@ -356,6 +356,8 @@ pub struct DesktopProducerRuntime {
 pub struct DesktopStateAuthority {
     registry: Arc<DesktopRegistry>,
     transaction: Arc<StdMutex<DesktopAuthorityTransaction>>,
+    startup_deadline: StdInstant,
+    initialization: Mutex<()>,
     initialized: Notify,
     events: broadcast::Sender<DesktopEnvelope>,
 }
@@ -365,6 +367,15 @@ struct DesktopAuthorityTransaction {
     generations: crate::sessiond::GenerationAllocator,
     current_generation: u64,
     latest_snapshot: Option<DesktopEnvelope>,
+}
+
+enum InitializationAssembly {
+    Existing(DesktopEnvelope),
+    Staged {
+        states: BTreeMap<DesktopDomainId, DesktopDomainState>,
+        generation: u64,
+        event: DesktopEnvelope,
+    },
 }
 
 pub struct DesktopSubscriber {
@@ -606,6 +617,7 @@ impl DesktopStateAuthority {
         generation_path: impl AsRef<Path>,
         event_capacity: usize,
     ) -> io::Result<Arc<Self>> {
+        let startup_deadline = StdInstant::now() + INITIAL_DEADLINE;
         if event_capacity == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -613,10 +625,15 @@ impl DesktopStateAuthority {
             ));
         }
         let generation_path = generation_path.as_ref().to_owned();
-        let generations = tokio::task::spawn_blocking(move || {
+        let generation_worker = tokio::task::spawn_blocking(move || {
             crate::sessiond::GenerationAllocator::open(generation_path, 64)
-        })
+        });
+        let generations = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(startup_deadline),
+            generation_worker,
+        )
         .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "desktop.initialization-timeout"))?
         .map_err(join_error)??;
         let (events, _) = broadcast::channel(event_capacity);
         Ok(Arc::new(Self {
@@ -627,27 +644,34 @@ impl DesktopStateAuthority {
                 current_generation: 0,
                 latest_snapshot: None,
             })),
+            startup_deadline,
+            initialization: Mutex::new(()),
             initialized: Notify::new(),
             events,
         }))
     }
 
     pub async fn initialize(&self) -> io::Result<DesktopEnvelope> {
-        let deadline = StdInstant::now() + INITIAL_DEADLINE;
-        let probe_deadline = tokio::time::Instant::now() + INITIAL_PROBE_BUDGET;
+        let _initialization = self.initialization.lock().await;
+        let deadline = self.startup_deadline;
+        ensure_initial_deadline(deadline)?;
+        let overall_deadline = tokio::time::Instant::from_std(deadline);
+        let probe_deadline =
+            (tokio::time::Instant::now() + INITIAL_PROBE_BUDGET).min(overall_deadline);
+        let drain_deadline = (probe_deadline + Duration::from_millis(250)).min(overall_deadline);
         let states = self
             .registry
-            .initial_states_until(probe_deadline, probe_deadline + Duration::from_millis(250))
+            .initial_states_until(probe_deadline, drain_deadline)
             .await;
         let transaction = Arc::clone(&self.transaction);
         let registry = Arc::clone(&self.registry);
-        let event = tokio::task::spawn_blocking(move || -> io::Result<DesktopEnvelope> {
+        let assembly = tokio::task::spawn_blocking(move || -> io::Result<_> {
             ensure_initial_deadline(deadline)?;
             let mut transaction = transaction
                 .lock()
                 .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?;
             if let Some(existing) = transaction.latest_snapshot.clone() {
-                return Ok(existing);
+                return Ok(InitializationAssembly::Existing(existing));
             }
             let states = registry.localize_contract_failures(states)?;
             ensure_initial_deadline(deadline)?;
@@ -664,13 +688,43 @@ impl DesktopStateAuthority {
                 DesktopEvent::FullSnapshot(Box::new(snapshot)),
             )?;
             ensure_initial_deadline(deadline)?;
-            transaction.states = Some(states);
-            transaction.current_generation = generation;
-            transaction.latest_snapshot = Some(event.clone());
-            Ok(event)
-        })
-        .await
-        .map_err(join_error)??;
+            Ok(InitializationAssembly::Staged {
+                states,
+                generation,
+                event,
+            })
+        });
+        let assembly = tokio::time::timeout_at(overall_deadline, assembly)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "desktop.initialization-timeout"))?
+            .map_err(join_error)??;
+        let event = match assembly {
+            InitializationAssembly::Existing(event) => event,
+            InitializationAssembly::Staged {
+                states,
+                generation,
+                event,
+            } => {
+                ensure_initial_deadline(deadline)?;
+                let mut transaction = self.transaction.try_lock().map_err(|error| match error {
+                    std::sync::TryLockError::Poisoned(_) => {
+                        io::Error::other("desktop authority transaction lock poisoned")
+                    }
+                    std::sync::TryLockError::WouldBlock => {
+                        io::Error::new(io::ErrorKind::TimedOut, "desktop.initialization-timeout")
+                    }
+                })?;
+                ensure_initial_deadline(deadline)?;
+                if let Some(existing) = transaction.latest_snapshot.clone() {
+                    existing
+                } else {
+                    transaction.states = Some(states);
+                    transaction.current_generation = generation;
+                    transaction.latest_snapshot = Some(event.clone());
+                    event
+                }
+            }
+        };
         self.initialized.notify_waiters();
         Ok(event)
     }
@@ -1138,13 +1192,20 @@ impl DesktopRegistry {
                     if token.is_cancelled() {
                         return;
                     }
-                    let result = producer.run(sender.clone(), token.child_token()).await;
+                    let run_producer = Arc::clone(&producer);
+                    let run_sender = sender.clone();
+                    let run_token = token.child_token();
+                    let result =
+                        tokio::spawn(async move { run_producer.run(run_sender, run_token).await })
+                            .await;
                     if token.is_cancelled() {
                         return;
                     }
                     let diagnostic = match result {
-                        Ok(()) => "producer.disconnected".to_owned(),
-                        Err(error) => bounded_diagnostic(error.to_string()),
+                        Ok(Ok(())) => "producer.disconnected".to_owned(),
+                        Ok(Err(error)) => bounded_diagnostic(error.to_string()),
+                        Err(error) if error.is_panic() => "producer.panicked".to_owned(),
+                        Err(_) => "producer.worker-failed".to_owned(),
                     };
                     let state = DesktopDomainState::terminal(
                         domain,
@@ -1208,11 +1269,14 @@ impl DesktopProducerRuntime {
                 }
                 Err(_) => {
                     timed_out_at = Some(index);
-                    for task in &self.tasks[index..] {
-                        task.abort();
-                    }
                     for task in &mut self.tasks[index..] {
-                        let _ = task.await;
+                        if let Err(error) = task.await {
+                            failure.get_or_insert_with(|| {
+                                io::Error::other(format!(
+                                    "desktop producer task failed while draining: {error}"
+                                ))
+                            });
+                        }
                     }
                     failure.get_or_insert_with(|| {
                         io::Error::new(io::ErrorKind::TimedOut, "desktop producers did not drain")
@@ -1222,8 +1286,19 @@ impl DesktopProducerRuntime {
             }
         }
         if timed_out_at.is_some() {
-            self.aggregator.abort();
-            let _ = (&mut self.aggregator).await;
+            match (&mut self.aggregator).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        io::Error::other(format!(
+                            "desktop producer aggregator failed while draining: {error}"
+                        ))
+                    });
+                }
+            }
         } else {
             match tokio::time::timeout_at(deadline, &mut self.aggregator).await {
                 Ok(Ok(Ok(()))) => {}
@@ -1952,6 +2027,7 @@ impl DurableDedupe {
                         .sync()
                         .map_err(|sync_error| io::Error::other(sync_error.to_string()))?;
                     self.document = staged;
+                    return Ok(());
                 }
             }
             return Err(io::Error::other(error.to_string()));
@@ -2062,6 +2138,9 @@ pub async fn serve_control_stream<E: DesktopMutationExecutor>(
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sleepy_sdk::{DesktopCommand, DesktopSessionCommand};
 
     use super::*;
 
@@ -2075,10 +2154,110 @@ mod tests {
         }
     }
 
+    struct TestProducer(DesktopDomainId);
+
+    #[async_trait]
+    impl DesktopProducer for TestProducer {
+        fn domain(&self) -> DesktopDomainId {
+            self.0
+        }
+
+        async fn initial(&self) -> DesktopDomainState {
+            DesktopDomainState::available(self.0, DesktopDomainValue::empty(self.0)).unwrap()
+        }
+
+        async fn run(
+            &self,
+            _sender: mpsc::Sender<DesktopDomainUpdate>,
+            cancellation: CancellationToken,
+        ) -> Result<(), ProducerError> {
+            cancellation.cancelled().await;
+            Ok(())
+        }
+    }
+
+    struct CountingExecutor(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl DesktopMutationExecutor for CountingExecutor {
+        async fn execute(
+            &self,
+            _request: &DesktopRequest,
+        ) -> Result<DesktopMutationOutcome, ProducerError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(DesktopMutationOutcome::Confirmed(vec![
+                DesktopDomainState::available(
+                    DesktopDomainId::Lock,
+                    DesktopDomainValue::Lock(LockState { secure: true }),
+                )
+                .unwrap(),
+            ]))
+        }
+    }
+
+    fn test_registry() -> Arc<DesktopRegistry> {
+        Arc::new(
+            DesktopRegistry::new(
+                DesktopDomainId::ALL
+                    .into_iter()
+                    .map(|domain| Arc::new(TestProducer(domain)) as Arc<dyn DesktopProducer>)
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn reconciled_control_begin_executes_once_and_replays_durable_completion() {
+        for fault in [DedupeFaultPoint::Rename, DedupeFaultPoint::DirectorySync] {
+            let temp = tempfile::tempdir().unwrap();
+            let generation_path = temp.path().join("generation");
+            let dedupe_path = temp.path().join("dedupe.json");
+            let state = DesktopStateAuthority::open(test_registry(), &generation_path, 8)
+                .await
+                .unwrap();
+            state.initialize().await.unwrap();
+            let first_calls = Arc::new(AtomicUsize::new(0));
+            let control = DesktopControlAuthority::open(
+                Arc::clone(&state),
+                Arc::new(CountingExecutor(Arc::clone(&first_calls))),
+                &dedupe_path,
+                8,
+            )
+            .await
+            .unwrap();
+            control.dedupe.lock().unwrap().fault = Some(fault);
+            let request = DesktopRequest {
+                schema_version: DESKTOP_WIRE_VERSION,
+                request_id: "00000000-0000-4000-8000-000000000045".into(),
+                expected_generation: state.current_generation(),
+                command: DesktopCommand::Session(DesktopSessionCommand::Lock),
+            };
+            let encoded = serde_json::to_string(&request).unwrap();
+            let first = control.handle_json(&encoded).await.unwrap();
+            assert_eq!(first.status, DesktopResultStatus::Succeeded, "{fault:?}");
+            assert_eq!(first_calls.load(Ordering::SeqCst), 1, "{fault:?}");
+            drop(control);
+
+            let replay_calls = Arc::new(AtomicUsize::new(0));
+            let reopened = DesktopControlAuthority::open(
+                state,
+                Arc::new(CountingExecutor(Arc::clone(&replay_calls))),
+                &dedupe_path,
+                8,
+            )
+            .await
+            .unwrap();
+            let replay = reopened.handle_json(&encoded).await.unwrap();
+            assert_eq!(replay, first, "{fault:?}");
+            assert_eq!(replay_calls.load(Ordering::SeqCst), 0, "{fault:?}");
+        }
+    }
+
     #[test]
     fn dedupe_fault_boundaries_never_leave_memory_ahead_of_disk() {
         let request_id = "00000000-0000-4000-8000-000000000041";
-        for (fault, materialized) in [
+        for (fault, reconciled) in [
             (DedupeFaultPoint::FileSync, false),
             (DedupeFaultPoint::Rename, true),
             (DedupeFaultPoint::DirectorySync, true),
@@ -2087,17 +2266,17 @@ mod tests {
             let path = temp.path().join("dedupe.json");
             let mut dedupe = DurableDedupe::open(&path, 8).unwrap();
             dedupe.fault = Some(fault);
-            assert!(dedupe.begin(request_id.into()).is_err());
             assert_eq!(
-                dedupe.lookup(request_id).is_some(),
-                materialized,
+                dedupe.begin(request_id.into()).is_ok(),
+                reconciled,
                 "{fault:?}"
             );
+            assert_eq!(dedupe.lookup(request_id).is_some(), reconciled, "{fault:?}");
 
             let reopened = DurableDedupe::open(&path, 8).unwrap();
             assert_eq!(
                 reopened.lookup(request_id).is_some(),
-                materialized,
+                reconciled,
                 "{fault:?}"
             );
         }
@@ -2116,7 +2295,12 @@ mod tests {
             let mut dedupe = DurableDedupe::open(&path, 8).unwrap();
             dedupe.begin(request_id.into()).unwrap();
             dedupe.fault = Some(fault);
-            assert!(dedupe.complete(request_id, result(request_id)).is_err());
+            let reconciled = fault != DedupeFaultPoint::FileSync;
+            assert_eq!(
+                dedupe.complete(request_id, result(request_id)).is_ok(),
+                reconciled,
+                "{fault:?}"
+            );
 
             let reopened = DurableDedupe::open(&path, 8).unwrap();
             match (fault, reopened.lookup(request_id).unwrap()) {

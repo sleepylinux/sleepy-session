@@ -2,11 +2,11 @@
 
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Write},
     os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex as StdMutex},
     thread,
     time::{Duration, Instant},
@@ -35,6 +35,7 @@ const LOGIN1_SESSION: &str = "org.freedesktop.login1.Session";
 const LOGIND_ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIND_STATE_TIMEOUT: Duration = Duration::from_millis(1_750);
 const UTILITY_REFRESH: Duration = Duration::from_secs(2);
+const RECORDING_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const GAME_MODE_DESTINATION: &str = "com.feralinteractive.GameMode";
 const GAME_MODE_PATH: &str = "/com/feralinteractive/GameMode";
 const GAME_MODE_INTERFACE: &str = "com.feralinteractive.GameMode";
@@ -52,6 +53,7 @@ pub fn action_spec(
                 "sleepy-capture-helper",
                 [
                     "screenshot",
+                    "--interactive-consent",
                     "--gesture-token",
                     gesture_token,
                     "--output-id",
@@ -67,10 +69,10 @@ pub fn action_spec(
                 "sleepy-capture-helper",
                 [
                     "pick-color",
+                    "--interactive-consent",
                     "--gesture-token",
                     gesture_token,
-                    "--result-fd",
-                    "1",
+                    "--clipboard",
                 ],
             )
         }
@@ -81,12 +83,15 @@ pub fn action_spec(
                 "sleepy-capture-helper",
                 [
                     "record",
+                    "--interactive-consent",
                     "--gesture-token",
                     gesture_token,
                     "--output-id",
                     output_name(output_id)?,
                     "--output-path",
                     output_path,
+                    "--status-fd",
+                    "1",
                 ],
             )
         }
@@ -154,6 +159,7 @@ fn validate_output_path(path: &str) -> io::Result<()> {
 struct RecordingRuntime {
     state: RecordingState,
     child: Option<Child>,
+    status: Option<BufReader<ChildStdout>>,
 }
 
 impl Default for RecordingRuntime {
@@ -165,6 +171,7 @@ impl Default for RecordingRuntime {
                 output_id: None,
             },
             child: None,
+            status: None,
         }
     }
 }
@@ -380,17 +387,29 @@ impl ProductionUtilityService {
             gesture_token,
         )?
         .ok_or_else(|| io::Error::other("recording command contract missing"))?;
-        let mut child = ChildGuard::new(fixed_child(&spec)?.spawn()?);
-        thread::sleep(Duration::from_millis(40));
-        if child.child_mut()?.try_wait()?.is_some() {
-            return Err(io::Error::other("recording process exited before readback"));
-        }
+        let mut command = fixed_child(&spec)?;
+        command.stdout(Stdio::piped());
+        let mut child = ChildGuard::new(command.spawn()?);
+        let stdout = child
+            .child_mut()?
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("recording helper status stream missing"))?;
+        set_nonblocking(stdout.as_raw_fd())?;
+        let mut status = BufReader::new(stdout);
+        wait_for_recording_ack(
+            &mut status,
+            child.child_mut()?,
+            RecordingStatus::Recording,
+            Instant::now() + RECORDING_ACK_TIMEOUT,
+        )?;
         runtime.state = RecordingState {
             status: RecordingStatus::Recording,
             recording_id: Some(recording_id),
             output_id: Some(output_id.as_str().to_owned()),
         };
         runtime.child = Some(child.disarm()?);
+        runtime.status = Some(status);
         Ok(())
     }
 
@@ -399,8 +418,13 @@ impl ProductionUtilityService {
             .recording
             .lock()
             .map_err(|_| io::Error::other("recording state lock poisoned"))?;
-        let child = runtime
-            .child
+        let desired = match runtime.state.status {
+            RecordingStatus::Recording => RecordingStatus::Paused,
+            RecordingStatus::Paused => RecordingStatus::Recording,
+            RecordingStatus::Inactive => return Err(io::Error::other("recording state mismatch")),
+        };
+        let RecordingRuntime { child, status, .. } = &mut *runtime;
+        let child = child
             .as_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no recording is active"))?;
         if child.try_wait()?.is_some() {
@@ -414,11 +438,20 @@ impl ProductionUtilityService {
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
-        runtime.state.status = match runtime.state.status {
-            RecordingStatus::Recording => RecordingStatus::Paused,
-            RecordingStatus::Paused => RecordingStatus::Recording,
-            RecordingStatus::Inactive => return Err(io::Error::other("recording state mismatch")),
-        };
+        let status = status
+            .as_mut()
+            .ok_or_else(|| io::Error::other("recording helper status stream missing"))?;
+        let acknowledgement = wait_for_recording_ack(
+            status,
+            child,
+            desired,
+            Instant::now() + RECORDING_ACK_TIMEOUT,
+        );
+        if let Err(error) = acknowledgement {
+            invalidate_recording_runtime(&mut runtime);
+            return Err(error);
+        }
+        runtime.state.status = desired;
         Ok(())
     }
 
@@ -433,6 +466,7 @@ impl ProductionUtilityService {
                 "no recording is active",
             ));
         };
+        runtime.status.take();
         let result = terminate_child(&mut child, libc::SIGINT, Duration::from_secs(5));
         if result.is_err() {
             let _ = child.kill();
@@ -512,6 +546,60 @@ impl ProductionUtilityService {
             extension
         ))
     }
+}
+
+fn wait_for_recording_ack(
+    status: &mut BufReader<ChildStdout>,
+    child: &mut Child,
+    expected: RecordingStatus,
+    deadline: Instant,
+) -> io::Result<()> {
+    let expected = match expected {
+        RecordingStatus::Recording => "STATE recording",
+        RecordingStatus::Paused => "STATE paused",
+        RecordingStatus::Inactive => "STATE inactive",
+    };
+    let mut line = String::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recording helper acknowledgement timed out",
+            ));
+        }
+        line.clear();
+        match status.read_line(&mut line) {
+            Ok(0) => {
+                if child.try_wait()?.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "recording helper exited before acknowledgement",
+                    ));
+                }
+            }
+            Ok(_) => {
+                if line.len() > 64 || line.trim_end() != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "recording helper returned an invalid acknowledgement",
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn invalidate_recording_runtime(runtime: &mut RecordingRuntime) {
+    runtime.status.take();
+    if let Some(mut child) = runtime.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    runtime.state = RecordingRuntime::default().state;
 }
 
 fn execute_game_mode_with(
@@ -1088,6 +1176,105 @@ mod tests {
 
     use super::*;
     use crate::system::{CommandOutput, CommandRunner, RunnerError};
+
+    fn scripted_status_child(
+        script: &str,
+    ) -> (Child, std::io::BufReader<std::process::ChildStdout>) {
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        set_nonblocking(stdout.as_raw_fd()).unwrap();
+        (child, std::io::BufReader::new(stdout))
+    }
+
+    #[test]
+    fn recording_confirmation_requires_bounded_helper_state_acknowledgements() {
+        let (mut child, mut status) = scripted_status_child(
+            "printf 'STATE recording\\n'; trap \"printf 'STATE paused\\n'\" USR1; while :; do sleep 0.02; done",
+        );
+        wait_for_recording_ack(
+            &mut status,
+            &mut child,
+            RecordingStatus::Recording,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGUSR1) },
+            0
+        );
+        wait_for_recording_ack(
+            &mut status,
+            &mut child,
+            RecordingStatus::Paused,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn live_helper_without_ready_ack_cannot_confirm_recording_start() {
+        let (mut child, mut status) = scripted_status_child("sleep 5");
+        assert_eq!(
+            wait_for_recording_ack(
+                &mut status,
+                &mut child,
+                RecordingStatus::Recording,
+                Instant::now() + Duration::from_millis(50),
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn helper_that_ignores_pause_cannot_acknowledge_a_fabricated_state() {
+        let (mut child, mut status) = scripted_status_child(
+            "printf 'STATE recording\\n'; trap ':' USR1; while :; do sleep 0.02; done",
+        );
+        wait_for_recording_ack(
+            &mut status,
+            &mut child,
+            RecordingStatus::Recording,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGUSR1) },
+            0
+        );
+        let error = wait_for_recording_ack(
+            &mut status,
+            &mut child,
+            RecordingStatus::Paused,
+            Instant::now() + Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut runtime = RecordingRuntime {
+            state: RecordingState {
+                status: RecordingStatus::Recording,
+                recording_id: Some("recording-under-test".into()),
+                output_id: Some("output-under-test".into()),
+            },
+            child: Some(child),
+            status: Some(status),
+        };
+        invalidate_recording_runtime(&mut runtime);
+        assert_eq!(runtime.state.status, RecordingStatus::Inactive);
+        assert!(runtime.child.is_none());
+        assert!(runtime.status.is_none());
+    }
 
     #[derive(Clone, Default)]
     struct FixtureRunner {

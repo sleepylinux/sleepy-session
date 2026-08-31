@@ -186,11 +186,39 @@ impl SecretBroker {
 
 #[async_trait]
 pub trait NetworkSecretExchange: Send + Sync + 'static {
-    fn has_pending_request(&self) -> bool;
-    fn pending_deadline(&self) -> Option<Instant> {
-        Some(Instant::now() + SECRET_DEADLINE)
+    fn acquire_lease(&self) -> io::Result<SecretRequestLease>;
+    async fn submit(&self, lease: &SecretRequestLease, secret: LockedSecret) -> io::Result<()>;
+}
+
+#[derive(Clone)]
+pub struct SecretRequestLease {
+    request_id: [u8; 16],
+    key: SecretRequestKey,
+    deadline: StdInstant,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SecretRequestLease {
+    pub fn new(
+        request_id: [u8; 16],
+        connection_path: impl Into<String>,
+        setting_name: impl Into<String>,
+        deadline: StdInstant,
+    ) -> Self {
+        Self {
+            request_id,
+            key: SecretRequestKey {
+                connection_path: connection_path.into(),
+                setting_name: setting_name.into(),
+            },
+            deadline,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
     }
-    async fn submit(&self, secret: LockedSecret) -> io::Result<()>;
+
+    fn tokio_deadline(&self) -> Instant {
+        Instant::from_std(self.deadline)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -198,11 +226,14 @@ pub struct UnavailableNetworkManagerExchange;
 
 #[async_trait]
 impl NetworkSecretExchange for UnavailableNetworkManagerExchange {
-    fn has_pending_request(&self) -> bool {
-        false
+    fn acquire_lease(&self) -> io::Result<SecretRequestLease> {
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "NetworkManager did not request a secret",
+        ))
     }
 
-    async fn submit(&self, _secret: LockedSecret) -> io::Result<()> {
+    async fn submit(&self, _lease: &SecretRequestLease, _secret: LockedSecret) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "NetworkManager secret-agent exchange is unavailable",
@@ -305,7 +336,32 @@ impl NetworkManagerSecretExchange {
         }
     }
 
-    fn begin_reply(&self, id: &[u8; 16]) -> bool {
+    fn acquire_lease(&self) -> io::Result<SecretRequestLease> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| io::Error::other("NetworkManager secret exchange lock poisoned"))?;
+        let request = pending.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "NetworkManager did not request a secret",
+            )
+        })?;
+        if request.cancelled.load(Ordering::Acquire) || StdInstant::now() >= request.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "NetworkManager secret request is no longer live",
+            ));
+        }
+        Ok(SecretRequestLease {
+            request_id: request.id,
+            key: request.key.clone(),
+            deadline: request.deadline,
+            cancelled: Arc::clone(&request.cancelled),
+        })
+    }
+
+    fn send_reply_if_live(&self, id: &[u8; 16], send: impl FnOnce() -> bool) -> bool {
         let Ok(mut pending) = self.pending.lock() else {
             return false;
         };
@@ -316,39 +372,46 @@ impl NetworkManagerSecretExchange {
             return false;
         }
         request.reply_started = true;
-        true
+        send()
     }
 }
 
 #[async_trait]
 impl NetworkSecretExchange for NetworkManagerSecretExchange {
-    fn has_pending_request(&self) -> bool {
-        self.pending.lock().is_ok_and(|pending| pending.is_some())
+    fn acquire_lease(&self) -> io::Result<SecretRequestLease> {
+        NetworkManagerSecretExchange::acquire_lease(self)
     }
 
-    fn pending_deadline(&self) -> Option<Instant> {
-        self.pending.lock().ok().and_then(|pending| {
-            pending
-                .as_ref()
-                .map(|request| Instant::from_std(request.deadline))
-        })
-    }
-
-    async fn submit(&self, secret: LockedSecret) -> io::Result<()> {
-        let sender = self
+    async fn submit(&self, lease: &SecretRequestLease, secret: LockedSecret) -> io::Result<()> {
+        let pending = self
             .pending
             .lock()
-            .map_err(|_| io::Error::other("NetworkManager secret exchange lock poisoned"))?
-            .as_ref()
-            .map(|request| request.sender.clone())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "NetworkManager did not request a secret",
-                )
-            })?;
-        sender.send(secret).map_err(|error| {
-            drop(error.0);
+            .map_err(|_| io::Error::other("NetworkManager secret exchange lock poisoned"))?;
+        let request = pending.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "NetworkManager did not request a secret",
+            )
+        })?;
+        let matching = request.id == lease.request_id
+            && request.key == lease.key
+            && request.deadline == lease.deadline
+            && Arc::ptr_eq(&request.cancelled, &lease.cancelled);
+        if !matching
+            || request.cancelled.load(Ordering::Acquire)
+            || lease.cancelled.load(Ordering::Acquire)
+            || StdInstant::now() >= request.deadline
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "NetworkManager secret request lease is stale",
+            ));
+        }
+        request.sender.try_send(secret).map_err(|error| {
+            match error {
+                std_mpsc::TrySendError::Full(secret)
+                | std_mpsc::TrySendError::Disconnected(secret) => drop(secret),
+            }
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "NetworkManager secret request was cancelled",
@@ -555,22 +618,27 @@ fn register_network_manager_methods(
                         let connection = Arc::clone(&callback_connection);
                         let exchange = Arc::clone(&exchange);
                         let request_id = receiver.id;
-                        let cancelled = Arc::clone(&receiver.cancelled);
                         let worker = thread::spawn(move || {
-                            let (mut reply, retained) =
+                            let (reply, retained) =
                                 finish_get_secrets(&message, &exchange, receiver);
-                            if cancelled.load(Ordering::Acquire)
-                                || !exchange.begin_reply(&request_id)
-                            {
-                                reply = secret_error_reply(
-                                    &message,
-                                    &io::Error::new(
-                                        io::ErrorKind::Interrupted,
-                                        "NetworkManager secret request was cancelled",
-                                    ),
-                                );
+                            if retained.is_some() {
+                                let mut reply = Some(reply);
+                                if !exchange.send_reply_if_live(&request_id, || {
+                                    connection
+                                        .send(reply.take().expect("reply is sent once"))
+                                        .is_ok()
+                                }) {
+                                    let _ = connection.send(secret_error_reply(
+                                        &message,
+                                        &io::Error::new(
+                                            io::ErrorKind::Interrupted,
+                                            "NetworkManager secret request was cancelled",
+                                        ),
+                                    ));
+                                }
+                            } else {
+                                let _ = connection.send(reply);
                             }
-                            let _ = connection.send(reply);
                             exchange.complete(&request_id);
                             // Keep the locked owner alive through libdbus serialization/send.
                             // libdbus necessarily owns its transport copy after append; the
@@ -897,12 +965,8 @@ async fn serve_secret<X: NetworkSecretExchange + ?Sized>(
     broker: SecretBroker,
     exchange: Arc<X>,
 ) -> io::Result<()> {
-    let deadline = exchange.pending_deadline().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            "NetworkManager did not request a secret",
-        )
-    })?;
+    let lease = exchange.acquire_lease()?;
+    let deadline = lease.tokio_deadline();
     if deadline <= Instant::now() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -910,17 +974,11 @@ async fn serve_secret<X: NetworkSecretExchange + ?Sized>(
         ));
     }
     let operation = async {
-        if !exchange.has_pending_request() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "NetworkManager did not request a secret",
-            ));
-        }
         let challenge = broker.issue_until(deadline).await?;
         write_binary_frame(&mut stream, &challenge).await?;
         let response = read_binary_frame(&mut stream, Arc::clone(&broker.observer)).await?;
         let secret = broker.accept_locked_response(response).await?;
-        exchange.submit(secret).await
+        exchange.submit(&lease, secret).await
     };
     let result = tokio::select! {
         biased;
@@ -978,9 +1036,27 @@ pub fn validate_secret_socket_path(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use dbus::strings::BusName;
 
     use super::*;
+
+    #[derive(Default)]
+    struct ZeroizeAudit {
+        calls: AtomicUsize,
+        nonzero_bytes: AtomicUsize,
+    }
+
+    impl SecretZeroizeObserver for ZeroizeAudit {
+        fn after_zeroize(&self, bytes: &[u8]) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.nonzero_bytes.fetch_add(
+                bytes.iter().filter(|byte| **byte != 0).count(),
+                Ordering::SeqCst,
+            );
+        }
+    }
 
     fn message_from(sender: &str) -> Message {
         let mut message = Message::new_method_call(
@@ -1020,15 +1096,16 @@ mod tests {
             setting_name: "802-11-wireless-security".into(),
         };
         let pending = exchange.begin(key.clone()).unwrap();
+        let lease = exchange.acquire_lease().unwrap();
         let secret =
             LockedSecret::from_frame(b"super-secret".to_vec(), 0, Arc::new(NoopZeroizeObserver));
-        exchange.submit(secret).await.unwrap();
+        exchange.submit(&lease, secret).await.unwrap();
 
-        assert!(exchange.has_pending_request());
+        assert!(exchange.pending.lock().unwrap().is_some());
         exchange.cancel_matching(&key);
         assert!(pending.cancelled.load(Ordering::Acquire));
         assert!(pending.receiver.recv().is_ok());
-        assert!(!exchange.has_pending_request());
+        assert!(exchange.pending.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1043,11 +1120,61 @@ mod tests {
         let restarted = exchange.begin(key).unwrap();
 
         exchange.complete(&old.id);
-        assert!(exchange.has_pending_request());
+        assert!(exchange.pending.lock().unwrap().is_some());
         assert_eq!(
             exchange.pending.lock().unwrap().as_ref().unwrap().id,
             restarted.id
         );
+    }
+
+    #[tokio::test]
+    async fn stale_socket_lease_cannot_submit_request_a_secret_into_request_b() {
+        let audit = Arc::new(ZeroizeAudit::default());
+        let exchange = NetworkManagerSecretExchange::new();
+        let key_a = SecretRequestKey {
+            connection_path: "/org/freedesktop/NetworkManager/Settings/1".into(),
+            setting_name: "802-11-wireless-security".into(),
+        };
+        let key_b = SecretRequestKey {
+            connection_path: "/org/freedesktop/NetworkManager/Settings/2".into(),
+            setting_name: "802-11-wireless-security".into(),
+        };
+        let request_a = exchange.begin(key_a.clone()).unwrap();
+        let lease_a = exchange.acquire_lease().unwrap();
+        exchange.cancel_matching(&key_a);
+        let request_b = exchange.begin(key_b).unwrap();
+        let secret = LockedSecret::from_frame(b"request-a-sentinel".to_vec(), 0, audit.clone());
+
+        assert_eq!(
+            exchange.submit(&lease_a, secret).await.unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        assert!(matches!(
+            request_b.receiver.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+        assert!(request_a.cancelled.load(Ordering::Acquire));
+        assert_eq!(audit.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(audit.nonzero_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn owner_revocation_that_wins_prevents_secret_bearing_send() {
+        let exchange = NetworkManagerSecretExchange::new();
+        let request = exchange
+            .begin(SecretRequestKey {
+                connection_path: "/org/freedesktop/NetworkManager/Settings/3".into(),
+                setting_name: "802-11-wireless-security".into(),
+            })
+            .unwrap();
+        exchange.cancel();
+        let sent = AtomicBool::new(false);
+
+        assert!(!exchange.send_reply_if_live(&request.id, || {
+            sent.store(true, Ordering::Release);
+            true
+        }));
+        assert!(!sent.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1058,18 +1185,19 @@ mod tests {
             setting_name: "802-11-wireless-security".into(),
         };
         let pending = exchange.begin(key).unwrap();
+        let lease = exchange.acquire_lease().unwrap();
         let secret = LockedSecret::from_frame(
             b"correct-horse-battery-staple".to_vec(),
             0,
             Arc::new(NoopZeroizeObserver),
         );
-        exchange.submit(secret).await.unwrap();
+        exchange.submit(&lease, secret).await.unwrap();
         let mut request = message_from(":1.42");
         request.set_serial(7);
 
         let request_id = pending.id;
         let (reply, retained) = finish_get_secrets_result(&request, &exchange, pending).unwrap();
-        assert!(exchange.begin_reply(&request_id));
+        assert!(exchange.send_reply_if_live(&request_id, || true));
         let values: HashMap<String, HashMap<String, Variant<String>>> = reply.read1().unwrap();
         assert_eq!(
             values["802-11-wireless-security"]["psk"].0,
@@ -1081,6 +1209,6 @@ mod tests {
         );
         exchange.complete(&request_id);
         drop(retained);
-        assert!(!exchange.has_pending_request());
+        assert!(exchange.pending.lock().unwrap().is_none());
     }
 }
