@@ -125,9 +125,21 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let socket = runtime.join("sleepy/session.sock");
     let osd_socket = runtime.join("sleepy/osd.sock");
     let theme_socket = runtime.join("sleepy/theme.sock");
+    let desktop_socket = runtime.join("sleepy/desktop.sock");
+    let desktop_control_socket = runtime.join("sleepy/desktop-control.sock");
+    let secret_socket = runtime.join("sleepy/secret.sock");
     wait_for_path(&socket, Duration::from_secs(2));
     wait_for_path(&osd_socket, Duration::from_secs(2));
     wait_for_path(&theme_socket, Duration::from_secs(2));
+    wait_for_path(&desktop_socket, Duration::from_secs(2));
+    wait_for_path(&desktop_control_socket, Duration::from_secs(2));
+    wait_for_path(&secret_socket, Duration::from_secs(2));
+
+    // Keep v3 clients deliberately idle across STOPPING. The daemon must cancel
+    // their handlers, drain them, and remove every startup-barrier socket.
+    let _slow_desktop = std::os::unix::net::UnixStream::connect(&desktop_socket).unwrap();
+    let _slow_desktop_control =
+        std::os::unix::net::UnixStream::connect(&desktop_control_socket).unwrap();
 
     let mut watcher = Command::new(env!("CARGO_BIN_EXE_sleepyctl"))
         .args(["events", "watch", "--format", "ndjson"])
@@ -193,6 +205,9 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     assert!(!socket.exists());
     assert!(!osd_socket.exists());
     assert!(!theme_socket.exists());
+    assert!(!desktop_socket.exists());
+    assert!(!desktop_control_socket.exists());
+    assert!(!secret_socket.exists());
     assert!(watcher.wait().unwrap().success());
 }
 

@@ -322,6 +322,7 @@ pub fn parse_full_snapshot(
     }
 
     Ok(HyprlandSnapshot {
+        action_capabilities: crate::desktop::hyprland_action_capabilities(),
         monitors,
         workspaces,
         windows,

@@ -36,6 +36,19 @@ enum MenuAction {
     Menu { path: String, node_id: i32 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrayInvocation {
+    Activate {
+        service: String,
+        path: String,
+    },
+    Menu {
+        service: String,
+        path: String,
+        node_id: i32,
+    },
+}
+
 #[derive(Default)]
 pub struct TrayService {
     targets: Mutex<BTreeMap<String, Target>>,
@@ -106,42 +119,73 @@ impl TrayService {
 
     pub fn invoke(&self, item_id: &StableId, menu_id: &StableId) -> io::Result<Vec<TrayItem>> {
         let deadline = Instant::now() + OPERATION_TIMEOUT;
-        let (target, action) = self
+        self.invoke_with(
+            item_id,
+            menu_id,
+            |invocation| {
+                let connection = dbus::blocking::Connection::new_session().map_err(dbus_error)?;
+                match invocation {
+                    TrayInvocation::Activate { service, path } => {
+                        let proxy = connection.with_proxy(service, path, remaining(deadline)?);
+                        let _: () = proxy
+                            .method_call(ITEM_INTERFACE, "Activate", (0_i32, 0_i32))
+                            .map_err(dbus_error)?;
+                    }
+                    TrayInvocation::Menu {
+                        service,
+                        path,
+                        node_id,
+                    } => {
+                        let proxy = connection.with_proxy(service, path, remaining(deadline)?);
+                        let _: () = proxy
+                            .method_call(
+                                MENU_INTERFACE,
+                                "Event",
+                                (node_id, "clicked", Variant(0_i32), 0_u32),
+                            )
+                            .map_err(dbus_error)?;
+                    }
+                }
+                Ok(())
+            },
+            || self.probe_until(deadline),
+        )
+    }
+
+    fn invoke_with(
+        &self,
+        item_id: &StableId,
+        menu_id: &StableId,
+        transport: impl FnOnce(TrayInvocation) -> io::Result<()>,
+        refresh: impl FnOnce() -> io::Result<Vec<TrayItem>>,
+    ) -> io::Result<Vec<TrayItem>> {
+        let invocation = self.invocation(item_id, menu_id)?;
+        transport(invocation)?;
+        refresh()
+    }
+
+    fn invocation(&self, item_id: &StableId, menu_id: &StableId) -> io::Result<TrayInvocation> {
+        let targets = self
             .targets
             .lock()
-            .map_err(|_| io::Error::other("tray target lock poisoned"))?
-            .get(item_id.as_str())
-            .and_then(|target| {
-                target
-                    .actions
-                    .get(menu_id.as_str())
-                    .cloned()
-                    .map(|action| (target.clone(), action))
-            })
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "unknown tray menu target")
-            })?;
-        let connection = dbus::blocking::Connection::new_session().map_err(dbus_error)?;
-        match action {
-            MenuAction::Activate => {
-                let proxy =
-                    connection.with_proxy(target.service, target.path, remaining(deadline)?);
-                let _: () = proxy
-                    .method_call(ITEM_INTERFACE, "Activate", (0_i32, 0_i32))
-                    .map_err(dbus_error)?;
-            }
-            MenuAction::Menu { path, node_id } => {
-                let proxy = connection.with_proxy(target.service, path, remaining(deadline)?);
-                let _: () = proxy
-                    .method_call(
-                        MENU_INTERFACE,
-                        "Event",
-                        (node_id, "clicked", Variant(0_i32), 0_u32),
-                    )
-                    .map_err(dbus_error)?;
-            }
-        }
-        self.probe_until(deadline)
+            .map_err(|_| io::Error::other("tray target lock poisoned"))?;
+        let target = targets.get(item_id.as_str()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "unknown tray menu target")
+        })?;
+        let action = target.actions.get(menu_id.as_str()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "unknown tray menu target")
+        })?;
+        Ok(match action {
+            MenuAction::Activate => TrayInvocation::Activate {
+                service: target.service.clone(),
+                path: target.path.clone(),
+            },
+            MenuAction::Menu { path, node_id } => TrayInvocation::Menu {
+                service: target.service.clone(),
+                path: path.clone(),
+                node_id: *node_id,
+            },
+        })
     }
 }
 
@@ -364,4 +408,54 @@ fn valid_object_path(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[test]
+    fn injected_tray_transport_receives_only_the_cached_typed_target() {
+        let item_id = StableId("tray:fixture".into());
+        let menu_id = StableId("tray-menu:fixture:7".into());
+        let service = TrayService {
+            targets: Mutex::new(BTreeMap::from([(
+                item_id.as_str().to_owned(),
+                Target {
+                    service: "org.example.Tray".into(),
+                    path: "/StatusNotifierItem".into(),
+                    actions: BTreeMap::from([(
+                        menu_id.as_str().to_owned(),
+                        MenuAction::Menu {
+                            path: "/Menu".into(),
+                            node_id: 7,
+                        },
+                    )]),
+                },
+            )])),
+        };
+        let invocations = RefCell::new(Vec::new());
+        let refreshed = service
+            .invoke_with(
+                &item_id,
+                &menu_id,
+                |invocation| {
+                    invocations.borrow_mut().push(invocation);
+                    Ok(())
+                },
+                || Ok(Vec::new()),
+            )
+            .unwrap();
+        assert!(refreshed.is_empty());
+        assert_eq!(
+            invocations.into_inner(),
+            [TrayInvocation::Menu {
+                service: "org.example.Tray".into(),
+                path: "/Menu".into(),
+                node_id: 7,
+            }]
+        );
+    }
 }

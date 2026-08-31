@@ -73,7 +73,8 @@ impl<R: CommandRunner> CoreSystemProducer<R> {
                 | DesktopDomainId::Audio
                 | DesktopDomainId::Media
                 | DesktopDomainId::Battery
-                | DesktopDomainId::Display
+                | DesktopDomainId::Brightness
+                | DesktopDomainId::NightLight
                 | DesktopDomainId::Power
         ) {
             return Err(io::Error::new(
@@ -148,7 +149,12 @@ pub fn probe_domain<R: CommandRunner>(
         }
         DesktopDomainId::Audio => super::audio::probe(&runner).map(DesktopDomainValue::Audio),
         DesktopDomainId::Media => super::media::probe(&runner).map(DesktopDomainValue::Media),
-        DesktopDomainId::Display => super::display::probe(&runner).map(DesktopDomainValue::Display),
+        DesktopDomainId::Brightness => {
+            super::display::probe_brightness(&runner).map(DesktopDomainValue::Brightness)
+        }
+        DesktopDomainId::NightLight => {
+            super::display::probe_night_light().map(DesktopDomainValue::NightLight)
+        }
         DesktopDomainId::Power => super::power::probe(&runner).map(DesktopDomainValue::Power),
         _ => return probe_legacy_domain(facade, domain),
     };

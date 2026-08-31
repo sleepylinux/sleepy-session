@@ -11,7 +11,7 @@ use std::{
         mpsc as std_mpsc, Arc, Mutex as StdMutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant as StdInstant},
 };
 
 use async_trait::async_trait;
@@ -128,6 +128,10 @@ impl SecretBroker {
     }
 
     pub async fn issue(&self) -> io::Result<[u8; 16]> {
+        self.issue_until(Instant::now() + SECRET_DEADLINE).await
+    }
+
+    async fn issue_until(&self, deadline: Instant) -> io::Result<[u8; 16]> {
         let mut pending = self.pending.lock().await;
         if pending.is_some() {
             return Err(io::Error::new(
@@ -136,10 +140,7 @@ impl SecretBroker {
             ));
         }
         let id = *uuid::Uuid::new_v4().as_bytes();
-        *pending = Some(PendingChallenge {
-            id,
-            deadline: Instant::now() + SECRET_DEADLINE,
-        });
+        *pending = Some(PendingChallenge { id, deadline });
         Ok(id)
     }
 
@@ -186,6 +187,9 @@ impl SecretBroker {
 #[async_trait]
 pub trait NetworkSecretExchange: Send + Sync + 'static {
     fn has_pending_request(&self) -> bool;
+    fn pending_deadline(&self) -> Option<Instant> {
+        Some(Instant::now() + SECRET_DEADLINE)
+    }
     async fn submit(&self, secret: LockedSecret) -> io::Result<()>;
 }
 
@@ -207,7 +211,30 @@ impl NetworkSecretExchange for UnavailableNetworkManagerExchange {
 }
 
 pub struct NetworkManagerSecretExchange {
-    pending: StdMutex<Option<std_mpsc::SyncSender<LockedSecret>>>,
+    pending: StdMutex<Option<PendingSecretRequest>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SecretRequestKey {
+    connection_path: String,
+    setting_name: String,
+}
+
+struct PendingSecretRequest {
+    id: [u8; 16],
+    key: SecretRequestKey,
+    sender: std_mpsc::SyncSender<LockedSecret>,
+    cancelled: Arc<AtomicBool>,
+    deadline: StdInstant,
+    reply_started: bool,
+}
+
+struct PendingSecretReceiver {
+    id: [u8; 16],
+    key: SecretRequestKey,
+    receiver: std_mpsc::Receiver<LockedSecret>,
+    cancelled: Arc<AtomicBool>,
+    deadline: StdInstant,
 }
 
 impl NetworkManagerSecretExchange {
@@ -217,7 +244,7 @@ impl NetworkManagerSecretExchange {
         })
     }
 
-    fn begin(&self) -> io::Result<std_mpsc::Receiver<LockedSecret>> {
+    fn begin(&self, key: SecretRequestKey) -> io::Result<PendingSecretReceiver> {
         let mut pending = self
             .pending
             .lock()
@@ -229,14 +256,67 @@ impl NetworkManagerSecretExchange {
             ));
         }
         let (sender, receiver) = std_mpsc::sync_channel(1);
-        *pending = Some(sender);
-        Ok(receiver)
+        let id = *uuid::Uuid::new_v4().as_bytes();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = StdInstant::now() + SECRET_DEADLINE;
+        *pending = Some(PendingSecretRequest {
+            id,
+            key: key.clone(),
+            sender,
+            cancelled: Arc::clone(&cancelled),
+            deadline,
+            reply_started: false,
+        });
+        Ok(PendingSecretReceiver {
+            id,
+            key,
+            receiver,
+            cancelled,
+            deadline,
+        })
     }
 
     fn cancel(&self) {
         if let Ok(mut pending) = self.pending.lock() {
-            pending.take();
+            if let Some(request) = pending.take() {
+                request.cancelled.store(true, Ordering::Release);
+            }
         }
+    }
+
+    fn cancel_matching(&self, key: &SecretRequestKey) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if pending
+                .as_ref()
+                .is_some_and(|request| request.key == *key && !request.reply_started)
+            {
+                if let Some(request) = pending.take() {
+                    request.cancelled.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    fn complete(&self, id: &[u8; 16]) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if pending.as_ref().is_some_and(|request| request.id == *id) {
+                pending.take();
+            }
+        }
+    }
+
+    fn begin_reply(&self, id: &[u8; 16]) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        let Some(request) = pending.as_mut().filter(|request| request.id == *id) else {
+            return false;
+        };
+        if request.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        request.reply_started = true;
+        true
     }
 }
 
@@ -246,12 +326,21 @@ impl NetworkSecretExchange for NetworkManagerSecretExchange {
         self.pending.lock().is_ok_and(|pending| pending.is_some())
     }
 
+    fn pending_deadline(&self) -> Option<Instant> {
+        self.pending.lock().ok().and_then(|pending| {
+            pending
+                .as_ref()
+                .map(|request| Instant::from_std(request.deadline))
+        })
+    }
+
     async fn submit(&self, secret: LockedSecret) -> io::Result<()> {
         let sender = self
             .pending
             .lock()
             .map_err(|_| io::Error::other("NetworkManager secret exchange lock poisoned"))?
-            .take()
+            .as_ref()
+            .map(|request| request.sender.clone())
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -275,6 +364,48 @@ pub struct NetworkManagerSecretAgent {
     workers: Arc<StdMutex<Vec<thread::JoinHandle<()>>>>,
 }
 
+#[derive(Clone)]
+struct NetworkManagerPeerAuthority {
+    unique_owner: Arc<StdMutex<Option<String>>>,
+}
+
+impl NetworkManagerPeerAuthority {
+    fn new(unique_owner: String) -> Self {
+        Self {
+            unique_owner: Arc::new(StdMutex::new(Some(unique_owner))),
+        }
+    }
+
+    fn authorize(&self, message: &Message) -> io::Result<()> {
+        let sender = message
+            .sender()
+            .map(|sender| sender.to_string())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "NetworkManager request has no authenticated D-Bus sender",
+                )
+            })?;
+        let owner = self
+            .unique_owner
+            .lock()
+            .map_err(|_| io::Error::other("NetworkManager owner lock poisoned"))?;
+        if owner.as_deref() != Some(sender.as_str()) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "NetworkManager request sender is not the pinned unique owner",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replace(&self, owner: Option<String>) {
+        if let Ok(mut current) = self.unique_owner.lock() {
+            *current = owner;
+        }
+    }
+}
+
 impl NetworkManagerSecretAgent {
     pub fn start_if_available() -> io::Result<(Option<Self>, Arc<dyn NetworkSecretExchange>)> {
         let connection = match SyncConnection::new_system() {
@@ -284,29 +415,41 @@ impl NetworkManagerSecretAgent {
             }
         };
         let connection = Arc::new(connection);
+        let unique_owner = match resolve_network_manager_owner(&connection) {
+            Ok(owner) => owner,
+            Err(_) => return Ok((None, Arc::new(UnavailableNetworkManagerExchange))),
+        };
+        let authority = NetworkManagerPeerAuthority::new(unique_owner);
         let exchange = NetworkManagerSecretExchange::new();
         let workers = Arc::new(StdMutex::new(Vec::new()));
-        register_network_manager_methods(&connection, Arc::clone(&exchange), Arc::clone(&workers));
-        let manager = connection.with_proxy(
-            "org.freedesktop.NetworkManager",
-            "/org/freedesktop/NetworkManager/AgentManager",
-            Duration::from_secs(5),
+        register_network_manager_methods(
+            &connection,
+            Arc::clone(&exchange),
+            Arc::clone(&workers),
+            authority.clone(),
         );
-        let registration: Result<(), dbus::Error> = manager.method_call(
-            "org.freedesktop.NetworkManager.AgentManager",
-            "RegisterWithCapabilities",
-            ("org.sleepylinux.SleepySession", 0_u32),
-        );
-        if registration.is_err() {
+        if register_network_manager_owner_watch(
+            &connection,
+            Arc::clone(&exchange),
+            authority,
+            Arc::clone(&workers),
+        )
+        .is_err()
+        {
+            return Ok((None, Arc::new(UnavailableNetworkManagerExchange)));
+        }
+        if register_with_network_manager(&connection).is_err() {
             return Ok((None, Arc::new(UnavailableNetworkManagerExchange)));
         }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let thread_exchange = Arc::clone(&exchange);
         let thread = thread::Builder::new()
             .name("sleepy-network-secret-agent".into())
             .spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     if connection.process(Duration::from_millis(25)).is_err() {
+                        thread_exchange.cancel();
                         return;
                     }
                 }
@@ -343,11 +486,57 @@ impl Drop for NetworkManagerSecretAgent {
 
 const NM_AGENT_PATH: &str = "/org/freedesktop/NetworkManager/SecretAgent";
 const NM_AGENT_INTERFACE: &str = "org.freedesktop.NetworkManager.SecretAgent";
+const NM_DESTINATION: &str = "org.freedesktop.NetworkManager";
+const DBUS_DESTINATION: &str = "org.freedesktop.DBus";
+const DBUS_PATH: &str = "/org/freedesktop/DBus";
+const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
+
+fn resolve_network_manager_owner(connection: &SyncConnection) -> io::Result<String> {
+    let proxy = connection.with_proxy(DBUS_DESTINATION, DBUS_PATH, Duration::from_secs(2));
+    let (owner,): (String,) = proxy
+        .method_call(DBUS_INTERFACE, "GetNameOwner", (NM_DESTINATION,))
+        .map_err(dbus_io_error)?;
+    if !owner.starts_with(':') {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "NetworkManager did not resolve to a unique D-Bus owner",
+        ));
+    }
+    if let Ok((uid,)) = proxy.method_call::<(u32,), _, _, _>(
+        DBUS_INTERFACE,
+        "GetConnectionUnixUser",
+        (owner.as_str(),),
+    ) {
+        if uid != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "NetworkManager D-Bus owner is not privileged",
+            ));
+        }
+    }
+    Ok(owner)
+}
+
+fn register_with_network_manager(connection: &SyncConnection) -> io::Result<()> {
+    let manager = connection.with_proxy(
+        NM_DESTINATION,
+        "/org/freedesktop/NetworkManager/AgentManager",
+        Duration::from_secs(5),
+    );
+    manager
+        .method_call(
+            "org.freedesktop.NetworkManager.AgentManager",
+            "RegisterWithCapabilities",
+            ("org.sleepylinux.SleepySession", 0_u32),
+        )
+        .map_err(dbus_io_error)
+}
 
 fn register_network_manager_methods(
     connection: &Arc<SyncConnection>,
     exchange: Arc<NetworkManagerSecretExchange>,
     workers: Arc<StdMutex<Vec<thread::JoinHandle<()>>>>,
+    authority: NetworkManagerPeerAuthority,
 ) {
     let mut rule = MatchRule::new_method_call();
     rule.path = Some(NM_AGENT_PATH.into());
@@ -356,15 +545,33 @@ fn register_network_manager_methods(
     connection.start_receive(
         rule,
         Box::new(move |message, channel| {
+            if let Err(error) = authority.authorize(&message) {
+                let _ = channel.send(secret_error_reply(&message, &error));
+                return true;
+            }
             if message.member().as_deref() == Some("GetSecrets") {
                 match begin_get_secrets(&message, &exchange) {
                     Ok(receiver) => {
                         let connection = Arc::clone(&callback_connection);
                         let exchange = Arc::clone(&exchange);
+                        let request_id = receiver.id;
+                        let cancelled = Arc::clone(&receiver.cancelled);
                         let worker = thread::spawn(move || {
-                            let (reply, retained) =
+                            let (mut reply, retained) =
                                 finish_get_secrets(&message, &exchange, receiver);
+                            if cancelled.load(Ordering::Acquire)
+                                || !exchange.begin_reply(&request_id)
+                            {
+                                reply = secret_error_reply(
+                                    &message,
+                                    &io::Error::new(
+                                        io::ErrorKind::Interrupted,
+                                        "NetworkManager secret request was cancelled",
+                                    ),
+                                );
+                            }
                             let _ = connection.send(reply);
+                            exchange.complete(&request_id);
                             // Keep the locked owner alive through libdbus serialization/send.
                             // libdbus necessarily owns its transport copy after append; the
                             // daemon creates no Rust String/serde copy of the secret.
@@ -397,6 +604,59 @@ fn register_network_manager_methods(
     );
 }
 
+fn register_network_manager_owner_watch(
+    connection: &Arc<SyncConnection>,
+    exchange: Arc<NetworkManagerSecretExchange>,
+    authority: NetworkManagerPeerAuthority,
+    workers: Arc<StdMutex<Vec<thread::JoinHandle<()>>>>,
+) -> io::Result<()> {
+    let rule = MatchRule::new_signal(DBUS_INTERFACE, "NameOwnerChanged");
+    let callback_connection = Arc::clone(connection);
+    connection
+        .add_match(
+            rule,
+            move |(name, _old_owner, new_owner): (String, String, String), _, _| {
+                if name != NM_DESTINATION {
+                    return true;
+                }
+                exchange.cancel();
+                authority.replace(None);
+                if new_owner.is_empty() {
+                    return true;
+                }
+                let connection = Arc::clone(&callback_connection);
+                let authority = authority.clone();
+                let worker = thread::spawn(move || {
+                    let Ok(resolved) = resolve_network_manager_owner(&connection) else {
+                        return;
+                    };
+                    if resolved != new_owner {
+                        return;
+                    }
+                    authority.replace(Some(resolved));
+                    if register_with_network_manager(&connection).is_err() {
+                        authority.replace(None);
+                    }
+                });
+                if let Ok(mut handles) = workers.lock() {
+                    let mut index = 0;
+                    while index < handles.len() {
+                        if handles[index].is_finished() {
+                            let finished = handles.swap_remove(index);
+                            let _ = finished.join();
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    handles.push(worker);
+                }
+                true
+            },
+        )
+        .map(|_| ())
+        .map_err(dbus_io_error)
+}
+
 fn handle_network_manager_method(
     message: &Message,
     exchange: &NetworkManagerSecretExchange,
@@ -406,8 +666,8 @@ fn handle_network_manager_method(
             io::ErrorKind::WouldBlock,
             "NetworkManager secret request was already dispatched",
         )),
-        Some("CancelGetSecrets") => read_cancel_args(message).map(|_| {
-            exchange.cancel();
+        Some("CancelGetSecrets") => read_cancel_args(message).map(|key| {
+            exchange.cancel_matching(&key);
             (message.method_return(), None)
         }),
         Some("SaveSecrets") | Some("DeleteSecrets") => {
@@ -424,10 +684,10 @@ fn handle_network_manager_method(
 fn begin_get_secrets(
     message: &Message,
     exchange: &NetworkManagerSecretExchange,
-) -> io::Result<std_mpsc::Receiver<LockedSecret>> {
+) -> io::Result<PendingSecretReceiver> {
     let mut arguments = message.iter_init();
     require_argument(&mut arguments, "a{sa{sv}}", "connection settings")?;
-    let _path: dbus::Path<'_> = arguments.read().map_err(invalid_dbus_args)?;
+    let path: dbus::Path<'_> = arguments.read().map_err(invalid_dbus_args)?;
     let setting_name: &str = arguments.read().map_err(invalid_dbus_args)?;
     require_argument(&mut arguments, "as", "secret hints")?;
     let _flags: u32 = arguments.read().map_err(invalid_dbus_args)?;
@@ -438,13 +698,16 @@ fn begin_get_secrets(
             "only Wi-Fi security secrets are supported",
         ));
     }
-    exchange.begin()
+    exchange.begin(SecretRequestKey {
+        connection_path: path.to_string(),
+        setting_name: setting_name.to_owned(),
+    })
 }
 
 fn finish_get_secrets(
     message: &Message,
     exchange: &NetworkManagerSecretExchange,
-    receiver: std_mpsc::Receiver<LockedSecret>,
+    receiver: PendingSecretReceiver,
 ) -> (Message, Option<LockedSecret>) {
     match finish_get_secrets_result(message, exchange, receiver) {
         Ok(result) => result,
@@ -455,10 +718,20 @@ fn finish_get_secrets(
 fn finish_get_secrets_result(
     message: &Message,
     exchange: &NetworkManagerSecretExchange,
-    receiver: std_mpsc::Receiver<LockedSecret>,
+    receiver: PendingSecretReceiver,
 ) -> io::Result<(Message, Option<LockedSecret>)> {
-    let secret = receiver.recv_timeout(SECRET_DEADLINE).map_err(|error| {
-        exchange.cancel();
+    let remaining = receiver
+        .deadline
+        .saturating_duration_since(StdInstant::now());
+    if remaining.is_zero() {
+        exchange.cancel_matching(&receiver.key);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "network secret response exceeded its total deadline",
+        ));
+    }
+    let secret = receiver.receiver.recv_timeout(remaining).map_err(|error| {
+        exchange.cancel_matching(&receiver.key);
         match error {
             std_mpsc::RecvTimeoutError::Timeout => io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -470,6 +743,12 @@ fn finish_get_secrets_result(
             ),
         }
     })?;
+    if receiver.cancelled.load(Ordering::Acquire) || StdInstant::now() >= receiver.deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "NetworkManager secret request was cancelled",
+        ));
+    }
     let value = std::str::from_utf8(secret.expose()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -479,14 +758,24 @@ fn finish_get_secrets_result(
     let setting = HashMap::from([("psk", Variant(value))]);
     let reply = HashMap::from([("802-11-wireless-security", setting)]);
     let message = message.return_with_args((reply,));
+    if receiver.cancelled.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "NetworkManager secret request was cancelled",
+        ));
+    }
     Ok((message, Some(secret)))
 }
 
-fn read_cancel_args(message: &Message) -> io::Result<()> {
+fn read_cancel_args(message: &Message) -> io::Result<SecretRequestKey> {
     let mut arguments = message.iter_init();
-    let _path: dbus::Path<'_> = arguments.read().map_err(invalid_dbus_args)?;
-    let _setting: &str = arguments.read().map_err(invalid_dbus_args)?;
-    require_end(&mut arguments)
+    let path: dbus::Path<'_> = arguments.read().map_err(invalid_dbus_args)?;
+    let setting: &str = arguments.read().map_err(invalid_dbus_args)?;
+    require_end(&mut arguments)?;
+    Ok(SecretRequestKey {
+        connection_path: path.to_string(),
+        setting_name: setting.to_owned(),
+    })
 }
 
 fn read_connection_and_path(message: &Message) -> io::Result<()> {
@@ -530,6 +819,17 @@ fn secret_error_reply(message: &Message, error: &io::Error) -> Message {
 
 fn invalid_dbus_args(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+}
+
+fn dbus_io_error(error: dbus::Error) -> io::Error {
+    let kind = match error.name() {
+        Some("org.freedesktop.DBus.Error.AccessDenied") => io::ErrorKind::PermissionDenied,
+        Some("org.freedesktop.DBus.Error.NoReply") => io::ErrorKind::TimedOut,
+        Some("org.freedesktop.DBus.Error.NameHasNoOwner")
+        | Some("org.freedesktop.DBus.Error.ServiceUnknown") => io::ErrorKind::NotFound,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error.to_string())
 }
 
 pub struct SecretSocket<X: NetworkSecretExchange + ?Sized> {
@@ -597,6 +897,18 @@ async fn serve_secret<X: NetworkSecretExchange + ?Sized>(
     broker: SecretBroker,
     exchange: Arc<X>,
 ) -> io::Result<()> {
+    let deadline = exchange.pending_deadline().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "NetworkManager did not request a secret",
+        )
+    })?;
+    if deadline <= Instant::now() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "network secret exchange exceeded its total deadline",
+        ));
+    }
     let operation = async {
         if !exchange.has_pending_request() {
             return Err(io::Error::new(
@@ -604,7 +916,7 @@ async fn serve_secret<X: NetworkSecretExchange + ?Sized>(
                 "NetworkManager did not request a secret",
             ));
         }
-        let challenge = broker.issue().await?;
+        let challenge = broker.issue_until(deadline).await?;
         write_binary_frame(&mut stream, &challenge).await?;
         let response = read_binary_frame(&mut stream, Arc::clone(&broker.observer)).await?;
         let secret = broker.accept_locked_response(response).await?;
@@ -613,7 +925,7 @@ async fn serve_secret<X: NetworkSecretExchange + ?Sized>(
     let result = tokio::select! {
         biased;
         _ = context.cancellation.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "secret connection cancelled")),
-        result = tokio::time::timeout(SECRET_DEADLINE, operation) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "secret exchange timed out"))?,
+        result = tokio::time::timeout_at(deadline, operation) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "secret exchange timed out"))?,
     };
     broker.cancel_pending().await;
     result
@@ -662,4 +974,113 @@ pub fn validate_secret_socket_path(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use dbus::strings::BusName;
+
+    use super::*;
+
+    fn message_from(sender: &str) -> Message {
+        let mut message = Message::new_method_call(
+            NM_DESTINATION,
+            NM_AGENT_PATH,
+            NM_AGENT_INTERFACE,
+            "GetSecrets",
+        )
+        .unwrap();
+        message.set_sender(Some(BusName::new(sender).unwrap()));
+        message
+    }
+
+    #[test]
+    fn network_manager_peer_authority_pins_unique_sender_across_restart() {
+        let authority = NetworkManagerPeerAuthority::new(":1.42".into());
+        assert!(authority.authorize(&message_from(":1.42")).is_ok());
+        assert_eq!(
+            authority
+                .authorize(&message_from(":1.43"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        authority.replace(None);
+        assert!(authority.authorize(&message_from(":1.42")).is_err());
+        authority.replace(Some(":1.43".into()));
+        assert!(authority.authorize(&message_from(":1.43")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_survives_submit_until_dbus_reply_completion() {
+        let exchange = NetworkManagerSecretExchange::new();
+        let key = SecretRequestKey {
+            connection_path: "/org/freedesktop/NetworkManager/Settings/1".into(),
+            setting_name: "802-11-wireless-security".into(),
+        };
+        let pending = exchange.begin(key.clone()).unwrap();
+        let secret =
+            LockedSecret::from_frame(b"super-secret".to_vec(), 0, Arc::new(NoopZeroizeObserver));
+        exchange.submit(secret).await.unwrap();
+
+        assert!(exchange.has_pending_request());
+        exchange.cancel_matching(&key);
+        assert!(pending.cancelled.load(Ordering::Acquire));
+        assert!(pending.receiver.recv().is_ok());
+        assert!(!exchange.has_pending_request());
+    }
+
+    #[tokio::test]
+    async fn stale_dbus_reply_completion_cannot_remove_restarted_request() {
+        let exchange = NetworkManagerSecretExchange::new();
+        let key = SecretRequestKey {
+            connection_path: "/org/freedesktop/NetworkManager/Settings/1".into(),
+            setting_name: "802-11-wireless-security".into(),
+        };
+        let old = exchange.begin(key.clone()).unwrap();
+        exchange.cancel_matching(&key);
+        let restarted = exchange.begin(key).unwrap();
+
+        exchange.complete(&old.id);
+        assert!(exchange.has_pending_request());
+        assert_eq!(
+            exchange.pending.lock().unwrap().as_ref().unwrap().id,
+            restarted.id
+        );
+    }
+
+    #[tokio::test]
+    async fn correlated_secret_is_retained_through_typed_dbus_reply() {
+        let exchange = NetworkManagerSecretExchange::new();
+        let key = SecretRequestKey {
+            connection_path: "/org/freedesktop/NetworkManager/Settings/7".into(),
+            setting_name: "802-11-wireless-security".into(),
+        };
+        let pending = exchange.begin(key).unwrap();
+        let secret = LockedSecret::from_frame(
+            b"correct-horse-battery-staple".to_vec(),
+            0,
+            Arc::new(NoopZeroizeObserver),
+        );
+        exchange.submit(secret).await.unwrap();
+        let mut request = message_from(":1.42");
+        request.set_serial(7);
+
+        let request_id = pending.id;
+        let (reply, retained) = finish_get_secrets_result(&request, &exchange, pending).unwrap();
+        assert!(exchange.begin_reply(&request_id));
+        let values: HashMap<String, HashMap<String, Variant<String>>> = reply.read1().unwrap();
+        assert_eq!(
+            values["802-11-wireless-security"]["psk"].0,
+            "correct-horse-battery-staple"
+        );
+        assert_eq!(
+            retained.as_ref().unwrap().expose(),
+            b"correct-horse-battery-staple"
+        );
+        exchange.complete(&request_id);
+        drop(retained);
+        assert!(!exchange.has_pending_request());
+    }
 }

@@ -26,8 +26,8 @@ use sleepy_session::desktop::secret_agent::{
 use sleepy_session::desktop::{audio, bluetooth, display, media, network, power};
 use sleepy_session::desktop::{
     DesktopControlAuthority, DesktopDomainId, DesktopDomainState, DesktopDomainValue,
-    DesktopMutationExecutor, DesktopProducer, DesktopRegistry, DesktopStateAuthority,
-    ProducerError,
+    DesktopMutationExecutor, DesktopMutationOutcome, DesktopProducer, DesktopRegistry,
+    DesktopStateAuthority, ProducerError,
 };
 use sleepy_session::sessiond::supervisor::PreparedDesktopSockets;
 use sleepy_session::system::{CommandOutput, CommandRunner, CommandSpec, RunnerError};
@@ -41,6 +41,100 @@ struct StaticProducer {
     domain: DesktopDomainId,
     state: DesktopDomainState,
     delay: Duration,
+}
+
+struct ReconnectingProducer {
+    domain: DesktopDomainId,
+    calls: Arc<AtomicUsize>,
+}
+
+struct PanickingProducer {
+    domain: DesktopDomainId,
+}
+
+struct DrainTrackingProducer {
+    domain: DesktopDomainId,
+    drained: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl DesktopProducer for ReconnectingProducer {
+    fn domain(&self) -> DesktopDomainId {
+        self.domain
+    }
+
+    async fn initial(&self) -> DesktopDomainState {
+        DesktopDomainState::terminal(
+            self.domain,
+            CapabilityAvailability::Unavailable,
+            "fixture unavailable",
+        )
+        .unwrap()
+    }
+
+    async fn run(
+        &self,
+        _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
+        cancellation: CancellationToken,
+    ) -> Result<(), ProducerError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            return Err(ProducerError::new("fixture transient disconnect"));
+        }
+        cancellation.cancelled().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DesktopProducer for PanickingProducer {
+    fn domain(&self) -> DesktopDomainId {
+        self.domain
+    }
+
+    async fn initial(&self) -> DesktopDomainState {
+        DesktopDomainState::terminal(
+            self.domain,
+            CapabilityAvailability::Unavailable,
+            "fixture unavailable",
+        )
+        .unwrap()
+    }
+
+    async fn run(
+        &self,
+        _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ProducerError> {
+        panic!("fixture producer panic")
+    }
+}
+
+#[async_trait]
+impl DesktopProducer for DrainTrackingProducer {
+    fn domain(&self) -> DesktopDomainId {
+        self.domain
+    }
+
+    async fn initial(&self) -> DesktopDomainState {
+        DesktopDomainState::terminal(
+            self.domain,
+            CapabilityAvailability::Unavailable,
+            "fixture unavailable",
+        )
+        .unwrap()
+    }
+
+    async fn run(
+        &self,
+        _sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
+        cancellation: CancellationToken,
+    ) -> Result<(), ProducerError> {
+        cancellation.cancelled().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.drained.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -269,6 +363,12 @@ fn every_rich_system_mutation_has_a_narrow_fixed_argv_contract() {
     assert_eq!(brightness.program, "brightnessctl");
     assert_eq!(brightness.args, ["set", "42.0000%"]);
     assert!(display::brightness_spec(f64::NAN).is_err());
+    assert_eq!(
+        display::brightness_spec_for_output("DP-1", 0.42)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Unsupported
+    );
     let profile = power::mutation_spec(sleepy_sdk::PowerProfile::Performance);
     assert_eq!(profile.program, "powerprofilesctl");
     assert_eq!(profile.args, ["set", "performance"]);
@@ -341,6 +441,39 @@ fn rich_system_parsers_emit_complete_stable_sdk_snapshots() {
 }
 
 #[test]
+fn per_item_probes_validate_dedupe_and_bound_identifiers_before_subprocesses() {
+    let bluetooth_rows = (0..1_025)
+        .map(|index| {
+            format!(
+                "Device 02:00:00:{:02X}:{:02X}:{:02X} Device\n",
+                (index >> 16) & 0xff,
+                (index >> 8) & 0xff,
+                index & 0xff
+            )
+        })
+        .collect::<String>();
+    let bluetooth_runner = ScriptedRunner::new([
+        command_output(b"\tPowered: yes\n\tDiscovering: no\n"),
+        command_output(bluetooth_rows.as_bytes()),
+    ]);
+    assert!(bluetooth::probe(&bluetooth_runner).is_err());
+    assert_eq!(bluetooth_runner.seen.lock().unwrap().len(), 2);
+
+    let audio_runner = ScriptedRunner::new([command_output(
+        b"Audio\n Sinks:\n  * 42. Speakers\n  42. Duplicate\n",
+    )]);
+    assert!(audio::probe(&audio_runner).is_err());
+    assert_eq!(audio_runner.seen.lock().unwrap().len(), 1);
+
+    let player_rows = (0..257)
+        .map(|index| format!("org.mpris.MediaPlayer2.fixture{index}\n"))
+        .collect::<String>();
+    let media_runner = ScriptedRunner::new([command_output(player_rows.as_bytes())]);
+    assert!(media::probe(&media_runner).is_err());
+    assert_eq!(media_runner.seen.lock().unwrap().len(), 1);
+}
+
+#[test]
 fn rich_system_mutations_execute_then_require_complete_confirmed_readback() {
     let network_runner = ScriptedRunner::new([
         command_output(b""),
@@ -405,6 +538,8 @@ fn rich_system_mutations_execute_then_require_complete_confirmed_readback() {
     assert!(audio.streams[0].muted);
 
     let media_runner = ScriptedRunner::new([
+        command_output(b"org.mpris.MediaPlayer2.test\n"),
+        command_output(b"Test\tTitle\tArtist\tPlaying\t25\t100\n"),
         command_output(b""),
         command_output(b"org.mpris.MediaPlayer2.test\n"),
         command_output(b"Test\tTitle\tArtist\tPaused\t25\t100\n"),
@@ -418,6 +553,26 @@ fn rich_system_mutations_execute_then_require_complete_confirmed_readback() {
     )
     .unwrap();
     assert!(!media.players[0].playing);
+
+    let ignored_media_command = ScriptedRunner::new([
+        command_output(b"org.mpris.MediaPlayer2.test\n"),
+        command_output(b"Test\tTitle\tArtist\tPlaying\t25\t100\n"),
+        command_output(b""),
+        command_output(b"org.mpris.MediaPlayer2.test\n"),
+        command_output(b"Test\tTitle\tArtist\tPlaying\t25\t100\n"),
+    ]);
+    assert_eq!(
+        media::mutate(
+            &ignored_media_command,
+            &MediaCommand::Transport {
+                player_id: StableId("mpris:org.mpris.MediaPlayer2.test".into()),
+                transport: MediaTransport::PlayPause,
+            },
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::Other
+    );
 
     let power_runner = ScriptedRunner::new([
         command_output(b""),
@@ -482,34 +637,60 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
             output_id: StableId("output:DP-1".into()),
         },
         "/run/user/1000/sleepy/captures/capture.png",
+        "00000000-0000-4000-8000-000000000051",
     )
     .unwrap()
     .unwrap();
-    assert_eq!(screenshot.program, "grim");
+    assert_eq!(screenshot.program, "sleepy-capture-helper");
     assert_eq!(
         screenshot.args,
-        ["-o", "DP-1", "/run/user/1000/sleepy/captures/capture.png"]
+        [
+            "screenshot",
+            "--gesture-token",
+            "00000000-0000-4000-8000-000000000051",
+            "--output-id",
+            "DP-1",
+            "--output-path",
+            "/run/user/1000/sleepy/captures/capture.png"
+        ]
     );
-    let color = utilities::action_spec(&UtilityCommand::PickColor, "unused")
-        .unwrap()
-        .unwrap();
-    assert_eq!(color.program, "hyprpicker");
-    assert_eq!(color.args, ["--autocopy"]);
+    let color = utilities::action_spec(
+        &UtilityCommand::PickColor,
+        "unused",
+        "00000000-0000-4000-8000-000000000052",
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(color.program, "sleepy-capture-helper");
+    assert_eq!(
+        color.args,
+        [
+            "pick-color",
+            "--gesture-token",
+            "00000000-0000-4000-8000-000000000052",
+            "--result-fd",
+            "1"
+        ]
+    );
     let recording = utilities::action_spec(
         &UtilityCommand::StartRecording {
             output_id: StableId("output:eDP-1".into()),
         },
         "/run/user/1000/sleepy/captures/recording.mkv",
+        "00000000-0000-4000-8000-000000000053",
     )
     .unwrap()
     .unwrap();
-    assert_eq!(recording.program, "wf-recorder");
+    assert_eq!(recording.program, "sleepy-capture-helper");
     assert_eq!(
         recording.args,
         [
-            "--output",
+            "record",
+            "--gesture-token",
+            "00000000-0000-4000-8000-000000000053",
+            "--output-id",
             "eDP-1",
-            "--file",
+            "--output-path",
             "/run/user/1000/sleepy/captures/recording.mkv"
         ]
     );
@@ -527,9 +708,11 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
         UtilityCommand::StopRecording,
         UtilityCommand::SetGameMode { enabled: true },
     ] {
-        assert!(utilities::action_spec(&command, "unused")
-            .unwrap()
-            .is_none());
+        assert!(
+            utilities::action_spec(&command, "unused", "00000000-0000-4000-8000-000000000054")
+                .unwrap()
+                .is_none()
+        );
     }
 
     assert_eq!(
@@ -541,6 +724,20 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
         ("org.example.Item", "/StatusNotifierItem")
     );
     assert!(tray::split_registration("--invalid").is_err());
+}
+
+#[test]
+fn suspend_requires_a_confirmed_secure_lock_precondition() {
+    use sleepy_session::desktop::utilities::validate_session_precondition;
+
+    assert_eq!(
+        validate_session_precondition(DesktopSessionCommand::Suspend, false)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(validate_session_precondition(DesktopSessionCommand::Suspend, true).is_ok());
+    assert!(validate_session_precondition(DesktopSessionCommand::Reboot, false).is_ok());
 }
 
 #[tokio::test]
@@ -629,7 +826,8 @@ fn registry_domain_ids_are_exhaustive_and_stably_ordered() {
             DesktopDomainId::Audio,
             DesktopDomainId::Media,
             DesktopDomainId::Battery,
-            DesktopDomainId::Display,
+            DesktopDomainId::Brightness,
+            DesktopDomainId::NightLight,
             DesktopDomainId::Power,
             DesktopDomainId::Osd,
             DesktopDomainId::Lock,
@@ -645,6 +843,8 @@ fn registry_domain_ids_are_exhaustive_and_stably_ordered() {
             DesktopDomainId::Recording,
             DesktopDomainId::IdleInhibit,
             DesktopDomainId::GameMode,
+            DesktopDomainId::Screenshot,
+            DesktopDomainId::ColorPicker,
         ]
     );
 }
@@ -714,6 +914,72 @@ async fn initial_registry_preserves_every_terminal_status_without_a_placeholder(
     }
 }
 
+#[tokio::test]
+async fn malformed_initial_state_localizes_parse_to_its_declared_owner() {
+    let owner = DesktopDomainId::Network;
+    let malformed = Arc::new(StaticProducer {
+        domain: owner,
+        state: DesktopDomainState::terminal(
+            DesktopDomainId::Audio,
+            CapabilityAvailability::Unavailable,
+            "wrong owner",
+        )
+        .unwrap(),
+        delay: Duration::ZERO,
+    });
+    let registry = DesktopRegistry::new(complete_registry_with(Some((owner, malformed)))).unwrap();
+    let states = registry.initial_states().await;
+
+    assert_eq!(states[&owner].status(), CapabilityAvailability::Parse);
+    assert_eq!(
+        states[&DesktopDomainId::Audio].status(),
+        CapabilityAvailability::Unsupported
+    );
+}
+
+#[tokio::test]
+async fn invalid_initial_payload_is_localized_before_first_publication() {
+    let invalid = DesktopDomainState::available(
+        DesktopDomainId::Network,
+        DesktopDomainValue::Network(NetworkSnapshot {
+            wifi_enabled: true,
+            scanning: false,
+            access_points: vec![NetworkAccessPoint {
+                id: "wifi-ap:AA-BB-CC-DD-EE-FF".into(),
+                ssid: "Sleepy".into(),
+                signal_level: f64::NAN,
+                secured: true,
+            }],
+            connections: Vec::new(),
+        }),
+    )
+    .unwrap();
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Network,
+            producer(DesktopDomainId::Network, invalid),
+        ))))
+        .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let authority = DesktopStateAuthority::open(registry, temp.path().join("generation"), 8)
+        .await
+        .unwrap();
+    let initial = authority.initialize().await.unwrap();
+    validate_desktop_envelope(&serde_json::to_string(&initial).unwrap()).unwrap();
+    let DesktopEvent::FullSnapshot(snapshot) = &initial.payload else {
+        unreachable!()
+    };
+    assert_eq!(
+        snapshot.system.network.status,
+        CapabilityAvailability::Parse
+    );
+    assert_eq!(
+        snapshot.system.audio.status,
+        CapabilityAvailability::Unsupported
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_slow_initial_producer_becomes_timeout_at_the_shared_two_second_deadline() {
     let domain = DesktopDomainId::Network;
@@ -767,6 +1033,77 @@ async fn every_available_domain_assembles_one_sdk_valid_atomic_snapshot() {
     };
 
     validate_desktop_envelope(&serde_json::to_string(&envelope).unwrap()).unwrap();
+    let DesktopEvent::FullSnapshot(snapshot) = envelope.payload else {
+        unreachable!()
+    };
+    assert_eq!(
+        snapshot.system.brightness.status,
+        CapabilityAvailability::Available
+    );
+    assert_eq!(
+        snapshot.system.night_light.status,
+        CapabilityAvailability::Available
+    );
+    assert_eq!(
+        snapshot.utilities.screenshot.status,
+        CapabilityAvailability::Available
+    );
+    assert_eq!(
+        snapshot.utilities.color_picker.status,
+        CapabilityAvailability::Available
+    );
+    assert!(
+        !snapshot
+            .compositor
+            .hyprland
+            .data
+            .as_ref()
+            .unwrap()
+            .action_capabilities
+            .toggle_fullscreen
+    );
+    assert!(
+        !snapshot
+            .compositor
+            .hyprland
+            .data
+            .as_ref()
+            .unwrap()
+            .action_capabilities
+            .toggle_group
+    );
+}
+
+#[tokio::test]
+async fn utility_subproducer_terminal_state_does_not_mask_siblings() {
+    let registry = DesktopRegistry::new(complete_registry_with(Some((
+        DesktopDomainId::Screenshot,
+        producer(
+            DesktopDomainId::Screenshot,
+            DesktopDomainState::terminal(
+                DesktopDomainId::Screenshot,
+                CapabilityAvailability::PermissionDenied,
+                "capture.permission-denied",
+            )
+            .unwrap(),
+        ),
+    ))))
+    .unwrap();
+    let states = registry.initial_states().await;
+    let snapshot = registry.assemble(&states).unwrap();
+
+    assert_eq!(
+        snapshot.utilities.screenshot.status,
+        CapabilityAvailability::PermissionDenied
+    );
+    assert_eq!(
+        snapshot.utilities.color_picker.status,
+        CapabilityAvailability::Unsupported
+    );
+    assert_eq!(
+        snapshot.utilities.tray_items.status,
+        CapabilityAvailability::Unsupported
+    );
 }
 
 #[test]
@@ -828,6 +1165,117 @@ async fn desktop_authority_replays_one_full_snapshot_then_monotonic_domain_updat
     assert_eq!(replay.generation, update.generation);
     assert_eq!(replay.cause.kind, EventCauseKind::Replay);
     assert!(matches!(replay.payload, DesktopEvent::FullSnapshot(_)));
+}
+
+#[tokio::test]
+async fn concurrent_subscription_and_publication_never_duplicate_one_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let authority = DesktopStateAuthority::open(
+        available_registry(),
+        temp.path().join("desktop-generation"),
+        64,
+    )
+    .await
+    .unwrap();
+    authority.initialize().await.unwrap();
+
+    for index in 0..32 {
+        let subscriber_authority = Arc::clone(&authority);
+        let subscriber =
+            tokio::spawn(async move { subscriber_authority.subscribe().await.unwrap() });
+        let publish_authority = Arc::clone(&authority);
+        let publication = tokio::spawn(async move {
+            publish_authority
+                .publish_domain(
+                    DesktopDomainState::available(
+                        DesktopDomainId::GameMode,
+                        DesktopDomainValue::GameMode(index % 2 == 0),
+                    )
+                    .unwrap(),
+                    EventCause {
+                        kind: EventCauseKind::External,
+                        request_id: None,
+                    },
+                )
+                .await
+                .unwrap()
+        });
+        let mut subscriber = subscriber.await.unwrap();
+        let published = publication.await.unwrap();
+        let replay = subscriber.recv().await.unwrap();
+        assert!(replay.generation <= published.generation);
+        if replay.generation < published.generation {
+            assert_eq!(
+                subscriber.recv().await.unwrap().generation,
+                published.generation
+            );
+        } else {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(5), subscriber.recv())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn producer_runtime_reconnects_after_transient_failure_and_cancels_backoff() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reconnecting: Arc<dyn DesktopProducer> = Arc::new(ReconnectingProducer {
+        domain: DesktopDomainId::Network,
+        calls: Arc::clone(&calls),
+    });
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Network,
+            reconnecting,
+        ))))
+        .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let authority =
+        DesktopStateAuthority::open(Arc::clone(&registry), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let runtime = registry.start(authority, 16).unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+    runtime.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test]
+async fn producer_runtime_gathers_remaining_workers_after_one_panics() {
+    let drained = Arc::new(AtomicUsize::new(0));
+    let mut producers = complete_registry_with(Some((
+        DesktopDomainId::Network,
+        Arc::new(PanickingProducer {
+            domain: DesktopDomainId::Network,
+        }),
+    )));
+    *producers
+        .iter_mut()
+        .find(|producer| producer.domain() == DesktopDomainId::Bluetooth)
+        .unwrap() = Arc::new(DrainTrackingProducer {
+        domain: DesktopDomainId::Bluetooth,
+        drained: Arc::clone(&drained),
+    });
+    let registry = Arc::new(DesktopRegistry::new(producers).unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let authority =
+        DesktopStateAuthority::open(Arc::clone(&registry), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let runtime = registry.start(authority, 16).unwrap();
+    tokio::task::yield_now().await;
+
+    assert!(runtime.shutdown(Duration::from_secs(1)).await.is_err());
+    assert_eq!(drained.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -949,18 +1397,71 @@ struct FakeMutationExecutor {
     calls: AtomicUsize,
 }
 
+struct AcknowledgingMutationExecutor;
+
+struct TerminalMutationExecutor;
+
+struct InvalidConfirmedMutationExecutor;
+
+#[async_trait]
+impl DesktopMutationExecutor for AcknowledgingMutationExecutor {
+    async fn execute(
+        &self,
+        _request: &DesktopRequest,
+    ) -> Result<DesktopMutationOutcome, ProducerError> {
+        Ok(DesktopMutationOutcome::Acknowledged)
+    }
+}
+
+#[async_trait]
+impl DesktopMutationExecutor for TerminalMutationExecutor {
+    async fn execute(
+        &self,
+        _request: &DesktopRequest,
+    ) -> Result<DesktopMutationOutcome, ProducerError> {
+        Ok(DesktopMutationOutcome::TerminalFailure {
+            readbacks: vec![DesktopDomainState::terminal(
+                DesktopDomainId::Lock,
+                CapabilityAvailability::Error,
+                "/private/backend/path leaked internally",
+            )
+            .unwrap()],
+            diagnostic_code: "/private/backend/result detail".into(),
+        })
+    }
+}
+
+#[async_trait]
+impl DesktopMutationExecutor for InvalidConfirmedMutationExecutor {
+    async fn execute(
+        &self,
+        _request: &DesktopRequest,
+    ) -> Result<DesktopMutationOutcome, ProducerError> {
+        Ok(DesktopMutationOutcome::Confirmed(vec![
+            DesktopDomainState::terminal(
+                DesktopDomainId::Lock,
+                CapabilityAvailability::Error,
+                "fixture backend degraded",
+            )
+            .unwrap(),
+        ]))
+    }
+}
+
 #[async_trait]
 impl DesktopMutationExecutor for FakeMutationExecutor {
     async fn execute(
         &self,
         _request: &DesktopRequest,
-    ) -> Result<Vec<DesktopDomainState>, ProducerError> {
+    ) -> Result<DesktopMutationOutcome, ProducerError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(vec![DesktopDomainState::available(
-            DesktopDomainId::Lock,
-            DesktopDomainValue::Lock(LockState { secure: true }),
-        )
-        .unwrap()])
+        Ok(DesktopMutationOutcome::Confirmed(vec![
+            DesktopDomainState::available(
+                DesktopDomainId::Lock,
+                DesktopDomainValue::Lock(LockState { secure: true }),
+            )
+            .unwrap(),
+        ]))
     }
 }
 
@@ -1061,6 +1562,109 @@ async fn successful_control_publishes_confirmed_readback_before_correlated_resul
     );
     assert!(matches!(outcome.payload, DesktopEvent::CommandResult(ref value) if *value == result));
     validate_desktop_envelope(&serde_json::to_string(&outcome).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn acknowledged_logind_transition_does_not_overwrite_power_domain() {
+    let temp = tempfile::tempdir().unwrap();
+    let state =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 8)
+            .await
+            .unwrap();
+    state.initialize().await.unwrap();
+    let control = DesktopControlAuthority::open(
+        Arc::clone(&state),
+        Arc::new(AcknowledgingMutationExecutor),
+        temp.path().join("dedupe.json"),
+        8,
+    )
+    .await
+    .unwrap();
+    let mut events = state.subscribe().await.unwrap();
+    events.recv().await.unwrap();
+    let request = DesktopRequest {
+        schema_version: DESKTOP_WIRE_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000061".into(),
+        expected_generation: state.current_generation(),
+        command: DesktopCommand::Session(DesktopSessionCommand::Reboot),
+    };
+    let result = control
+        .handle_json(&serde_json::to_string(&request).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result.status, DesktopResultStatus::Succeeded);
+    assert!(matches!(
+        events.recv().await.unwrap().payload,
+        DesktopEvent::CommandResult(_)
+    ));
+}
+
+#[tokio::test]
+async fn terminal_readback_never_succeeds_and_public_diagnostics_are_redacted_codes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 8)
+            .await
+            .unwrap();
+    state.initialize().await.unwrap();
+    let control = DesktopControlAuthority::open(
+        Arc::clone(&state),
+        Arc::new(TerminalMutationExecutor),
+        temp.path().join("dedupe.json"),
+        8,
+    )
+    .await
+    .unwrap();
+    let mut events = state.subscribe().await.unwrap();
+    events.recv().await.unwrap();
+    let request = lock_request(
+        state.current_generation(),
+        "00000000-0000-4000-8000-000000000062",
+    );
+    let result = control
+        .handle_json(&serde_json::to_string(&request).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result.status, DesktopResultStatus::Failed);
+    assert_eq!(
+        result.diagnostic.unwrap().message,
+        "mutation.terminal-failure"
+    );
+    let update = events.recv().await.unwrap();
+    let encoded = serde_json::to_string(&update).unwrap();
+    assert!(encoded.contains("producer.failed"));
+    assert!(!encoded.contains("/private/"));
+}
+
+#[tokio::test]
+async fn invalid_confirmed_terminal_readback_is_failed_and_durably_completed() {
+    let temp = tempfile::tempdir().unwrap();
+    let state =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 8)
+            .await
+            .unwrap();
+    state.initialize().await.unwrap();
+    let control = DesktopControlAuthority::open(
+        Arc::clone(&state),
+        Arc::new(InvalidConfirmedMutationExecutor),
+        temp.path().join("dedupe.json"),
+        8,
+    )
+    .await
+    .unwrap();
+    let request = lock_request(
+        state.current_generation(),
+        "00000000-0000-4000-8000-000000000063",
+    );
+    let encoded = serde_json::to_string(&request).unwrap();
+
+    let first = control.handle_json(&encoded).await.unwrap();
+    assert_eq!(first.status, DesktopResultStatus::Failed);
+    assert_eq!(
+        first.diagnostic.as_ref().unwrap().message,
+        "mutation.readback-terminal"
+    );
+    assert_eq!(control.handle_json(&encoded).await.unwrap(), first);
 }
 
 #[tokio::test]

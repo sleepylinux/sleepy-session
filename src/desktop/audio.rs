@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{collections::BTreeMap, io, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    time::Duration,
+};
 
 use sleepy_sdk::{
     AudioCommand, AudioNode, AudioNodeKind, AudioSnapshot, AudioStream, StableId, SystemMutation,
@@ -10,6 +14,7 @@ use crate::system::{CommandRunner, CommandSpec};
 
 const NODE_PREFIX: &str = "audio-node:";
 const STREAM_PREFIX: &str = "audio-stream:";
+const MAX_PROBED_AUDIO_OBJECTS: usize = 128;
 
 pub fn mutation_spec(command: &AudioCommand) -> io::Result<CommandSpec> {
     let args = match command {
@@ -300,6 +305,7 @@ fn parse_rows(status: &[u8]) -> io::Result<Vec<Row>> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "wpctl output is not UTF-8"))?;
     let mut section = None;
     let mut rows = Vec::new();
+    let mut identifiers = BTreeSet::new();
     for line in text.lines() {
         let trimmed = line.trim_start_matches([' ', '│', '├', '└', '─']);
         section = match trimmed {
@@ -318,7 +324,13 @@ fn parse_rows(status: &[u8]) -> io::Result<Vec<Row>> {
         let Some((id, remainder)) = row.split_once('.') else {
             continue;
         };
-        numeric(id.trim())?;
+        let id = numeric(id.trim())?;
+        if !identifiers.insert(id.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate audio identifier",
+            ));
+        }
         let name = remainder
             .split(" [")
             .next()
@@ -331,12 +343,24 @@ fn parse_rows(status: &[u8]) -> io::Result<Vec<Row>> {
                 "audio row name is empty",
             ));
         }
+        if name.len() > 512 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "audio row name exceeds its bound",
+            ));
+        }
         rows.push(Row {
-            id: id.trim().to_owned(),
+            id,
             name,
             kind,
             is_default,
         });
+        if rows.len() > MAX_PROBED_AUDIO_OBJECTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "audio identifier probe exceeds its call budget",
+            ));
+        }
     }
     if !rows.iter().any(|row| row.kind == RowKind::Output) {
         return Err(io::Error::new(

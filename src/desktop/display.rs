@@ -6,7 +6,7 @@ use std::{
 };
 
 use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
-use sleepy_sdk::{DisplayCommand, DisplaySnapshot};
+use sleepy_sdk::{BrightnessSnapshot, NightLightSnapshot};
 
 use crate::system::{CommandRunner, CommandSpec};
 
@@ -29,41 +29,67 @@ pub fn brightness_spec(level: f64) -> io::Result<CommandSpec> {
     Ok(spec)
 }
 
-pub fn probe<R: CommandRunner>(runner: &R) -> io::Result<DisplaySnapshot> {
+pub fn brightness_spec_for_output(output_id: &str, level: f64) -> io::Result<CommandSpec> {
+    output_name(output_id)?;
+    brightness_spec(level)?;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "brightness.output-target-unmapped",
+    ))
+}
+
+pub fn output_name(output_id: &str) -> io::Result<&str> {
+    let value = output_id.strip_prefix("output:").unwrap_or(output_id);
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "brightness output ID is invalid",
+        ));
+    }
+    Ok(value)
+}
+
+pub fn probe_brightness<R: CommandRunner>(runner: &R) -> io::Result<BrightnessSnapshot> {
     let output = super::network::run(
         runner,
         CommandSpec::new("brightnessctl", ["--machine-readable", "info"]),
     )?;
-    let brightness = parse_brightness(&output)?;
-    let night_light_enabled = night_light_state()?;
-    Ok(DisplaySnapshot {
-        brightness: Some(brightness),
-        night_light_enabled,
+    Ok(BrightnessSnapshot {
+        level: parse_brightness(&output)?,
     })
 }
 
-pub fn mutate<R: CommandRunner>(
+pub fn probe_night_light() -> io::Result<NightLightSnapshot> {
+    Ok(NightLightSnapshot {
+        enabled: night_light_state()?,
+    })
+}
+
+pub fn mutate_brightness<R: CommandRunner>(
     runner: &R,
-    command: &DisplayCommand,
-) -> io::Result<DisplaySnapshot> {
-    match command {
-        DisplayCommand::SetBrightness { level, .. } => {
-            super::network::run(runner, brightness_spec(*level)?)?;
-        }
-        DisplayCommand::SetNightLightEnabled { enabled } => set_night_light(*enabled)?,
-    }
-    let snapshot = probe(runner)?;
-    let confirmed = match command {
-        DisplayCommand::SetBrightness { level, .. } => snapshot
-            .brightness
-            .is_some_and(|readback| (readback - level).abs() <= 0.005),
-        DisplayCommand::SetNightLightEnabled { enabled } => {
-            snapshot.night_light_enabled == *enabled
-        }
-    };
-    if !confirmed {
+    level: f64,
+) -> io::Result<BrightnessSnapshot> {
+    super::network::run(runner, brightness_spec(level)?)?;
+    let snapshot = probe_brightness(runner)?;
+    if (snapshot.level - level).abs() > 0.005 {
         return Err(io::Error::other(
-            "display readback did not confirm the requested state",
+            "brightness readback did not confirm the requested state",
+        ));
+    }
+    Ok(snapshot)
+}
+
+pub fn mutate_night_light(enabled: bool) -> io::Result<NightLightSnapshot> {
+    set_night_light(enabled)?;
+    let snapshot = probe_night_light()?;
+    if snapshot.enabled != enabled {
+        return Err(io::Error::other(
+            "night-light readback did not confirm the requested state",
         ));
     }
     Ok(snapshot)

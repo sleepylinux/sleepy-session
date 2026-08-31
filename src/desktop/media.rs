@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{collections::BTreeMap, io, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    time::Duration,
+};
 
 use sleepy_sdk::{MediaCommand, MediaPlayer, MediaSnapshot, MediaTransport};
 
 use crate::system::{CommandRunner, CommandSpec};
 
 const PLAYER_PREFIX: &str = "mpris:";
+const MAX_PROBED_PLAYERS: usize = 64;
 
 pub fn mutation_spec(command: &MediaCommand) -> io::Result<CommandSpec> {
     let MediaCommand::Transport {
@@ -51,16 +56,34 @@ pub fn probe<R: CommandRunner>(runner: &R) -> io::Result<MediaSnapshot> {
 }
 
 pub fn mutate<R: CommandRunner>(runner: &R, command: &MediaCommand) -> io::Result<MediaSnapshot> {
-    super::network::run(runner, mutation_spec(command)?)?;
-    let snapshot = probe(runner)?;
-    let MediaCommand::Transport { player_id, .. } = command;
-    if !snapshot
+    let before = probe(runner)?;
+    let MediaCommand::Transport {
+        player_id,
+        transport,
+    } = command;
+    let before_player = before
         .players
         .iter()
-        .any(|player| player.id == player_id.as_str())
-    {
+        .find(|player| player.id == player_id.as_str())
+        .ok_or_else(|| io::Error::other("MPRIS pre-state omitted the targeted player"))?;
+    super::network::run(runner, mutation_spec(command)?)?;
+    let snapshot = probe(runner)?;
+    let after_player = snapshot
+        .players
+        .iter()
+        .find(|player| player.id == player_id.as_str())
+        .ok_or_else(|| io::Error::other("MPRIS readback omitted the targeted player"))?;
+    let confirmed = match transport {
+        MediaTransport::PlayPause => before_player.playing != after_player.playing,
+        MediaTransport::Next | MediaTransport::Previous => {
+            before_player.title != after_player.title
+                || before_player.artist != after_player.artist
+                || (before_player.progress - after_player.progress).abs() > f64::EPSILON
+        }
+    };
+    if !confirmed {
         return Err(io::Error::other(
-            "MPRIS readback omitted the targeted player",
+            "MPRIS readback did not confirm the requested transport",
         ));
     }
     Ok(snapshot)
@@ -105,6 +128,9 @@ pub fn parse_snapshot(
         let fields = text.splitn(6, '\t').collect::<Vec<_>>();
         if fields.len() != 6 || fields[0].trim().is_empty() {
             return invalid("MPRIS metadata row is malformed");
+        }
+        if fields[0].len() > 256 || fields[1].len() > 4_096 || fields[2].len() > 2_048 {
+            return invalid("MPRIS metadata text exceeds its bound");
         }
         let playing = match fields[3] {
             "Playing" => true,
@@ -154,12 +180,16 @@ fn player_names(bytes: &[u8]) -> io::Result<Vec<String>> {
         io::Error::new(io::ErrorKind::InvalidData, "MPRIS player list is not UTF-8")
     })?;
     let mut names = Vec::new();
+    let mut identifiers = BTreeSet::new();
     for name in text.lines().filter(|line| !line.is_empty()) {
         player_id(name)?;
-        if names.iter().any(|existing| existing == name) {
+        if !identifiers.insert(name) {
             return invalid("duplicate MPRIS player name");
         }
         names.push(name.to_owned());
+        if names.len() > MAX_PROBED_PLAYERS {
+            return invalid("MPRIS player probe exceeds its call budget");
+        }
     }
     Ok(names)
 }

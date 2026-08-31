@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{collections::BTreeMap, io, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    time::Duration,
+};
 
 use sleepy_sdk::{BluetoothCommand, BluetoothDevice, BluetoothSnapshot, StableId};
 
 use crate::system::{CommandRunner, CommandSpec};
 
 const DEVICE_PREFIX: &str = "bluetooth:";
+const MAX_PROBED_DEVICES: usize = 64;
 
 pub fn mutation_spec(command: &BluetoothCommand) -> io::Result<CommandSpec> {
     let args = match command {
@@ -89,14 +94,13 @@ pub fn parse_snapshot(
         let info = text(info)?;
         let name = property(info, "Name")
             .filter(|value| !value.is_empty())
-            .unwrap_or(fallback_name.as_str())
-            .to_owned();
-        if name.is_empty() {
-            return invalid("Bluetooth device name is empty");
+            .unwrap_or(fallback_name.as_str());
+        if name.is_empty() || name.len() > 512 {
+            return invalid("Bluetooth device name is empty or exceeds its bound");
         }
         parsed.push(BluetoothDevice {
             id: device_id(&mac)?,
-            name,
+            name: name.to_owned(),
             paired: yes_no(required_property(info, "Paired")?)?,
             connected: yes_no(required_property(info, "Connected")?)?,
         });
@@ -130,6 +134,7 @@ fn on_off(value: bool) -> &'static str {
 
 fn parse_device_rows(bytes: &[u8]) -> io::Result<Vec<(String, String)>> {
     let mut rows = Vec::new();
+    let mut identifiers = BTreeSet::new();
     for line in text(bytes)?.lines().filter(|line| !line.trim().is_empty()) {
         let mut fields = line.splitn(3, ' ');
         if fields.next() != Some("Device") {
@@ -139,8 +144,17 @@ fn parse_device_rows(bytes: &[u8]) -> io::Result<Vec<(String, String)>> {
             .next()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Bluetooth MAC omitted"))?;
         let name = fields.next().unwrap_or_default().trim();
-        super::network::canonical_mac(mac)?;
+        let mac = super::network::canonical_mac(mac)?;
+        if !identifiers.insert(mac.clone()) {
+            return invalid("duplicate Bluetooth device identifier");
+        }
+        if name.len() > 512 {
+            return invalid("Bluetooth device name exceeds its bound");
+        }
         rows.push((mac.to_owned(), name.to_owned()));
+        if rows.len() > MAX_PROBED_DEVICES {
+            return invalid("Bluetooth device probe exceeds its call budget");
+        }
     }
     Ok(rows)
 }

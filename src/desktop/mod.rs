@@ -3,30 +3,28 @@ use std::{
     ffi::OsString,
     fmt, io,
     path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex as StdMutex,
-    },
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant as StdInstant},
 };
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sleepy_sdk::{
     validate_desktop_envelope, validate_desktop_request, validate_desktop_result, AudioSnapshot,
-    BatterySnapshot, BluetoothSnapshot, CacheStatus, CalendarSnapshot, CapabilityAvailability,
-    CapabilityFailure, ClipboardEntry, DesktopAppearanceSnapshot, DesktopCalendarSnapshot,
-    DesktopCapability, DesktopCompositorSnapshot, DesktopCompositorUpdate,
+    BatterySnapshot, BluetoothSnapshot, BrightnessSnapshot, CacheStatus, CalendarSnapshot,
+    CapabilityAvailability, CapabilityFailure, ClipboardEntry, DesktopAppearanceSnapshot,
+    DesktopCalendarSnapshot, DesktopCapability, DesktopCompositorSnapshot, DesktopCompositorUpdate,
     DesktopDomainUpdate as SdkDomainUpdate, DesktopEnvelope, DesktopEvent, DesktopLauncherSnapshot,
     DesktopNotificationSnapshot, DesktopOsdSnapshot, DesktopPowerSnapshot, DesktopRequest,
     DesktopResourceSnapshot, DesktopResult, DesktopResultStatus, DesktopSnapshot,
-    DesktopSystemSnapshot, DesktopSystemUpdate, DesktopUtilitySnapshot, DesktopWeatherSnapshot,
-    DisplaySnapshot, EventCause, EventCauseKind, HyprlandSnapshot, LauncherEntry, LockState,
-    MediaSnapshot, NetworkSnapshot, PowerProfile, ProducerAvailability, ProviderStatus,
-    RecordingState, RecordingStatus, ResourceSample, ThemeDocument, TrayItem, WeatherLocation,
-    WeatherSnapshot, DESKTOP_WIRE_VERSION, WIRE_SCHEMA_VERSION,
+    DesktopSystemSnapshot, DesktopSystemUpdate, DesktopUtilitySnapshot, DesktopUtilityUpdate,
+    DesktopWeatherSnapshot, EventCause, EventCauseKind, HyprlandActionCapabilities,
+    HyprlandSnapshot, LauncherEntry, LockState, MediaSnapshot, NetworkSnapshot, NightLightSnapshot,
+    PowerProfile, ProducerAvailability, ProviderStatus, RecordingState, RecordingStatus,
+    ResourceSample, ThemeDocument, TrayItem, WeatherLocation, WeatherSnapshot,
+    DESKTOP_WIRE_VERSION, WIRE_SCHEMA_VERSION,
 };
-use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 use tokio::{io::BufReader, net::UnixStream};
 use tokio_util::sync::CancellationToken;
 
@@ -47,6 +45,10 @@ pub mod tray;
 pub mod utilities;
 
 const INITIAL_DEADLINE: Duration = Duration::from_secs(2);
+const INITIAL_PROBE_BUDGET: Duration = Duration::from_millis(1_500);
+const MAX_DESKTOP_FRAME_BYTES: usize = 896 * 1024;
+const MAX_DESKTOP_SERIALIZED_ITEMS: usize = 20_000;
+const MAX_DESKTOP_STRING_BYTES: usize = 768 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DesktopDomainId {
@@ -55,7 +57,8 @@ pub enum DesktopDomainId {
     Audio,
     Media,
     Battery,
-    Display,
+    Brightness,
+    NightLight,
     Power,
     Osd,
     Lock,
@@ -71,16 +74,19 @@ pub enum DesktopDomainId {
     Recording,
     IdleInhibit,
     GameMode,
+    Screenshot,
+    ColorPicker,
 }
 
 impl DesktopDomainId {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 24] = [
         Self::Network,
         Self::Bluetooth,
         Self::Audio,
         Self::Media,
         Self::Battery,
-        Self::Display,
+        Self::Brightness,
+        Self::NightLight,
         Self::Power,
         Self::Osd,
         Self::Lock,
@@ -96,6 +102,8 @@ impl DesktopDomainId {
         Self::Recording,
         Self::IdleInhibit,
         Self::GameMode,
+        Self::Screenshot,
+        Self::ColorPicker,
     ];
 }
 
@@ -106,7 +114,8 @@ pub enum DesktopDomainValue {
     Audio(AudioSnapshot),
     Media(MediaSnapshot),
     Battery(BatterySnapshot),
-    Display(DisplaySnapshot),
+    Brightness(BrightnessSnapshot),
+    NightLight(NightLightSnapshot),
     Power(DesktopPowerSnapshot),
     Osd(DesktopOsdSnapshot),
     Lock(LockState),
@@ -125,6 +134,8 @@ pub enum DesktopDomainValue {
     Recording(RecordingState),
     IdleInhibit(bool),
     GameMode(bool),
+    Screenshot,
+    ColorPicker,
 }
 
 impl DesktopDomainValue {
@@ -135,7 +146,8 @@ impl DesktopDomainValue {
             Self::Audio(_) => DesktopDomainId::Audio,
             Self::Media(_) => DesktopDomainId::Media,
             Self::Battery(_) => DesktopDomainId::Battery,
-            Self::Display(_) => DesktopDomainId::Display,
+            Self::Brightness(_) => DesktopDomainId::Brightness,
+            Self::NightLight(_) => DesktopDomainId::NightLight,
             Self::Power(_) => DesktopDomainId::Power,
             Self::Osd(_) => DesktopDomainId::Osd,
             Self::Lock(_) => DesktopDomainId::Lock,
@@ -151,6 +163,8 @@ impl DesktopDomainValue {
             Self::Recording(_) => DesktopDomainId::Recording,
             Self::IdleInhibit(_) => DesktopDomainId::IdleInhibit,
             Self::GameMode(_) => DesktopDomainId::GameMode,
+            Self::Screenshot => DesktopDomainId::Screenshot,
+            Self::ColorPicker => DesktopDomainId::ColorPicker,
         }
     }
 
@@ -179,10 +193,8 @@ impl DesktopDomainValue {
                 charging: false,
                 seconds_remaining: None,
             }),
-            DesktopDomainId::Display => Self::Display(DisplaySnapshot {
-                brightness: None,
-                night_light_enabled: false,
-            }),
+            DesktopDomainId::Brightness => Self::Brightness(BrightnessSnapshot { level: 0.0 }),
+            DesktopDomainId::NightLight => Self::NightLight(NightLightSnapshot { enabled: false }),
             DesktopDomainId::Power => Self::Power(DesktopPowerSnapshot {
                 active_profile: PowerProfile::Balanced,
                 available_profiles: vec![PowerProfile::Balanced],
@@ -193,6 +205,7 @@ impl DesktopDomainValue {
             }),
             DesktopDomainId::Lock => Self::Lock(LockState { secure: false }),
             DesktopDomainId::Hyprland => Self::Hyprland(HyprlandSnapshot {
+                action_capabilities: hyprland_action_capabilities(),
                 monitors: Vec::new(),
                 workspaces: Vec::new(),
                 windows: Vec::new(),
@@ -220,6 +233,8 @@ impl DesktopDomainValue {
             }),
             DesktopDomainId::IdleInhibit => Self::IdleInhibit(false),
             DesktopDomainId::GameMode => Self::GameMode(false),
+            DesktopDomainId::Screenshot => Self::Screenshot,
+            DesktopDomainId::ColorPicker => Self::ColorPicker,
         }
     }
 }
@@ -340,12 +355,16 @@ pub struct DesktopProducerRuntime {
 
 pub struct DesktopStateAuthority {
     registry: Arc<DesktopRegistry>,
-    states: Mutex<Option<BTreeMap<DesktopDomainId, DesktopDomainState>>>,
-    generations: Arc<StdMutex<crate::sessiond::GenerationAllocator>>,
-    current_generation: AtomicU64,
-    latest_snapshot: RwLock<Option<DesktopEnvelope>>,
+    transaction: Arc<StdMutex<DesktopAuthorityTransaction>>,
     initialized: Notify,
     events: broadcast::Sender<DesktopEnvelope>,
+}
+
+struct DesktopAuthorityTransaction {
+    states: Option<BTreeMap<DesktopDomainId, DesktopDomainState>>,
+    generations: crate::sessiond::GenerationAllocator,
+    current_generation: u64,
+    latest_snapshot: Option<DesktopEnvelope>,
 }
 
 pub struct DesktopSubscriber {
@@ -358,7 +377,17 @@ pub trait DesktopMutationExecutor: Send + Sync + 'static {
     async fn execute(
         &self,
         request: &DesktopRequest,
-    ) -> Result<Vec<DesktopDomainState>, ProducerError>;
+    ) -> Result<DesktopMutationOutcome, ProducerError>;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DesktopMutationOutcome {
+    Confirmed(Vec<DesktopDomainState>),
+    Acknowledged,
+    TerminalFailure {
+        readbacks: Vec<DesktopDomainState>,
+        diagnostic_code: String,
+    },
 }
 
 pub struct DesktopControlAuthority<E: DesktopMutationExecutor> {
@@ -368,14 +397,14 @@ pub struct DesktopControlAuthority<E: DesktopMutationExecutor> {
     serial: Mutex<()>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DedupeDocument {
     schema_version: u32,
     records: VecDeque<DedupeRecord>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DedupeRecord {
     request_id: String,
@@ -388,6 +417,14 @@ struct DurableDedupe {
     name: OsString,
     maximum_records: usize,
     document: DedupeDocument,
+    fault: Option<DedupeFaultPoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupeFaultPoint {
+    FileSync,
+    Rename,
+    DirectorySync,
 }
 
 impl DesktopSubscriber {
@@ -443,11 +480,15 @@ impl<E: DesktopMutationExecutor> DesktopControlAuthority<E> {
             return Ok(result);
         }
 
-        if request.expected_generation != self.state.current_generation() {
+        let (generation_matches, current_generation) = self
+            .state
+            .checked_generation(request.expected_generation)
+            .await?;
+        if !generation_matches {
             let result = failed_result(
                 &request.request_id,
-                self.state.current_generation(),
-                "stale desktop generation",
+                current_generation,
+                "request.generation-stale",
             )?;
             self.complete(request.request_id, result.clone()).await?;
             return Ok(result);
@@ -460,22 +501,49 @@ impl<E: DesktopMutationExecutor> DesktopControlAuthority<E> {
         };
         let execution = self.executor.execute(&request).await;
         let (status, diagnostic) = match execution {
-            Ok(readbacks) if !readbacks.is_empty() => {
+            Ok(DesktopMutationOutcome::Confirmed(readbacks)) if !readbacks.is_empty() => {
+                let terminal = readbacks
+                    .iter()
+                    .any(|readback| readback.status() != CapabilityAvailability::Available);
                 for readback in readbacks {
                     self.state.publish_domain(readback, cause.clone()).await?;
                 }
-                (DesktopResultStatus::Succeeded, None)
+                if terminal {
+                    (
+                        DesktopResultStatus::Failed,
+                        Some(CapabilityFailure {
+                            message: "mutation.readback-terminal".into(),
+                        }),
+                    )
+                } else {
+                    (DesktopResultStatus::Succeeded, None)
+                }
             }
-            Ok(_) => (
+            Ok(DesktopMutationOutcome::Confirmed(_)) => (
                 DesktopResultStatus::Failed,
                 Some(CapabilityFailure {
-                    message: "mutation completed without confirmed readback".into(),
+                    message: "mutation.readback-missing".into(),
                 }),
             ),
-            Err(error) => (
+            Ok(DesktopMutationOutcome::Acknowledged) => (DesktopResultStatus::Succeeded, None),
+            Ok(DesktopMutationOutcome::TerminalFailure {
+                readbacks,
+                diagnostic_code,
+            }) => {
+                for readback in readbacks {
+                    self.state.publish_domain(readback, cause.clone()).await?;
+                }
+                (
+                    DesktopResultStatus::Failed,
+                    Some(CapabilityFailure {
+                        message: public_mutation_diagnostic(&diagnostic_code).into(),
+                    }),
+                )
+            }
+            Err(_error) => (
                 DesktopResultStatus::Failed,
                 Some(CapabilityFailure {
-                    message: bounded_diagnostic(error.to_string()),
+                    message: "mutation.backend-failed".into(),
                 }),
             ),
         };
@@ -553,48 +621,83 @@ impl DesktopStateAuthority {
         let (events, _) = broadcast::channel(event_capacity);
         Ok(Arc::new(Self {
             registry,
-            states: Mutex::new(None),
-            generations: Arc::new(StdMutex::new(generations)),
-            current_generation: AtomicU64::new(0),
-            latest_snapshot: RwLock::new(None),
+            transaction: Arc::new(StdMutex::new(DesktopAuthorityTransaction {
+                states: None,
+                generations,
+                current_generation: 0,
+                latest_snapshot: None,
+            })),
             initialized: Notify::new(),
             events,
         }))
     }
 
     pub async fn initialize(&self) -> io::Result<DesktopEnvelope> {
-        let mut states_guard = self.states.lock().await;
-        if let Some(existing) = self.latest_snapshot.read().await.clone() {
-            return Ok(existing);
-        }
-        let states = self.registry.initial_states().await;
-        let snapshot = self.registry.assemble(&states)?;
-        let generation = self.allocate_generation().await?;
-        let event = validated_envelope(
-            generation,
-            EventCause {
-                kind: EventCauseKind::Replay,
-                request_id: None,
-            },
-            DesktopEvent::FullSnapshot(Box::new(snapshot)),
-        )?;
-        *states_guard = Some(states);
-        *self.latest_snapshot.write().await = Some(event.clone());
-        self.current_generation.store(generation, Ordering::Release);
+        let deadline = StdInstant::now() + INITIAL_DEADLINE;
+        let probe_deadline = tokio::time::Instant::now() + INITIAL_PROBE_BUDGET;
+        let states = self
+            .registry
+            .initial_states_until(probe_deadline, probe_deadline + Duration::from_millis(250))
+            .await;
+        let transaction = Arc::clone(&self.transaction);
+        let registry = Arc::clone(&self.registry);
+        let event = tokio::task::spawn_blocking(move || -> io::Result<DesktopEnvelope> {
+            ensure_initial_deadline(deadline)?;
+            let mut transaction = transaction
+                .lock()
+                .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?;
+            if let Some(existing) = transaction.latest_snapshot.clone() {
+                return Ok(existing);
+            }
+            let states = registry.localize_contract_failures(states)?;
+            ensure_initial_deadline(deadline)?;
+            let snapshot = registry.assemble(&states)?;
+            ensure_initial_deadline(deadline)?;
+            let generation = transaction.generations.next_generation()?;
+            ensure_initial_deadline(deadline)?;
+            let event = validated_envelope(
+                generation,
+                EventCause {
+                    kind: EventCauseKind::Replay,
+                    request_id: None,
+                },
+                DesktopEvent::FullSnapshot(Box::new(snapshot)),
+            )?;
+            ensure_initial_deadline(deadline)?;
+            transaction.states = Some(states);
+            transaction.current_generation = generation;
+            transaction.latest_snapshot = Some(event.clone());
+            Ok(event)
+        })
+        .await
+        .map_err(join_error)??;
         self.initialized.notify_waiters();
         Ok(event)
     }
 
     pub async fn subscribe(&self) -> io::Result<DesktopSubscriber> {
         loop {
-            let events = self.events.subscribe();
-            if let Some(snapshot) = self.latest_snapshot.read().await.clone() {
-                return Ok(DesktopSubscriber {
-                    replay: VecDeque::from([snapshot]),
-                    events,
-                });
+            let notified = self.initialized.notified();
+            let transaction = Arc::clone(&self.transaction);
+            let event_sender = self.events.clone();
+            if let Some(subscriber) = tokio::task::spawn_blocking(move || {
+                let transaction = transaction
+                    .lock()
+                    .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?;
+                let events = event_sender.subscribe();
+                Ok::<_, io::Error>(transaction.latest_snapshot.clone().map(|snapshot| {
+                    DesktopSubscriber {
+                        replay: VecDeque::from([snapshot]),
+                        events,
+                    }
+                }))
+            })
+            .await
+            .map_err(join_error)??
+            {
+                return Ok(subscriber);
             }
-            self.initialized.notified().await;
+            notified.await;
         }
     }
 
@@ -603,47 +706,58 @@ impl DesktopStateAuthority {
         update: DesktopDomainState,
         cause: EventCause,
     ) -> io::Result<DesktopEnvelope> {
-        let mut states_guard = self.states.lock().await;
-        let states = states_guard.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "desktop authority has not initialized",
-            )
-        })?;
-        let domain = update.domain();
-        states.insert(domain, update);
-        let snapshot = match self.registry.assemble(states) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                states.insert(
-                    domain,
-                    DesktopDomainState::terminal(
+        let transaction = Arc::clone(&self.transaction);
+        let registry = Arc::clone(&self.registry);
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut transaction = transaction
+                .lock()
+                .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?;
+            let current = transaction.states.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "desktop authority has not initialized",
+                )
+            })?;
+            let domain = update.domain();
+            let mut staged = current.clone();
+            staged.insert(domain, update);
+            let snapshot = match registry.assemble(&staged) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    staged.insert(
                         domain,
-                        CapabilityAvailability::Parse,
-                        "producer update violated the desktop wire contract",
-                    )?,
-                );
-                self.registry.assemble(states)?
-            }
-        };
-        let generation = self.allocate_generation().await?;
-        let incremental = validated_envelope(
-            generation,
-            cause,
-            DesktopEvent::DomainUpdate(domain_update(domain, &snapshot)),
-        )?;
-        let replay = validated_envelope(
-            generation,
-            EventCause {
-                kind: EventCauseKind::Replay,
-                request_id: None,
-            },
-            DesktopEvent::FullSnapshot(Box::new(snapshot)),
-        )?;
-        *self.latest_snapshot.write().await = Some(replay);
-        self.current_generation.store(generation, Ordering::Release);
-        let _ = self.events.send(incremental.clone());
-        Ok(incremental)
+                        DesktopDomainState::terminal(
+                            domain,
+                            CapabilityAvailability::Parse,
+                            "producer.contract-invalid",
+                        )?,
+                    );
+                    registry.assemble(&staged)?
+                }
+            };
+            let generation = transaction.generations.next_generation()?;
+            let incremental = validated_envelope(
+                generation,
+                cause,
+                DesktopEvent::DomainUpdate(domain_update(domain, &snapshot)),
+            )?;
+            let replay = validated_envelope(
+                generation,
+                EventCause {
+                    kind: EventCauseKind::Replay,
+                    request_id: None,
+                },
+                DesktopEvent::FullSnapshot(Box::new(snapshot)),
+            )?;
+            transaction.states = Some(staged);
+            transaction.latest_snapshot = Some(replay);
+            transaction.current_generation = generation;
+            let _ = events.send(incremental.clone());
+            Ok(incremental)
+        })
+        .await
+        .map_err(join_error)?
     }
 
     pub async fn publish_command_result(
@@ -652,57 +766,72 @@ impl DesktopStateAuthority {
         status: DesktopResultStatus,
         diagnostic: Option<CapabilityFailure>,
     ) -> io::Result<(DesktopEnvelope, DesktopResult)> {
-        let states_guard = self.states.lock().await;
-        let states = states_guard.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "desktop authority has not initialized",
-            )
-        })?;
-        let snapshot = self.registry.assemble(states)?;
-        let generation = self.allocate_generation().await?;
-        let result = DesktopResult {
-            schema_version: DESKTOP_WIRE_VERSION,
-            request_id: request_id.clone(),
-            generation,
-            status,
-            diagnostic,
-        };
-        validate_desktop_result(&serde_json::to_string(&result).map_err(io::Error::other)?)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let outcome = validated_envelope(
-            generation,
-            EventCause {
-                kind: EventCauseKind::Request,
-                request_id: Some(request_id),
-            },
-            DesktopEvent::CommandResult(result.clone()),
-        )?;
-        let replay = validated_envelope(
-            generation,
-            EventCause {
-                kind: EventCauseKind::Replay,
-                request_id: None,
-            },
-            DesktopEvent::FullSnapshot(Box::new(snapshot)),
-        )?;
-        *self.latest_snapshot.write().await = Some(replay);
-        self.current_generation.store(generation, Ordering::Release);
-        let _ = self.events.send(outcome.clone());
-        Ok((outcome, result))
+        let transaction = Arc::clone(&self.transaction);
+        let registry = Arc::clone(&self.registry);
+        let events = self.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut transaction = transaction
+                .lock()
+                .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?;
+            let states = transaction.states.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "desktop authority has not initialized",
+                )
+            })?;
+            let snapshot = registry.assemble(states)?;
+            let generation = transaction.generations.next_generation()?;
+            let result = DesktopResult {
+                schema_version: DESKTOP_WIRE_VERSION,
+                request_id: request_id.clone(),
+                generation,
+                status,
+                diagnostic,
+            };
+            validate_desktop_result(&serde_json::to_string(&result).map_err(io::Error::other)?)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let outcome = validated_envelope(
+                generation,
+                EventCause {
+                    kind: EventCauseKind::Request,
+                    request_id: Some(request_id),
+                },
+                DesktopEvent::CommandResult(result.clone()),
+            )?;
+            let replay = validated_envelope(
+                generation,
+                EventCause {
+                    kind: EventCauseKind::Replay,
+                    request_id: None,
+                },
+                DesktopEvent::FullSnapshot(Box::new(snapshot)),
+            )?;
+            transaction.latest_snapshot = Some(replay);
+            transaction.current_generation = generation;
+            let _ = events.send(outcome.clone());
+            Ok((outcome, result))
+        })
+        .await
+        .map_err(join_error)?
     }
 
     pub fn current_generation(&self) -> u64 {
-        self.current_generation.load(Ordering::Acquire)
+        self.transaction
+            .lock()
+            .map(|transaction| transaction.current_generation)
+            .unwrap_or(0)
     }
 
-    async fn allocate_generation(&self) -> io::Result<u64> {
-        let generations = Arc::clone(&self.generations);
+    async fn checked_generation(&self, expected: u64) -> io::Result<(bool, u64)> {
+        let transaction = Arc::clone(&self.transaction);
         tokio::task::spawn_blocking(move || {
-            generations
+            let transaction = transaction
                 .lock()
-                .map_err(|_| io::Error::other("desktop generation lock poisoned"))?
-                .next_generation()
+                .map_err(|_| io::Error::other("desktop authority transaction lock poisoned"))?;
+            Ok((
+                transaction.current_generation == expected,
+                transaction.current_generation,
+            ))
         })
         .await
         .map_err(join_error)?
@@ -747,6 +876,14 @@ impl DesktopRegistry {
 
     pub async fn initial_states(&self) -> BTreeMap<DesktopDomainId, DesktopDomainState> {
         let deadline = tokio::time::Instant::now() + INITIAL_DEADLINE;
+        self.initial_states_until(deadline, deadline).await
+    }
+
+    async fn initial_states_until(
+        &self,
+        deadline: tokio::time::Instant,
+        drain_deadline: tokio::time::Instant,
+    ) -> BTreeMap<DesktopDomainId, DesktopDomainState> {
         let mut tasks = tokio::task::JoinSet::new();
         for (domain, producer) in &self.producers {
             let domain = *domain;
@@ -766,8 +903,8 @@ impl DesktopRegistry {
                         domain,
                         DesktopDomainState::terminal(
                             domain,
-                            CapabilityAvailability::Error,
-                            "producer returned an invalid initial state",
+                            CapabilityAvailability::Parse,
+                            "producer.contract-invalid",
                         )
                         .expect("static diagnostic"),
                     );
@@ -776,6 +913,13 @@ impl DesktopRegistry {
                 Ok(None) => break,
                 Err(_) => {
                     deadline_elapsed = true;
+                    while !tasks.is_empty() {
+                        match tokio::time::timeout_at(drain_deadline, tasks.join_next()).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                     break;
@@ -801,6 +945,88 @@ impl DesktopRegistry {
             });
         }
         states
+    }
+
+    fn localize_contract_failures(
+        &self,
+        states: BTreeMap<DesktopDomainId, DesktopDomainState>,
+    ) -> io::Result<BTreeMap<DesktopDomainId, DesktopDomainState>> {
+        let mut baseline = BTreeMap::new();
+        for domain in DesktopDomainId::ALL {
+            baseline.insert(
+                domain,
+                DesktopDomainState::terminal(
+                    domain,
+                    CapabilityAvailability::Unsupported,
+                    "producer.probe-isolation",
+                )?,
+            );
+        }
+        let mut localized = states;
+        for domain in DesktopDomainId::ALL {
+            let Some(candidate) = localized.get(&domain).cloned() else {
+                continue;
+            };
+            let mut isolated = baseline.clone();
+            isolated.insert(domain, candidate);
+            if self.assemble(&isolated).is_err() {
+                localized.insert(
+                    domain,
+                    DesktopDomainState::terminal(
+                        domain,
+                        CapabilityAvailability::Parse,
+                        "producer.contract-invalid",
+                    )?,
+                );
+            }
+        }
+        if let Err(error) = self.assemble(&localized) {
+            if !matches!(
+                error.to_string().as_str(),
+                "desktop.frame-too-large" | "desktop.aggregate-budget-exceeded"
+            ) {
+                return Err(error);
+            }
+            let mut contributions = Vec::new();
+            for domain in DesktopDomainId::ALL {
+                if localized
+                    .get(&domain)
+                    .is_none_or(|state| state.status() != CapabilityAvailability::Available)
+                {
+                    continue;
+                }
+                let mut isolated = baseline.clone();
+                isolated.insert(
+                    domain,
+                    localized
+                        .get(&domain)
+                        .expect("domain came from the exhaustive registry")
+                        .clone(),
+                );
+                let bytes = self
+                    .assemble(&isolated)
+                    .ok()
+                    .and_then(|snapshot| serde_json::to_vec(&snapshot).ok())
+                    .map_or(0, |bytes| bytes.len());
+                contributions.push((bytes, domain));
+            }
+            contributions.sort_by(|left, right| right.cmp(left));
+            for (_, domain) in contributions {
+                localized.insert(
+                    domain,
+                    DesktopDomainState::terminal(
+                        domain,
+                        CapabilityAvailability::Parse,
+                        "producer.aggregate-budget-exceeded",
+                    )?,
+                );
+                if self.assemble(&localized).is_ok() {
+                    return Ok(localized);
+                }
+            }
+            return Err(error);
+        }
+        Ok(localized)
     }
 
     pub fn assemble(
@@ -844,10 +1070,18 @@ impl DesktopRegistry {
                     DesktopDomainValue::Battery(value) => Some(value.clone()),
                     _ => None,
                 })?,
-                display: capability(states, DesktopDomainId::Display, |value| match value {
-                    DesktopDomainValue::Display(value) => Some(value.clone()),
+                brightness: capability(states, DesktopDomainId::Brightness, |value| match value {
+                    DesktopDomainValue::Brightness(value) => Some(value.clone()),
                     _ => None,
                 })?,
+                night_light: capability(
+                    states,
+                    DesktopDomainId::NightLight,
+                    |value| match value {
+                        DesktopDomainValue::NightLight(value) => Some(value.clone()),
+                        _ => None,
+                    },
+                )?,
                 power: capability(states, DesktopDomainId::Power, |value| match value {
                     DesktopDomainValue::Power(value) => Some(value.clone()),
                     _ => None,
@@ -898,14 +1132,38 @@ impl DesktopRegistry {
             let sender = sender.clone();
             let token = cancellation.child_token();
             tasks.push(tokio::spawn(async move {
-                if let Err(error) = producer.run(sender.clone(), token).await {
+                let mut backoff = Duration::from_millis(100);
+                loop {
+                    let started = tokio::time::Instant::now();
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    let result = producer.run(sender.clone(), token.child_token()).await;
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    let diagnostic = match result {
+                        Ok(()) => "producer.disconnected".to_owned(),
+                        Err(error) => bounded_diagnostic(error.to_string()),
+                    };
                     let state = DesktopDomainState::terminal(
                         domain,
                         CapabilityAvailability::Error,
-                        bounded_diagnostic(error.to_string()),
+                        diagnostic,
                     )
                     .expect("producer error has a diagnostic");
-                    let _ = sender.send(DesktopDomainUpdate { state }).await;
+                    if sender.send(DesktopDomainUpdate { state }).await.is_err() {
+                        return;
+                    }
+                    if started.elapsed() >= Duration::from_secs(10) {
+                        backoff = Duration::from_millis(100);
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(5));
                 }
             }));
         }
@@ -938,38 +1196,60 @@ impl DesktopProducerRuntime {
     pub async fn shutdown(mut self, timeout: Duration) -> io::Result<()> {
         self.cancellation.cancel();
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut failure = None;
+        let mut timed_out_at = None;
         for index in 0..self.tasks.len() {
             match tokio::time::timeout_at(deadline, &mut self.tasks[index]).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    return Err(io::Error::other(format!(
-                        "desktop producer task failed: {error}"
-                    )));
+                    failure.get_or_insert_with(|| {
+                        io::Error::other(format!("desktop producer task failed: {error}"))
+                    });
                 }
                 Err(_) => {
+                    timed_out_at = Some(index);
                     for task in &self.tasks[index..] {
                         task.abort();
                     }
-                    self.aggregator.abort();
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "desktop producers did not drain",
-                    ));
+                    for task in &mut self.tasks[index..] {
+                        let _ = task.await;
+                    }
+                    failure.get_or_insert_with(|| {
+                        io::Error::new(io::ErrorKind::TimedOut, "desktop producers did not drain")
+                    });
+                    break;
                 }
             }
         }
-        match tokio::time::timeout_at(deadline, &mut self.aggregator).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(io::Error::other(format!(
-                "desktop producer aggregator failed: {error}"
-            ))),
-            Err(_) => {
-                self.aggregator.abort();
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "desktop producer aggregator did not drain",
-                ))
+        if timed_out_at.is_some() {
+            self.aggregator.abort();
+            let _ = (&mut self.aggregator).await;
+        } else {
+            match tokio::time::timeout_at(deadline, &mut self.aggregator).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    failure.get_or_insert(error);
+                }
+                Ok(Err(error)) => {
+                    failure.get_or_insert_with(|| {
+                        io::Error::other(format!("desktop producer aggregator failed: {error}"))
+                    });
+                }
+                Err(_) => {
+                    self.aggregator.abort();
+                    let _ = (&mut self.aggregator).await;
+                    failure.get_or_insert_with(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "desktop producer aggregator did not drain",
+                        )
+                    });
+                }
             }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
@@ -996,7 +1276,8 @@ pub fn production_registry<B: crate::daily::DailyBackend>(
         DesktopDomainId::Audio,
         DesktopDomainId::Media,
         DesktopDomainId::Battery,
-        DesktopDomainId::Display,
+        DesktopDomainId::Brightness,
+        DesktopDomainId::NightLight,
         DesktopDomainId::Power,
     ] {
         producers.push(Arc::new(CoreSystemProducer::production(
@@ -1028,6 +1309,8 @@ pub fn production_registry<B: crate::daily::DailyBackend>(
         DesktopDomainId::Recording,
         DesktopDomainId::IdleInhibit,
         DesktopDomainId::GameMode,
+        DesktopDomainId::Screenshot,
+        DesktopDomainId::ColorPicker,
     ] {
         producers.push(Arc::new(utilities::UtilityProducer::new(
             domain,
@@ -1072,10 +1355,7 @@ fn capability<T>(
             status: state.status,
             data: None,
             diagnostic: Some(CapabilityFailure {
-                message: state
-                    .diagnostic
-                    .clone()
-                    .unwrap_or_else(|| "desktop producer failed without a diagnostic".into()),
+                message: public_producer_diagnostic(state.status).into(),
             }),
         })
     }
@@ -1086,10 +1366,7 @@ fn producer_availability(state: &DesktopDomainState) -> ProducerAvailability {
         status: state.status,
         diagnostic: (state.status != CapabilityAvailability::Available).then(|| {
             CapabilityFailure {
-                message: state
-                    .diagnostic
-                    .clone()
-                    .unwrap_or_else(|| "desktop producer failed without a diagnostic".into()),
+                message: public_producer_diagnostic(state.status).into(),
             }
         }),
     }
@@ -1099,6 +1376,18 @@ fn available_producer() -> ProducerAvailability {
     ProducerAvailability {
         status: CapabilityAvailability::Available,
         diagnostic: None,
+    }
+}
+
+fn public_producer_diagnostic(status: CapabilityAvailability) -> &'static str {
+    match status {
+        CapabilityAvailability::Available => "producer.available",
+        CapabilityAvailability::Unavailable => "producer.unavailable",
+        CapabilityAvailability::Unsupported => "producer.unsupported",
+        CapabilityAvailability::PermissionDenied => "producer.permission-denied",
+        CapabilityAvailability::Timeout => "producer.timeout",
+        CapabilityAvailability::Parse => "producer.parse-invalid",
+        CapabilityAvailability::Error => "producer.failed",
     }
 }
 
@@ -1199,49 +1488,29 @@ fn resources_snapshot(
 fn utilities_snapshot(
     states: &BTreeMap<DesktopDomainId, DesktopDomainState>,
 ) -> io::Result<DesktopUtilitySnapshot> {
-    let utility_domains = [
-        DesktopDomainId::Tray,
-        DesktopDomainId::Clipboard,
-        DesktopDomainId::Recording,
-        DesktopDomainId::IdleInhibit,
-        DesktopDomainId::GameMode,
-    ];
-    let failed = utility_domains.into_iter().find_map(|domain| {
-        let state = states.get(&domain)?;
-        (state.status != CapabilityAvailability::Available).then_some(state)
-    });
-    let availability = failed.map_or_else(available_producer, producer_availability);
-    let tray_items = match state(states, DesktopDomainId::Tray)?.value.as_ref() {
-        Some(DesktopDomainValue::Tray(value)) => value.clone(),
-        _ => Vec::new(),
-    };
-    let clipboard_entries = match state(states, DesktopDomainId::Clipboard)?.value.as_ref() {
-        Some(DesktopDomainValue::Clipboard(value)) => value.clone(),
-        _ => Vec::new(),
-    };
-    let recording = match state(states, DesktopDomainId::Recording)?.value.as_ref() {
-        Some(DesktopDomainValue::Recording(value)) => value.clone(),
-        _ => RecordingState {
-            status: RecordingStatus::Inactive,
-            recording_id: None,
-            output_id: None,
-        },
-    };
-    let idle_inhibited = match state(states, DesktopDomainId::IdleInhibit)?.value.as_ref() {
-        Some(DesktopDomainValue::IdleInhibit(value)) => *value,
-        _ => false,
-    };
-    let game_mode = match state(states, DesktopDomainId::GameMode)?.value.as_ref() {
-        Some(DesktopDomainValue::GameMode(value)) => *value,
-        _ => false,
-    };
     Ok(DesktopUtilitySnapshot {
-        availability,
-        tray_items,
-        clipboard_entries,
-        recording,
-        idle_inhibited,
-        game_mode,
+        tray_items: capability(states, DesktopDomainId::Tray, |value| match value {
+            DesktopDomainValue::Tray(value) => Some(value.clone()),
+            _ => None,
+        })?,
+        clipboard_entries: capability(states, DesktopDomainId::Clipboard, |value| match value {
+            DesktopDomainValue::Clipboard(value) => Some(value.clone()),
+            _ => None,
+        })?,
+        recording: capability(states, DesktopDomainId::Recording, |value| match value {
+            DesktopDomainValue::Recording(value) => Some(value.clone()),
+            _ => None,
+        })?,
+        idle_inhibited: capability(states, DesktopDomainId::IdleInhibit, |value| match value {
+            DesktopDomainValue::IdleInhibit(value) => Some(*value),
+            _ => None,
+        })?,
+        game_mode: capability(states, DesktopDomainId::GameMode, |value| match value {
+            DesktopDomainValue::GameMode(value) => Some(*value),
+            _ => None,
+        })?,
+        screenshot: producer_availability(state(states, DesktopDomainId::Screenshot)?),
+        color_picker: producer_availability(state(states, DesktopDomainId::ColorPicker)?),
     })
 }
 
@@ -1288,6 +1557,7 @@ fn validate_assembled_snapshot(snapshot: DesktopSnapshot) -> io::Result<DesktopS
         payload: DesktopEvent::FullSnapshot(Box::new(snapshot.clone())),
     };
     let json = serde_json::to_string(&envelope).map_err(io::Error::other)?;
+    validate_serialized_budget(&json)?;
     validate_desktop_envelope(&json)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(snapshot)
@@ -1310,8 +1580,11 @@ fn domain_update(domain: DesktopDomainId, snapshot: &DesktopSnapshot) -> SdkDoma
         DesktopDomainId::Battery => SdkDomainUpdate::System(DesktopSystemUpdate::Battery(
             snapshot.system.battery.clone(),
         )),
-        DesktopDomainId::Display => SdkDomainUpdate::System(DesktopSystemUpdate::Display(
-            snapshot.system.display.clone(),
+        DesktopDomainId::Brightness => SdkDomainUpdate::System(DesktopSystemUpdate::Brightness(
+            snapshot.system.brightness.clone(),
+        )),
+        DesktopDomainId::NightLight => SdkDomainUpdate::System(DesktopSystemUpdate::NightLight(
+            snapshot.system.night_light.clone(),
         )),
         DesktopDomainId::Power => {
             SdkDomainUpdate::System(DesktopSystemUpdate::Power(snapshot.system.power.clone()))
@@ -1333,11 +1606,42 @@ fn domain_update(domain: DesktopDomainId, snapshot: &DesktopSnapshot) -> SdkDoma
         DesktopDomainId::Weather => SdkDomainUpdate::Weather(snapshot.weather.clone()),
         DesktopDomainId::Appearance => SdkDomainUpdate::Appearance(snapshot.appearance.clone()),
         DesktopDomainId::Resources => SdkDomainUpdate::Resources(snapshot.resources.clone()),
-        DesktopDomainId::Tray
-        | DesktopDomainId::Clipboard
-        | DesktopDomainId::Recording
-        | DesktopDomainId::IdleInhibit
-        | DesktopDomainId::GameMode => SdkDomainUpdate::Utilities(snapshot.utilities.clone()),
+        DesktopDomainId::Tray => SdkDomainUpdate::Utilities(DesktopUtilityUpdate::TrayItems(
+            snapshot.utilities.tray_items.clone(),
+        )),
+        DesktopDomainId::Clipboard => SdkDomainUpdate::Utilities(
+            DesktopUtilityUpdate::ClipboardEntries(snapshot.utilities.clipboard_entries.clone()),
+        ),
+        DesktopDomainId::Recording => SdkDomainUpdate::Utilities(DesktopUtilityUpdate::Recording(
+            snapshot.utilities.recording.clone(),
+        )),
+        DesktopDomainId::IdleInhibit => SdkDomainUpdate::Utilities(
+            DesktopUtilityUpdate::IdleInhibited(snapshot.utilities.idle_inhibited.clone()),
+        ),
+        DesktopDomainId::GameMode => SdkDomainUpdate::Utilities(DesktopUtilityUpdate::GameMode(
+            snapshot.utilities.game_mode.clone(),
+        )),
+        DesktopDomainId::Screenshot => SdkDomainUpdate::Utilities(
+            DesktopUtilityUpdate::Screenshot(snapshot.utilities.screenshot.clone()),
+        ),
+        DesktopDomainId::ColorPicker => SdkDomainUpdate::Utilities(
+            DesktopUtilityUpdate::ColorPicker(snapshot.utilities.color_picker.clone()),
+        ),
+    }
+}
+
+pub(crate) fn hyprland_action_capabilities() -> HyprlandActionCapabilities {
+    HyprlandActionCapabilities {
+        focus_window: true,
+        move_window_to_workspace: true,
+        close_window: true,
+        focus_workspace: true,
+        move_workspace_to_monitor: true,
+        toggle_fullscreen: false,
+        toggle_floating: true,
+        toggle_pinned: true,
+        toggle_group: false,
+        exit: true,
     }
 }
 
@@ -1355,9 +1659,83 @@ fn validated_envelope(
         payload,
     };
     let encoded = serde_json::to_string(&event).map_err(io::Error::other)?;
+    validate_serialized_budget(&encoded)?;
     validate_desktop_envelope(&encoded)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     Ok(event)
+}
+
+fn validate_serialized_budget(encoded: &str) -> io::Result<()> {
+    if encoded.len() > MAX_DESKTOP_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "desktop.frame-too-large",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(encoded).map_err(io::Error::other)?;
+    let mut items = 0_usize;
+    let mut string_bytes = 0_usize;
+    accumulate_serialized_budget(&value, 0, &mut items, &mut string_bytes)?;
+    if items > MAX_DESKTOP_SERIALIZED_ITEMS || string_bytes > MAX_DESKTOP_STRING_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "desktop.aggregate-budget-exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn accumulate_serialized_budget(
+    value: &serde_json::Value,
+    depth: usize,
+    items: &mut usize,
+    string_bytes: &mut usize,
+) -> io::Result<()> {
+    if depth > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "desktop.serialization-depth-exceeded",
+        ));
+    }
+    match value {
+        serde_json::Value::String(value) => {
+            *string_bytes = string_bytes.checked_add(value.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "desktop.string-budget-overflow")
+            })?;
+        }
+        serde_json::Value::Array(values) => {
+            *items = items.checked_add(values.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "desktop.item-budget-overflow")
+            })?;
+            for value in values {
+                accumulate_serialized_budget(value, depth + 1, items, string_bytes)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            *items = items.checked_add(values.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "desktop.item-budget-overflow")
+            })?;
+            for (key, value) in values {
+                *string_bytes = string_bytes.checked_add(key.len()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "desktop.string-budget-overflow")
+                })?;
+                accumulate_serialized_budget(value, depth + 1, items, string_bytes)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn ensure_initial_deadline(deadline: StdInstant) -> io::Result<()> {
+    if StdInstant::now() >= deadline {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "desktop.initialization-timeout",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn utc_now() -> io::Result<String> {
@@ -1447,6 +1825,20 @@ impl DurableDedupe {
                         "desktop dedupe document contains duplicate request IDs",
                     ));
                 }
+                for record in &document.records {
+                    validate_canonical_request_id(&record.request_id)?;
+                    if let Some(result) = &record.result {
+                        let encoded = serde_json::to_string(result).map_err(io::Error::other)?;
+                        validate_desktop_result(&encoded)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                        if result.request_id != record.request_id {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "desktop dedupe key/result requestId mismatch",
+                            ));
+                        }
+                    }
+                }
                 document
             }
             None => DedupeDocument {
@@ -1459,6 +1851,7 @@ impl DurableDedupe {
             name,
             maximum_records,
             document,
+            fault: None,
         })
     }
 
@@ -1471,42 +1864,53 @@ impl DurableDedupe {
     }
 
     fn begin(&mut self, request_id: String) -> io::Result<()> {
+        validate_canonical_request_id(&request_id)?;
         if self.lookup(&request_id).is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "desktop request is already recorded",
             ));
         }
-        self.make_room()?;
-        self.document.records.push_back(DedupeRecord {
+        let mut staged = self.document.clone();
+        Self::make_room(&mut staged, self.maximum_records)?;
+        staged.records.push_back(DedupeRecord {
             request_id,
             result: None,
         });
-        self.persist()
+        self.commit(staged)
     }
 
     fn complete(&mut self, request_id: &str, result: DesktopResult) -> io::Result<()> {
-        if let Some(record) = self
-            .document
+        validate_canonical_request_id(request_id)?;
+        let encoded = serde_json::to_string(&result).map_err(io::Error::other)?;
+        validate_desktop_result(&encoded)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if result.request_id != request_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "desktop dedupe key/result requestId mismatch",
+            ));
+        }
+        let mut staged = self.document.clone();
+        if let Some(record) = staged
             .records
             .iter_mut()
             .find(|record| record.request_id == request_id)
         {
             record.result = Some(result);
         } else {
-            self.make_room()?;
-            self.document.records.push_back(DedupeRecord {
+            Self::make_room(&mut staged, self.maximum_records)?;
+            staged.records.push_back(DedupeRecord {
                 request_id: request_id.to_owned(),
                 result: Some(result),
             });
         }
-        self.persist()
+        self.commit(staged)
     }
 
-    fn make_room(&mut self) -> io::Result<()> {
-        while self.document.records.len() >= self.maximum_records {
-            let index = self
-                .document
+    fn make_room(document: &mut DedupeDocument, maximum_records: usize) -> io::Result<()> {
+        while document.records.len() >= maximum_records {
+            let index = document
                 .records
                 .iter()
                 .position(|record| record.result.is_some())
@@ -1516,23 +1920,74 @@ impl DurableDedupe {
                         "desktop dedupe capacity is occupied by pending requests",
                     )
                 })?;
-            self.document.records.remove(index);
+            document.records.remove(index);
         }
         Ok(())
     }
 
-    fn persist(&self) -> io::Result<()> {
-        let bytes = serde_json::to_vec(&self.document).map_err(io::Error::other)?;
+    fn commit(&mut self, staged: DedupeDocument) -> io::Result<()> {
+        let bytes = serde_json::to_vec(&staged).map_err(io::Error::other)?;
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "desktop dedupe document exceeds its bounded size",
             ));
         }
-        self.directory
-            .atomic_replace(&self.name, &bytes, || Ok(()), || Ok(()), || Ok(()))
-            .map_err(|error| io::Error::other(error.to_string()))
+        let fault = self.fault.take();
+        let result = self.directory.atomic_replace(
+            &self.name,
+            &bytes,
+            || inject_dedupe_fault(fault, DedupeFaultPoint::FileSync),
+            || inject_dedupe_fault(fault, DedupeFaultPoint::Rename),
+            || inject_dedupe_fault(fault, DedupeFaultPoint::DirectorySync),
+        );
+        if let Err(error) = result {
+            if let Ok(Some(on_disk)) = self.directory.read_optional(&self.name) {
+                if serde_json::from_slice::<DedupeDocument>(&on_disk)
+                    .ok()
+                    .as_ref()
+                    == Some(&staged)
+                {
+                    self.directory
+                        .sync()
+                        .map_err(|sync_error| io::Error::other(sync_error.to_string()))?;
+                    self.document = staged;
+                }
+            }
+            return Err(io::Error::other(error.to_string()));
+        }
+        self.document = staged;
+        Ok(())
     }
+}
+
+fn inject_dedupe_fault(
+    configured: Option<DedupeFaultPoint>,
+    current: DedupeFaultPoint,
+) -> Result<(), crate::store::StoreError> {
+    if configured == Some(current) {
+        Err(crate::store::StoreError::io(format!(
+            "injected desktop dedupe {current:?} fault"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_canonical_request_id(request_id: &str) -> io::Result<()> {
+    let parsed = uuid::Uuid::parse_str(request_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "desktop dedupe requestId is not a UUID",
+        )
+    })?;
+    if parsed.to_string() != request_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "desktop dedupe requestId is not canonical",
+        ));
+    }
+    Ok(())
 }
 
 fn failed_result(request_id: &str, generation: u64, diagnostic: &str) -> io::Result<DesktopResult> {
@@ -1560,6 +2015,16 @@ fn bounded_diagnostic(message: String) -> String {
         boundary -= 1;
     }
     message[..boundary].to_owned()
+}
+
+fn public_mutation_diagnostic(code: &str) -> &'static str {
+    match code {
+        "mutation.readback-missing" => "mutation.readback-missing",
+        "mutation.readback-terminal" => "mutation.readback-terminal",
+        "brightness.output-target-unmapped" => "brightness.output-target-unmapped",
+        "capture.portal-unavailable" => "capture.portal-unavailable",
+        _ => "mutation.terminal-failure",
+    }
 }
 
 pub async fn serve_event_stream(
@@ -1592,4 +2057,134 @@ pub async fn serve_control_stream<E: DesktopMutationExecutor>(
     let result = authority.handle_json(input).await?;
     let response = serde_json::to_vec(&result).map_err(io::Error::other)?;
     context.write_frame(&mut write, &response).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    fn result(request_id: &str) -> DesktopResult {
+        DesktopResult {
+            schema_version: DESKTOP_WIRE_VERSION,
+            request_id: request_id.into(),
+            generation: 7,
+            status: DesktopResultStatus::Succeeded,
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_fault_boundaries_never_leave_memory_ahead_of_disk() {
+        let request_id = "00000000-0000-4000-8000-000000000041";
+        for (fault, materialized) in [
+            (DedupeFaultPoint::FileSync, false),
+            (DedupeFaultPoint::Rename, true),
+            (DedupeFaultPoint::DirectorySync, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("dedupe.json");
+            let mut dedupe = DurableDedupe::open(&path, 8).unwrap();
+            dedupe.fault = Some(fault);
+            assert!(dedupe.begin(request_id.into()).is_err());
+            assert_eq!(
+                dedupe.lookup(request_id).is_some(),
+                materialized,
+                "{fault:?}"
+            );
+
+            let reopened = DurableDedupe::open(&path, 8).unwrap();
+            assert_eq!(
+                reopened.lookup(request_id).is_some(),
+                materialized,
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedupe_completion_faults_reconcile_key_and_correlated_result() {
+        let request_id = "00000000-0000-4000-8000-000000000042";
+        for fault in [
+            DedupeFaultPoint::FileSync,
+            DedupeFaultPoint::Rename,
+            DedupeFaultPoint::DirectorySync,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("dedupe.json");
+            let mut dedupe = DurableDedupe::open(&path, 8).unwrap();
+            dedupe.begin(request_id.into()).unwrap();
+            dedupe.fault = Some(fault);
+            assert!(dedupe.complete(request_id, result(request_id)).is_err());
+
+            let reopened = DurableDedupe::open(&path, 8).unwrap();
+            match (fault, reopened.lookup(request_id).unwrap()) {
+                (DedupeFaultPoint::FileSync, None) => {}
+                (_, Some(value)) => assert_eq!(value.request_id, request_id),
+                _ => panic!("unexpected dedupe state after {fault:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dedupe_load_rejects_invalid_ids_results_and_key_correlation() {
+        let valid = "00000000-0000-4000-8000-000000000043";
+        let other = "00000000-0000-4000-8000-000000000044";
+        let cases = [
+            DedupeRecord {
+                request_id: "not-a-request-id".into(),
+                result: None,
+            },
+            DedupeRecord {
+                request_id: valid.into(),
+                result: Some(result(other)),
+            },
+            DedupeRecord {
+                request_id: valid.into(),
+                result: Some(DesktopResult {
+                    diagnostic: Some(CapabilityFailure {
+                        message: "invalid diagnostic on success".into(),
+                    }),
+                    ..result(valid)
+                }),
+            },
+        ];
+        for record in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("dedupe.json");
+            let document = DedupeDocument {
+                schema_version: 1,
+                records: VecDeque::from([record]),
+            };
+            std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let error = match DurableDedupe::open(&path, 8) {
+                Ok(_) => panic!("invalid dedupe record was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn serialized_desktop_budget_is_conservatively_below_transport_limit() {
+        let oversized = serde_json::json!({
+            "payload": "x".repeat(MAX_DESKTOP_FRAME_BYTES),
+        });
+        let encoded = serde_json::to_string(&oversized).unwrap();
+        assert_eq!(
+            validate_serialized_budget(&encoded).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let too_many_items =
+            serde_json::to_string(&vec![0; MAX_DESKTOP_SERIALIZED_ITEMS + 1]).unwrap();
+        assert_eq!(
+            validate_serialized_budget(&too_many_items)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 }

@@ -3,6 +3,7 @@
 use std::{
     fs,
     io::{self, Write},
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -38,18 +39,55 @@ const GAME_MODE_DESTINATION: &str = "com.feralinteractive.GameMode";
 const GAME_MODE_PATH: &str = "/com/feralinteractive/GameMode";
 const GAME_MODE_INTERFACE: &str = "com.feralinteractive.GameMode";
 
-pub fn action_spec(command: &UtilityCommand, output_path: &str) -> io::Result<Option<CommandSpec>> {
+pub fn action_spec(
+    command: &UtilityCommand,
+    output_path: &str,
+    gesture_token: &str,
+) -> io::Result<Option<CommandSpec>> {
     let spec = match command {
         UtilityCommand::Screenshot { output_id } => {
             validate_output_path(output_path)?;
-            CommandSpec::new("grim", ["-o", output_name(output_id)?, output_path])
+            validate_gesture_token(gesture_token)?;
+            CommandSpec::new(
+                "sleepy-capture-helper",
+                [
+                    "screenshot",
+                    "--gesture-token",
+                    gesture_token,
+                    "--output-id",
+                    output_name(output_id)?,
+                    "--output-path",
+                    output_path,
+                ],
+            )
         }
-        UtilityCommand::PickColor => CommandSpec::new("hyprpicker", ["--autocopy"]),
+        UtilityCommand::PickColor => {
+            validate_gesture_token(gesture_token)?;
+            CommandSpec::new(
+                "sleepy-capture-helper",
+                [
+                    "pick-color",
+                    "--gesture-token",
+                    gesture_token,
+                    "--result-fd",
+                    "1",
+                ],
+            )
+        }
         UtilityCommand::StartRecording { output_id } => {
             validate_output_path(output_path)?;
+            validate_gesture_token(gesture_token)?;
             CommandSpec::new(
-                "wf-recorder",
-                ["--output", output_name(output_id)?, "--file", output_path],
+                "sleepy-capture-helper",
+                [
+                    "record",
+                    "--gesture-token",
+                    gesture_token,
+                    "--output-id",
+                    output_name(output_id)?,
+                    "--output-path",
+                    output_path,
+                ],
             )
         }
         UtilityCommand::InvokeTrayMenu { .. }
@@ -61,6 +99,29 @@ pub fn action_spec(command: &UtilityCommand, output_path: &str) -> io::Result<Op
         | UtilityCommand::SetGameMode { .. } => return Ok(None),
     };
     Ok(Some(spec))
+}
+
+fn execute_capture_with<R: crate::system::CommandRunner>(
+    runner: &R,
+    command: &UtilityCommand,
+    output_path: &str,
+    gesture_token: &str,
+) -> io::Result<()> {
+    let spec = action_spec(command, output_path, gesture_token)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "capture command required"))?;
+    super::network::run(runner, spec).map(|_| ())
+}
+
+fn validate_gesture_token(token: &str) -> io::Result<()> {
+    let parsed = uuid::Uuid::parse_str(token)
+        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "capture.gesture-required"))?;
+    if parsed.to_string() != token {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "capture.gesture-required",
+        ));
+    }
+    Ok(())
 }
 
 fn output_name(output_id: &sleepy_sdk::StableId) -> io::Result<&str> {
@@ -135,6 +196,23 @@ impl ProductionUtilityService {
     }
 
     pub fn state(&self, domain: DesktopDomainId) -> DesktopDomainState {
+        if matches!(
+            domain,
+            DesktopDomainId::Screenshot | DesktopDomainId::ColorPicker
+        ) {
+            return match ensure_executable("sleepy-capture-helper") {
+                Ok(()) => DesktopDomainState::available(
+                    domain,
+                    if domain == DesktopDomainId::Screenshot {
+                        DesktopDomainValue::Screenshot
+                    } else {
+                        DesktopDomainValue::ColorPicker
+                    },
+                )
+                .expect("matching stateless capture domain"),
+                Err(error) => terminal(domain, availability_for_io(&error), error.to_string()),
+            };
+        }
         let result = match domain {
             DesktopDomainId::Tray => self.tray.probe().map(DesktopDomainValue::Tray),
             DesktopDomainId::Clipboard => {
@@ -162,7 +240,11 @@ impl ProductionUtilityService {
         }
     }
 
-    pub fn execute(&self, command: &UtilityCommand) -> io::Result<DesktopDomainState> {
+    pub fn execute(
+        &self,
+        command: &UtilityCommand,
+        gesture_token: &str,
+    ) -> io::Result<DesktopDomainState> {
         match command {
             UtilityCommand::InvokeTrayMenu { item_id, menu_id } => {
                 self.tray.invoke(item_id, menu_id)?;
@@ -181,7 +263,7 @@ impl ProductionUtilityService {
                 Ok(self.state(DesktopDomainId::IdleInhibit))
             }
             UtilityCommand::StartRecording { output_id } => {
-                self.start_recording(output_id)?;
+                self.start_recording(output_id, gesture_token)?;
                 Ok(self.state(DesktopDomainId::Recording))
             }
             UtilityCommand::PauseRecording => {
@@ -195,16 +277,12 @@ impl ProductionUtilityService {
             UtilityCommand::Screenshot { .. } => {
                 let path = self.output_path("screenshot", "png");
                 let path = path_to_string(&path)?;
-                let spec = action_spec(command, path)?
-                    .ok_or_else(|| io::Error::other("screenshot command contract missing"))?;
-                super::network::run(&self.runner, spec)?;
-                Ok(self.state(DesktopDomainId::Recording))
+                execute_capture_with(&self.runner, command, path, gesture_token)?;
+                Ok(self.state(DesktopDomainId::Screenshot))
             }
             UtilityCommand::PickColor => {
-                let spec = action_spec(command, "unused")?
-                    .ok_or_else(|| io::Error::other("color-picker command contract missing"))?;
-                super::network::run(&self.runner, spec)?;
-                Ok(self.state(DesktopDomainId::Recording))
+                execute_capture_with(&self.runner, command, "unused", gesture_token)?;
+                Ok(self.state(DesktopDomainId::ColorPicker))
             }
             UtilityCommand::SetGameMode { enabled } => {
                 self.set_game_mode(*enabled)?;
@@ -214,7 +292,14 @@ impl ProductionUtilityService {
     }
 
     fn clipboard_snapshot(&self) -> io::Result<Vec<ClipboardEntry>> {
-        let list = super::network::run(&self.runner, super::clipboard::list_spec())?;
+        self.clipboard_snapshot_with(&self.runner)
+    }
+
+    fn clipboard_snapshot_with<R: crate::system::CommandRunner>(
+        &self,
+        runner: &R,
+    ) -> io::Result<Vec<ClipboardEntry>> {
+        let list = super::network::run(runner, super::clipboard::list_spec())?;
         let rows = super::clipboard::parse_list(&list)?;
         let mut entries = Vec::with_capacity(rows.len());
         for (id, preview) in rows {
@@ -237,22 +322,24 @@ impl ProductionUtilityService {
     }
 
     fn paste_clipboard(&self, entry_id: &sleepy_sdk::StableId) -> io::Result<()> {
-        let current = self.clipboard_snapshot()?;
+        let timeout = Duration::from_secs(10);
+        let deadline = Instant::now() + timeout;
+        let runner = super::core::DeadlineRunner::new(self.runner, timeout);
+        let current = self.clipboard_snapshot_with(&runner)?;
         if !current.iter().any(|entry| entry.id == entry_id.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown clipboard entry ID",
             ));
         }
-        let mut contents =
-            super::network::run(&self.runner, super::clipboard::decode_spec(entry_id)?)?;
-        let result = write_wayland_clipboard(&contents);
+        let mut contents = super::network::run(&runner, super::clipboard::decode_spec(entry_id)?)?;
+        let result = write_wayland_clipboard(&contents, deadline);
         contents.zeroize();
         result
     }
 
     fn recording_snapshot(&self) -> io::Result<RecordingState> {
-        ensure_executable("wf-recorder")?;
+        ensure_executable("sleepy-capture-helper")?;
         let mut runtime = self
             .recording
             .lock()
@@ -265,7 +352,11 @@ impl ProductionUtilityService {
         Ok(runtime.state.clone())
     }
 
-    fn start_recording(&self, output_id: &sleepy_sdk::StableId) -> io::Result<()> {
+    fn start_recording(
+        &self,
+        output_id: &sleepy_sdk::StableId,
+        gesture_token: &str,
+    ) -> io::Result<()> {
         let mut runtime = self
             .recording
             .lock()
@@ -286,11 +377,12 @@ impl ProductionUtilityService {
                 output_id: output_id.clone(),
             },
             path_text,
+            gesture_token,
         )?
         .ok_or_else(|| io::Error::other("recording command contract missing"))?;
-        let mut child = fixed_child(&spec)?.spawn()?;
+        let mut child = ChildGuard::new(fixed_child(&spec)?.spawn()?);
         thread::sleep(Duration::from_millis(40));
-        if child.try_wait()?.is_some() {
+        if child.child_mut()?.try_wait()?.is_some() {
             return Err(io::Error::other("recording process exited before readback"));
         }
         runtime.state = RecordingState {
@@ -298,7 +390,7 @@ impl ProductionUtilityService {
             recording_id: Some(recording_id),
             output_id: Some(output_id.as_str().to_owned()),
         };
-        runtime.child = Some(child);
+        runtime.child = Some(child.disarm()?);
         Ok(())
     }
 
@@ -341,9 +433,13 @@ impl ProductionUtilityService {
                 "no recording is active",
             ));
         };
-        terminate_child(&mut child, libc::SIGINT, Duration::from_secs(5))?;
+        let result = terminate_child(&mut child, libc::SIGINT, Duration::from_secs(5));
+        if result.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         runtime.state = RecordingRuntime::default().state;
-        Ok(())
+        result
     }
 
     fn idle_snapshot(&self) -> io::Result<bool> {
@@ -396,17 +492,12 @@ impl ProductionUtilityService {
         let connection = dbus::blocking::Connection::new_session().map_err(dbus_error)?;
         let proxy =
             connection.with_proxy(GAME_MODE_DESTINATION, GAME_MODE_PATH, LOGIND_ACTION_TIMEOUT);
-        let method = if enabled {
-            "RegisterGame"
-        } else {
-            "UnregisterGame"
-        };
-        let (status,): (i32,) = proxy
-            .method_call(GAME_MODE_INTERFACE, method, (std::process::id() as i32,))
-            .map_err(dbus_error)?;
-        if status < 0 {
-            return Err(io::Error::other("GameMode rejected the request"));
-        }
+        execute_game_mode_with(enabled, |method| {
+            let (status,): (i32,) = proxy
+                .method_call(GAME_MODE_INTERFACE, method, (std::process::id() as i32,))
+                .map_err(dbus_error)?;
+            Ok(status)
+        })?;
         *self
             .game_mode
             .lock()
@@ -421,6 +512,21 @@ impl ProductionUtilityService {
             extension
         ))
     }
+}
+
+fn execute_game_mode_with(
+    enabled: bool,
+    transport: impl FnOnce(&str) -> io::Result<i32>,
+) -> io::Result<()> {
+    let method = if enabled {
+        "RegisterGame"
+    } else {
+        "UnregisterGame"
+    };
+    if transport(method)? < 0 {
+        return Err(io::Error::other("GameMode rejected the request"));
+    }
+    Ok(())
 }
 
 impl Drop for ProductionUtilityService {
@@ -451,6 +557,8 @@ impl UtilityProducer {
                 | DesktopDomainId::Recording
                 | DesktopDomainId::IdleInhibit
                 | DesktopDomainId::GameMode
+                | DesktopDomainId::Screenshot
+                | DesktopDomainId::ColorPicker
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -512,18 +620,119 @@ impl DesktopProducer for UtilityProducer {
     }
 }
 
-fn write_wayland_clipboard(contents: &[u8]) -> io::Result<()> {
-    let mut child = Command::new("wl-copy")
+fn write_wayland_clipboard(contents: &[u8], deadline: Instant) -> io::Result<()> {
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "clipboard write exceeded its total deadline",
+        ));
+    }
+    let child = Command::new("wl-copy")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    child
+    let mut child = ChildGuard::new(child);
+    let mut stdin = child
+        .child_mut()?
         .stdin
         .take()
-        .ok_or_else(|| io::Error::other("wl-copy stdin missing"))?
-        .write_all(contents)?;
-    wait_child(&mut child, Duration::from_secs(5))
+        .ok_or_else(|| io::Error::other("wl-copy stdin missing"))?;
+    set_nonblocking(stdin.as_raw_fd())?;
+    let mut offset = 0_usize;
+    while offset < contents.len() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "clipboard write exceeded its total deadline",
+            ));
+        }
+        match stdin.write(&contents[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "clipboard child closed its input",
+                ));
+            }
+            Ok(written) => offset += written,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if child.child_mut()?.try_wait()?.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "clipboard child exited before accepting input",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    drop(stdin);
+    child.wait_until(deadline)
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> io::Result<&mut Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("utility child was already reaped"))
+    }
+
+    fn disarm(mut self) -> io::Result<Child> {
+        self.child
+            .take()
+            .ok_or_else(|| io::Error::other("utility child was already reaped"))
+    }
+
+    fn wait_until(mut self, deadline: Instant) -> io::Result<()> {
+        loop {
+            let child = self.child_mut()?;
+            if let Some(status) = child.try_wait()? {
+                self.child.take();
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("utility process failed"))
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "utility process exceeded its total deadline",
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            child.stdin.take();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn fixed_child(spec: &CommandSpec) -> io::Result<Command> {
@@ -665,69 +874,92 @@ impl ProductionLogind {
         )
     }
 
-    pub fn execute(self, command: DesktopSessionCommand) -> io::Result<DesktopDomainState> {
+    pub fn execute(self, command: DesktopSessionCommand) -> io::Result<Option<DesktopDomainState>> {
         let deadline = Instant::now() + LOGIND_ACTION_TIMEOUT;
         let connection = dbus::blocking::Connection::new_system().map_err(dbus_error)?;
-        let manager = connection.with_proxy(
-            LOGIN1_DESTINATION,
-            LOGIN1_MANAGER_PATH,
-            remaining(deadline)?,
-        );
-        match command {
-            DesktopSessionCommand::Lock => {
-                let session_id = required_session_id()?;
-                let _: () = manager
-                    .method_call(LOGIN1_MANAGER, "LockSession", (session_id.clone(),))
-                    .map_err(dbus_error)?;
-                let (session_path,): (dbus::Path<'static>,) = manager
-                    .method_call(LOGIN1_MANAGER, "GetSession", (session_id,))
-                    .map_err(dbus_error)?;
-                let session =
-                    connection.with_proxy(LOGIN1_DESTINATION, session_path, remaining(deadline)?);
-                let locked: bool = session
-                    .get(LOGIN1_SESSION, "LockedHint")
-                    .map_err(dbus_error)?;
-                if !locked {
-                    return Err(io::Error::other(
-                        "logind readback did not confirm the session lock",
-                    ));
-                }
-                DesktopDomainState::available(
-                    DesktopDomainId::Lock,
-                    DesktopDomainValue::Lock(LockState { secure: true }),
-                )
+        execute_logind_with(
+            command,
+            || session_locked_hint(&connection, deadline),
+            |command| invoke_logind_action(&connection, command, deadline),
+        )
+    }
+}
+
+fn execute_logind_with(
+    command: DesktopSessionCommand,
+    mut locked_hint: impl FnMut() -> io::Result<bool>,
+    mut invoke: impl FnMut(DesktopSessionCommand) -> io::Result<()>,
+) -> io::Result<Option<DesktopDomainState>> {
+    match command {
+        DesktopSessionCommand::Lock => {
+            invoke(command)?;
+            if !locked_hint()? {
+                return Err(io::Error::other(
+                    "logind readback did not confirm the session lock",
+                ));
             }
-            DesktopSessionCommand::Logout => {
-                let session_id = required_session_id()?;
-                let _: () = manager
-                    .method_call(LOGIN1_MANAGER, "TerminateSession", (session_id,))
-                    .map_err(dbus_error)?;
-                DesktopDomainState::terminal(
-                    DesktopDomainId::Hyprland,
-                    CapabilityAvailability::Unavailable,
-                    "logind confirmed session termination",
-                )
-            }
-            DesktopSessionCommand::Suspend => {
-                let _: () = manager
-                    .method_call(LOGIN1_MANAGER, "Suspend", (true,))
-                    .map_err(dbus_error)?;
-                transition_state("logind accepted interactive suspend")
-            }
-            DesktopSessionCommand::Reboot => {
-                let _: () = manager
-                    .method_call(LOGIN1_MANAGER, "Reboot", (true,))
-                    .map_err(dbus_error)?;
-                transition_state("logind accepted interactive reboot")
-            }
-            DesktopSessionCommand::PowerOff => {
-                let _: () = manager
-                    .method_call(LOGIN1_MANAGER, "PowerOff", (true,))
-                    .map_err(dbus_error)?;
-                transition_state("logind accepted interactive power off")
-            }
+            DesktopDomainState::available(
+                DesktopDomainId::Lock,
+                DesktopDomainValue::Lock(LockState { secure: true }),
+            )
+            .map(Some)
+        }
+        DesktopSessionCommand::Suspend => {
+            validate_session_precondition(command, locked_hint()?)?;
+            invoke(command)?;
+            Ok(None)
+        }
+        DesktopSessionCommand::Logout
+        | DesktopSessionCommand::Reboot
+        | DesktopSessionCommand::PowerOff => {
+            invoke(command)?;
+            Ok(None)
         }
     }
+}
+
+fn invoke_logind_action(
+    connection: &dbus::blocking::Connection,
+    command: DesktopSessionCommand,
+    deadline: Instant,
+) -> io::Result<()> {
+    let manager = connection.with_proxy(
+        LOGIN1_DESTINATION,
+        LOGIN1_MANAGER_PATH,
+        remaining(deadline)?,
+    );
+    match command {
+        DesktopSessionCommand::Lock => {
+            let _: () = manager
+                .method_call(LOGIN1_MANAGER, "LockSession", (required_session_id()?,))
+                .map_err(dbus_error)?;
+        }
+        DesktopSessionCommand::Logout => {
+            let _: () = manager
+                .method_call(
+                    LOGIN1_MANAGER,
+                    "TerminateSession",
+                    (required_session_id()?,),
+                )
+                .map_err(dbus_error)?;
+        }
+        DesktopSessionCommand::Suspend => {
+            let _: () = manager
+                .method_call(LOGIN1_MANAGER, "Suspend", (true,))
+                .map_err(dbus_error)?;
+        }
+        DesktopSessionCommand::Reboot => {
+            let _: () = manager
+                .method_call(LOGIN1_MANAGER, "Reboot", (true,))
+                .map_err(dbus_error)?;
+        }
+        DesktopSessionCommand::PowerOff => {
+            let _: () = manager
+                .method_call(LOGIN1_MANAGER, "PowerOff", (true,))
+                .map_err(dbus_error)?;
+        }
+    }
+    Ok(())
 }
 
 pub struct LogindProducer;
@@ -787,12 +1019,37 @@ impl DesktopProducer for LogindProducer {
     }
 }
 
-fn transition_state(message: &'static str) -> io::Result<DesktopDomainState> {
-    DesktopDomainState::terminal(
-        DesktopDomainId::Power,
-        CapabilityAvailability::Unavailable,
-        message,
-    )
+fn session_locked_hint(
+    connection: &dbus::blocking::Connection,
+    deadline: Instant,
+) -> io::Result<bool> {
+    let manager = connection.with_proxy(
+        LOGIN1_DESTINATION,
+        LOGIN1_MANAGER_PATH,
+        remaining(deadline)?,
+    );
+    let session_id = required_session_id()?;
+    let (session_path,): (dbus::Path<'static>,) = manager
+        .method_call(LOGIN1_MANAGER, "GetSession", (session_id,))
+        .map_err(dbus_error)?;
+    let session = connection.with_proxy(LOGIN1_DESTINATION, session_path, remaining(deadline)?);
+    let locked: bool = session
+        .get(LOGIN1_SESSION, "LockedHint")
+        .map_err(dbus_error)?;
+    Ok(locked)
+}
+
+pub fn validate_session_precondition(
+    command: DesktopSessionCommand,
+    secure_lock: bool,
+) -> io::Result<()> {
+    if command == DesktopSessionCommand::Suspend && !secure_lock {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session.suspend-requires-secure-lock",
+        ));
+    }
+    Ok(())
 }
 
 fn required_session_id() -> io::Result<String> {
@@ -821,4 +1078,119 @@ fn dbus_error(error: dbus::Error) -> io::Error {
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, sync::Mutex};
+
+    use sleepy_sdk::StableId;
+
+    use super::*;
+    use crate::system::{CommandOutput, CommandRunner, RunnerError};
+
+    #[derive(Clone, Default)]
+    struct FixtureRunner {
+        seen: Arc<Mutex<Vec<CommandSpec>>>,
+    }
+
+    impl CommandRunner for FixtureRunner {
+        fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+            self.seen.lock().unwrap().push(command.clone());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn injected_capture_helper_executes_only_the_fixed_authorized_contract() {
+        let runner = FixtureRunner::default();
+        execute_capture_with(
+            &runner,
+            &UtilityCommand::Screenshot {
+                output_id: StableId("output:DP-1".into()),
+            },
+            "/run/user/1000/sleepy/captures/screenshot.png",
+            "00000000-0000-4000-8000-000000000071",
+        )
+        .unwrap();
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].program, "sleepy-capture-helper");
+        assert_eq!(seen[0].args[0], "screenshot");
+        assert!(seen[0]
+            .args
+            .windows(2)
+            .any(|pair| { pair == ["--gesture-token", "00000000-0000-4000-8000-000000000071",] }));
+    }
+
+    #[test]
+    fn injected_game_mode_transport_checks_method_and_backend_status() {
+        let mut invoked = None;
+        execute_game_mode_with(true, |method| {
+            invoked = Some(method.to_owned());
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(invoked.as_deref(), Some("RegisterGame"));
+
+        let error = execute_game_mode_with(false, |method| {
+            assert_eq!(method, "UnregisterGame");
+            Ok(-1)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn injected_logind_policy_confirms_lock_and_gates_suspend_before_action() {
+        let steps = RefCell::new(Vec::new());
+        let locked = execute_logind_with(
+            DesktopSessionCommand::Lock,
+            || {
+                steps.borrow_mut().push("locked-hint");
+                Ok(true)
+            },
+            |command| {
+                steps.borrow_mut().push(match command {
+                    DesktopSessionCommand::Lock => "lock",
+                    _ => "unexpected",
+                });
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(steps.into_inner(), ["lock", "locked-hint"]);
+        assert_eq!(locked.status(), CapabilityAvailability::Available);
+
+        let actions = RefCell::new(Vec::new());
+        let error = execute_logind_with(
+            DesktopSessionCommand::Suspend,
+            || Ok(false),
+            |command| {
+                actions.borrow_mut().push(command);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(actions.into_inner().is_empty());
+
+        let actions = RefCell::new(Vec::new());
+        assert!(execute_logind_with(
+            DesktopSessionCommand::Reboot,
+            || panic!("reboot does not query lock state"),
+            |command| {
+                actions.borrow_mut().push(command);
+                Ok(())
+            },
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(actions.into_inner(), [DesktopSessionCommand::Reboot]);
+    }
 }

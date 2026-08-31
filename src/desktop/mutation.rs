@@ -6,13 +6,13 @@ use async_trait::async_trait;
 use sleepy_sdk::{
     BluetoothCommand, DesktopCommand, DesktopRequest, DesktopSystemCommand, DesktopSystemMutation,
     DisplayCommand, HyprlandCommand, NetworkCommand, NotificationCommand as SdkNotificationCommand,
-    PowerCommand, StableId, SystemMutation,
+    PowerCommand, SystemMutation,
 };
 use tokio::sync::Mutex;
 
 use super::{
     adapters::DailyProducer, DesktopDomainId, DesktopDomainState, DesktopDomainValue,
-    DesktopMutationExecutor, DesktopProducer, ProducerError,
+    DesktopMutationExecutor, DesktopMutationOutcome, DesktopProducer, ProducerError,
 };
 use crate::{
     compositor::{CompositorExecution, HyprlandAdapter},
@@ -64,6 +64,12 @@ impl<B: DailyBackend> ProductionDesktopMutationExecutor<B> {
         )) = command
         {
             self.validate_output(output_id.as_str()).await?;
+            return Ok(vec![DesktopDomainState::terminal(
+                DesktopDomainId::Brightness,
+                sleepy_sdk::CapabilityAvailability::Unsupported,
+                "brightness.output-target-unmapped",
+            )
+            .expect("static diagnostic")]);
         }
         let runner = self.system.runner();
         let command = command.clone();
@@ -75,6 +81,8 @@ impl<B: DailyBackend> ProductionDesktopMutationExecutor<B> {
     }
 
     async fn validate_output(&self, output_id: &str) -> Result<(), ProducerError> {
+        let output_name = super::display::output_name(output_id)
+            .map_err(|error| ProducerError::new(error.to_string()))?;
         let adapter = self
             .hyprland
             .as_ref()
@@ -86,7 +94,7 @@ impl<B: DailyBackend> ProductionDesktopMutationExecutor<B> {
         if snapshot
             .monitors
             .iter()
-            .any(|monitor| monitor.id == output_id)
+            .any(|monitor| monitor.id == output_name)
         {
             Ok(())
         } else {
@@ -208,8 +216,8 @@ impl<B: DailyBackend> DesktopMutationExecutor for ProductionDesktopMutationExecu
     async fn execute(
         &self,
         request: &DesktopRequest,
-    ) -> Result<Vec<DesktopDomainState>, ProducerError> {
-        match &request.command {
+    ) -> Result<DesktopMutationOutcome, ProducerError> {
+        let readbacks = match &request.command {
             DesktopCommand::System(command) => {
                 self.execute_system(request.expected_generation, command)
                     .await
@@ -228,7 +236,10 @@ impl<B: DailyBackend> DesktopMutationExecutor for ProductionDesktopMutationExecu
                         ProducerError::new(format!("logind action worker failed: {error}"))
                     })?
                     .map_err(|error| ProducerError::new(error.to_string()))?;
-                Ok(vec![state])
+                match state {
+                    Some(state) => Ok(vec![state]),
+                    None => return Ok(DesktopMutationOutcome::Acknowledged),
+                }
             }
             DesktopCommand::Appearance(command) => {
                 let snapshot = self
@@ -253,17 +264,36 @@ impl<B: DailyBackend> DesktopMutationExecutor for ProductionDesktopMutationExecu
                 }
                 let service = Arc::clone(&self.utilities);
                 let command = command.clone();
-                let state = tokio::task::spawn_blocking(move || service.execute(&command))
-                    .await
-                    .map_err(|error| {
-                        ProducerError::new(format!("utility action worker failed: {error}"))
-                    })?
-                    .map_err(|error| ProducerError::new(error.to_string()))?;
+                let gesture_token = request.request_id.clone();
+                let state =
+                    tokio::task::spawn_blocking(move || service.execute(&command, &gesture_token))
+                        .await
+                        .map_err(|error| {
+                            ProducerError::new(format!("utility action worker failed: {error}"))
+                        })?
+                        .map_err(|error| ProducerError::new(error.to_string()))?;
                 // One-shot utilities (screenshot/color pick) have no result payload in the
                 // v3 SDK. Their bounded process exit is the confirmation; the returned state
                 // is still published even when an independent utility in that domain is absent.
                 Ok(vec![state])
             }
+        }?;
+        if readbacks.is_empty() {
+            return Ok(DesktopMutationOutcome::TerminalFailure {
+                readbacks,
+                diagnostic_code: "mutation.readback-missing".into(),
+            });
+        }
+        if readbacks
+            .iter()
+            .all(|state| state.status() == sleepy_sdk::CapabilityAvailability::Available)
+        {
+            Ok(DesktopMutationOutcome::Confirmed(readbacks))
+        } else {
+            Ok(DesktopMutationOutcome::TerminalFailure {
+                readbacks,
+                diagnostic_code: "mutation.readback-terminal".into(),
+            })
         }
     }
 }
@@ -291,9 +321,16 @@ fn execute_system_command(
                 DesktopDomainId::Media,
                 DesktopDomainValue::Media(super::media::mutate(&runner, &command)?),
             ),
-            DesktopSystemMutation::Display(command) => (
-                DesktopDomainId::Display,
-                DesktopDomainValue::Display(super::display::mutate(&runner, &command)?),
+            DesktopSystemMutation::Display(DisplayCommand::SetBrightness { output_id, level }) => {
+                super::display::brightness_spec_for_output(output_id.as_str(), level)?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "brightness.output-target-unmapped",
+                ));
+            }
+            DesktopSystemMutation::Display(DisplayCommand::SetNightLightEnabled { enabled }) => (
+                DesktopDomainId::NightLight,
+                DesktopDomainValue::NightLight(super::display::mutate_night_light(enabled)?),
             ),
             DesktopSystemMutation::Power(PowerCommand::SetProfile { profile }) => (
                 DesktopDomainId::Power,
@@ -324,21 +361,12 @@ fn execute_system_command(
                 DesktopDomainValue::Audio(super::audio::mutate_legacy(&runner, &mutation)?),
             ),
             SystemMutation::DisplayBrightness(level) => (
-                DesktopDomainId::Display,
-                DesktopDomainValue::Display(super::display::mutate(
-                    &runner,
-                    &DisplayCommand::SetBrightness {
-                        output_id: StableId("legacy-global".to_owned()),
-                        level,
-                    },
-                )?),
+                DesktopDomainId::Brightness,
+                DesktopDomainValue::Brightness(super::display::mutate_brightness(&runner, level)?),
             ),
             SystemMutation::DisplayNightLightEnabled(enabled) => (
-                DesktopDomainId::Display,
-                DesktopDomainValue::Display(super::display::mutate(
-                    &runner,
-                    &DisplayCommand::SetNightLightEnabled { enabled },
-                )?),
+                DesktopDomainId::NightLight,
+                DesktopDomainValue::NightLight(super::display::mutate_night_light(enabled)?),
             ),
             SystemMutation::PowerProfile(profile) => (
                 DesktopDomainId::Power,
