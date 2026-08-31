@@ -1,4 +1,4 @@
-use std::{env, io, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{env, ffi::OsStr, io, path::PathBuf, process::ExitCode, sync::Arc};
 
 use sleepy_sdk::{EventCause, EventCauseKind, ProviderEvent, SessionEvent};
 use sleepy_session::compositor::HyprlandAdapter;
@@ -27,19 +27,34 @@ use sleepy_session::sessiond::{
     MutationPipeline, ProductionMutationBackend, ProductionSources, SessionSocket,
     ShutdownCoordinator,
 };
-use sleepy_session::system::{ProcessCommandRunner, SystemFacade};
+use sleepy_session::system::{run_command_supervisor, ProcessCommandRunner, SystemFacade};
 use sleepy_session::{theme::ThemeManager, theme_socket::ThemeSocket};
 use tokio_util::sync::CancellationToken;
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
+fn main() -> ExitCode {
+    if is_internal_command_supervisor() {
+        return match run_command_supervisor() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::from(1),
+        };
+    }
+
+    let result = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .and_then(|runtime| runtime.block_on(run()));
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("sleepy-sessiond: {error}");
             ExitCode::from(1)
         }
     }
+}
+
+fn is_internal_command_supervisor() -> bool {
+    env::args_os().nth(1).as_deref() == Some(OsStr::new("--sleepy-internal-command-supervisor"))
+        && env::var_os("SLEEPY_INTERNAL_COMMAND_SUPERVISOR").as_deref() == Some(OsStr::new("1"))
 }
 
 async fn run() -> io::Result<()> {

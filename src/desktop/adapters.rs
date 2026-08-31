@@ -11,8 +11,8 @@ use sleepy_sdk::{
 use tokio::sync::{mpsc, Mutex};
 
 use super::{
-    DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue, DesktopProducer,
-    DesktopProducerContext, ProducerError,
+    join_error, DesktopDomainId, DesktopDomainState, DesktopDomainUpdate, DesktopDomainValue,
+    DesktopProducer, DesktopProducerContext, ProducerError,
 };
 use crate::{
     compositor::{CompositorError, CompositorErrorKind, HyprlandAdapter, HyprlandEvent},
@@ -271,19 +271,20 @@ impl<B: DailyBackend> DailyProducer<B> {
         })
     }
 
-    async fn snapshot(&self, context: Option<&DesktopProducerContext>) -> DesktopDomainState {
+    async fn snapshot_value(
+        &self,
+        context: Option<&DesktopProducerContext>,
+    ) -> io::Result<DesktopDomainValue> {
         if self.domain == DesktopDomainId::Weather && self.weather_location.is_none() {
-            return DesktopDomainState::terminal(
-                self.domain,
-                CapabilityAvailability::Unavailable,
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
                 "weather location is not configured",
-            )
-            .expect("static diagnostic");
+            ));
         }
         let domain = self.domain;
         let backend = Arc::clone(&self.backend);
         let location = self.weather_location.clone();
-        let result = match context {
+        match context {
             Some(context) => {
                 context
                     .spawn_blocking(
@@ -303,12 +304,16 @@ impl<B: DailyBackend> DailyProducer<B> {
                 })
                 .await
             }
-        };
-        match result {
-            Ok(Ok(value)) => DesktopDomainState::available(domain, value)
+        }
+        .map_err(join_error)?
+    }
+
+    async fn snapshot(&self, context: Option<&DesktopProducerContext>) -> DesktopDomainState {
+        let domain = self.domain;
+        match self.snapshot_value(context).await {
+            Ok(value) => DesktopDomainState::available(domain, value)
                 .unwrap_or_else(|error| terminal(domain, CapabilityAvailability::Parse, error)),
-            Ok(Err(error)) => terminal(domain, availability_for_io(&error), error),
-            Err(error) => terminal(domain, CapabilityAvailability::Error, error),
+            Err(error) => terminal(domain, availability_for_io(&error), error),
         }
     }
 }
@@ -424,7 +429,15 @@ impl<B: DailyBackend> PollingState for DailyProducer<B> {
         &self,
         context: &DesktopProducerContext,
     ) -> Option<DesktopDomainState> {
-        Some(self.snapshot(Some(context)).await)
+        match self.snapshot_value(Some(context)).await {
+            Ok(value) => Some(
+                DesktopDomainState::available(self.domain, value).unwrap_or_else(|error| {
+                    terminal(self.domain, CapabilityAvailability::Parse, error)
+                }),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+            Err(error) => Some(terminal(self.domain, availability_for_io(&error), error)),
+        }
     }
 }
 

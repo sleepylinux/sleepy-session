@@ -12,6 +12,7 @@ use std::{
 use fs2::FileExt;
 
 use crate::store::{SecureDir, StoreError};
+use crate::system::{RunCommitGuard, RunControl};
 
 pub struct GenerationAllocator {
     directory: SecureDir,
@@ -79,9 +80,26 @@ impl GenerationAllocator {
     ) -> io::Result<u64> {
         ensure_not_cancelled(&cancelled)?;
         if self.next == self.end {
-            self.reserve_block_while(&cancelled)?;
+            self.reserve_block_with(&cancelled, || Ok(None))?;
+        } else {
+            ensure_not_cancelled(&cancelled)?;
         }
+        let generation = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("generation exhausted"))?;
+        Ok(generation)
+    }
+
+    pub(crate) fn next_generation_controlled(&mut self, control: &RunControl) -> io::Result<u64> {
+        let cancelled = || control.is_cancelled() || control.remaining().is_zero();
         ensure_not_cancelled(&cancelled)?;
+        if self.next == self.end {
+            self.reserve_block_with(&cancelled, || control.begin_commit())?;
+        } else {
+            ensure_not_cancelled(&cancelled)?;
+        }
         let generation = self.next;
         self.next = self
             .next
@@ -103,10 +121,14 @@ impl GenerationAllocator {
     }
 
     fn reserve_block(&mut self) -> io::Result<()> {
-        self.reserve_block_while(&|| false)
+        self.reserve_block_with(&|| false, || Ok(None))
     }
 
-    fn reserve_block_while(&mut self, cancelled: &impl Fn() -> bool) -> io::Result<()> {
+    fn reserve_block_with(
+        &mut self,
+        cancelled: &impl Fn() -> bool,
+        mut begin_commit: impl FnMut() -> io::Result<Option<RunCommitGuard>>,
+    ) -> io::Result<()> {
         let lock = self
             .directory
             .open_lock(&self.lock_name)
@@ -132,17 +154,18 @@ impl GenerationAllocator {
             .checked_add(self.block_size)
             .ok_or_else(|| io::Error::other("generation range exhausted"))?;
         ensure_not_cancelled(cancelled)?;
-        atomic_write_while(
+        let commit_guard = atomic_write_while(
             &self.directory,
             &self.state_name,
             format!("{end}\n").as_bytes(),
             cancelled,
+            &mut begin_commit,
         )?;
-        ensure_not_cancelled(cancelled)?;
-        FileExt::unlock(&lock)?;
 
         self.next = start;
         self.end = end;
+        FileExt::unlock(&lock)?;
+        drop(commit_guard);
         Ok(())
     }
 }
@@ -201,17 +224,25 @@ fn atomic_write_while(
     name: &OsStr,
     bytes: &[u8],
     cancelled: &impl Fn() -> bool,
-) -> io::Result<()> {
+    begin_commit: &mut impl FnMut() -> io::Result<Option<RunCommitGuard>>,
+) -> io::Result<Option<RunCommitGuard>> {
+    let mut commit_started = false;
+    let mut commit_guard = None;
     directory
         .atomic_replace(
             name,
             bytes,
-            || ensure_not_cancelled(cancelled).map_err(StoreError::io),
-            || ensure_not_cancelled(cancelled).map_err(StoreError::io),
-            || ensure_not_cancelled(cancelled).map_err(StoreError::io),
+            || {
+                ensure_not_cancelled(cancelled).map_err(StoreError::io)?;
+                commit_guard = begin_commit().map_err(StoreError::io)?;
+                commit_started = true;
+                Ok(())
+            },
+            || Ok(()),
+            || Ok(()),
         )
         .map_err(|error| {
-            if cancelled() {
+            if !commit_started && cancelled() {
                 io::Error::new(
                     io::ErrorKind::Interrupted,
                     "generation allocation was cancelled",
@@ -219,7 +250,8 @@ fn atomic_write_while(
             } else {
                 store_error(error)
             }
-        })
+        })?;
+    Ok(commit_guard)
 }
 
 fn store_error(error: StoreError) -> io::Error {
@@ -254,5 +286,47 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"2\n");
         assert_eq!(allocator.next_generation().unwrap(), 2);
         assert_eq!(std::fs::read(&path).unwrap(), b"3\n");
+    }
+
+    #[test]
+    fn controlled_reservation_commit_wins_after_irreversible_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("generation");
+        let mut allocator = GenerationAllocator::open(&path, 1).unwrap();
+        assert_eq!(allocator.next_generation().unwrap(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"2\n");
+        let checks = AtomicUsize::new(0);
+
+        assert_eq!(
+            allocator
+                .next_generation_while(|| checks.fetch_add(1, Ordering::SeqCst) >= 5)
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"3\n");
+        assert_eq!(allocator.next_generation().unwrap(), 3);
+        assert_eq!(std::fs::read(&path).unwrap(), b"4\n");
+    }
+
+    #[test]
+    fn controlled_reservation_commit_wins_through_directory_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("generation");
+        let mut allocator = GenerationAllocator::open(&path, 1).unwrap();
+        assert_eq!(allocator.next_generation().unwrap(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), b"2\n");
+        let checks = AtomicUsize::new(0);
+
+        assert_eq!(
+            allocator
+                .next_generation_while(|| checks.fetch_add(1, Ordering::SeqCst) >= 6)
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"3\n");
+        assert_eq!(allocator.next_generation().unwrap(), 3);
+        assert_eq!(std::fs::read(&path).unwrap(), b"4\n");
     }
 }

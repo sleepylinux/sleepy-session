@@ -1,18 +1,26 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fmt, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
-    process::{Command, Stdio},
+    path::PathBuf,
+    process::{ChildStdin, ChildStdout, Command, Stdio},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex as StdMutex,
     },
     thread,
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
+
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const SUPERVISOR_ARG: &str = "--sleepy-internal-command-supervisor";
+const SUPERVISOR_ENV: &str = "SLEEPY_INTERNAL_COMMAND_SUPERVISOR";
+const SUPERVISOR_MAGIC: &[u8; 8] = b"SLPCMD1\0";
+const SUPERVISOR_REQUEST_LIMIT: usize = 1024 * 1024;
+const SUPERVISOR_RESULT_HEADER: usize = 8 + 1 + 4 + 4 + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -127,7 +135,8 @@ pub struct RunControl {
     deadline: Instant,
     generation: Option<u64>,
     latest_generation: Option<Arc<AtomicU64>>,
-    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    cancelled: Option<Arc<AtomicBool>>,
+    cancellation: Option<RunCancellation>,
 }
 
 impl RunControl {
@@ -141,6 +150,7 @@ impl RunControl {
             generation: Some(generation),
             latest_generation: Some(latest_generation),
             cancelled: None,
+            cancellation: None,
         }
     }
 
@@ -150,15 +160,27 @@ impl RunControl {
             generation: None,
             latest_generation: None,
             cancelled: None,
+            cancellation: None,
         }
     }
 
-    pub fn for_request(deadline: Instant, cancelled: Arc<std::sync::atomic::AtomicBool>) -> Self {
+    pub fn for_request(deadline: Instant, cancelled: Arc<AtomicBool>) -> Self {
         Self {
             deadline,
             generation: None,
             latest_generation: None,
             cancelled: Some(cancelled),
+            cancellation: None,
+        }
+    }
+
+    pub(crate) fn for_cancellation(deadline: Instant, cancellation: RunCancellation) -> Self {
+        Self {
+            deadline,
+            generation: None,
+            latest_generation: None,
+            cancelled: None,
+            cancellation: Some(cancellation),
         }
     }
 
@@ -167,6 +189,10 @@ impl RunControl {
             .as_ref()
             .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
             || self
+                .cancellation
+                .as_ref()
+                .is_some_and(RunCancellation::is_cancelled)
+            || self
                 .generation
                 .zip(self.latest_generation.as_ref())
                 .is_some_and(|(generation, latest)| generation < latest.load(Ordering::SeqCst))
@@ -174,6 +200,122 @@ impl RunControl {
 
     pub fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub(crate) fn begin_commit(&self) -> io::Result<Option<RunCommitGuard>> {
+        if self.remaining().is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "operation exceeded its deadline before commit",
+            ));
+        }
+        match &self.cancellation {
+            Some(cancellation) => cancellation.begin_commit().map(Some),
+            None if self.is_cancelled() => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "operation was cancelled before commit",
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RunCancellation {
+    inner: Arc<RunCancellationInner>,
+}
+
+struct RunCancellationInner {
+    observable: AtomicBool,
+    state: StdMutex<RunCancellationState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct RunCancellationState {
+    requested: bool,
+    cancelled: bool,
+    commits: usize,
+}
+
+pub(crate) struct RunCommitGuard {
+    cancellation: RunCancellation,
+}
+
+impl Default for RunCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RunCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(RunCancellationInner {
+                observable: AtomicBool::new(false),
+                state: StdMutex::new(RunCancellationState::default()),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.requested = true;
+        while state.commits != 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        state.cancelled = true;
+        self.inner.observable.store(true, Ordering::SeqCst);
+        self.inner.changed.notify_all();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.observable.load(Ordering::SeqCst)
+    }
+
+    fn begin_commit(&self) -> io::Result<RunCommitGuard> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state.requested || state.cancelled {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "operation was cancelled before commit",
+            ));
+        }
+        state.commits = state
+            .commits
+            .checked_add(1)
+            .expect("commit guard count overflow");
+        Ok(RunCommitGuard {
+            cancellation: self.clone(),
+        })
+    }
+}
+
+impl Drop for RunCommitGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .cancellation
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.commits = state.commits.saturating_sub(1);
+        if state.commits == 0 {
+            self.cancellation.inner.changed.notify_all();
+        }
     }
 }
 
@@ -212,254 +354,352 @@ impl ProcessCommandRunner {
         if control.is_cancelled() {
             return Err(RunnerError::cancelled());
         }
-        let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        for (key, value) in &spec.env {
-            command.env(key, value);
+        let effective_timeout = spec.timeout.min(control.remaining());
+        if effective_timeout.is_zero() {
+            return Err(RunnerError::timeout(
+                "adapter command exceeded its deadline",
+            ));
         }
-        ensure_process_subreaper()?;
         let started = Instant::now();
-        let mut child = command.spawn().map_err(|error| {
+        let request = SupervisorRequest::new(spec, effective_timeout);
+        let supervisor_path = command_supervisor_path()?;
+        let mut supervisor = Command::new(supervisor_path);
+        supervisor
+            .arg(SUPERVISOR_ARG)
+            .env(SUPERVISOR_ENV, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = supervisor.spawn().map_err(|error| {
             RunnerError::new(
                 RunnerErrorKind::Spawn,
-                format!("adapter executable is unavailable: {error}"),
+                format!("adapter command supervisor is unavailable: {error}"),
             )
         })?;
-        let process_group = child.id() as libc::pid_t;
-        let mut process_tree = OwnedProcessTree::new(process_group);
-        if let Err(error) = process_tree.refresh() {
-            terminate_process_boundary(&mut child, process_group, &mut process_tree);
-            return Err(process_ownership_error(error));
+        let mut supervisor_stdin = Some(child.stdin.take().expect("piped supervisor stdin"));
+        if let Err(error) = write_supervisor_request(
+            supervisor_stdin
+                .as_mut()
+                .expect("supervisor stdin is present before request"),
+            &request,
+        ) {
+            supervisor_stdin.take();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut stderr = child.stderr.take().expect("piped stderr");
-        if let Err(error) = set_nonblocking(stdout.as_raw_fd()) {
-            terminate_process_boundary(&mut child, process_group, &mut process_tree);
-            return Err(output_error(error));
+        let mut supervisor_stdout = child.stdout.take().expect("piped supervisor stdout");
+        if let Err(error) = set_nonblocking(supervisor_stdout.as_raw_fd()).map_err(output_error) {
+            supervisor_stdin.take();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
-        if let Err(error) = set_nonblocking(stderr.as_raw_fd()) {
-            terminate_process_boundary(&mut child, process_group, &mut process_tree);
-            return Err(output_error(error));
+        let response = wait_for_supervisor(
+            &mut child,
+            &mut supervisor_stdin,
+            &mut supervisor_stdout,
+            control,
+            spec.max_output_bytes,
+        )?;
+        Ok((response.into_output()?, started))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SupervisorRequest {
+    program: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    timeout_millis: u64,
+    max_output_bytes: usize,
+}
+
+impl SupervisorRequest {
+    fn new(spec: &CommandSpec, timeout: Duration) -> Self {
+        Self {
+            program: spec.program.clone(),
+            args: spec.args.clone(),
+            env: spec.env.clone(),
+            timeout_millis: u64::try_from(timeout.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+            max_output_bytes: spec.max_output_bytes,
         }
-        let mut stdout_capture = OutputCapture::new(spec.max_output_bytes);
-        let mut stderr_capture = OutputCapture::new(spec.max_output_bytes);
-        let status = loop {
-            if let Err(error) = process_tree.refresh() {
-                terminate_process_boundary(&mut child, process_group, &mut process_tree);
-                return Err(process_ownership_error(error));
-            }
-            if let Err(error) = stdout_capture.read_available(&mut stdout) {
-                terminate_process_boundary(&mut child, process_group, &mut process_tree);
-                return Err(error);
-            }
-            if let Err(error) = stderr_capture.read_available(&mut stderr) {
-                terminate_process_boundary(&mut child, process_group, &mut process_tree);
-                return Err(error);
-            }
-            if control.is_cancelled() {
-                terminate_process_boundary(&mut child, process_group, &mut process_tree);
-                drain_closed_boundary(
-                    &mut stdout,
-                    &mut stderr,
-                    &mut stdout_capture,
-                    &mut stderr_capture,
-                );
-                return Err(RunnerError::cancelled());
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let _ = process_tree.refresh();
-                    kill_process_group(process_group);
-                    process_tree.kill_all();
-                    reap_process_group(process_group);
-                    process_tree.reap_all();
-                    drain_closed_boundary(
-                        &mut stdout,
-                        &mut stderr,
-                        &mut stdout_capture,
-                        &mut stderr_capture,
-                    );
-                    break status;
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_millis)
+    }
+}
+
+struct SupervisorResponse {
+    tag: u8,
+    status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl SupervisorResponse {
+    fn exited(status: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        Self {
+            tag: 0,
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn timeout() -> Self {
+        Self::error(1)
+    }
+
+    fn cancelled() -> Self {
+        Self::error(2)
+    }
+
+    fn spawn() -> Self {
+        Self::error(3)
+    }
+
+    fn io() -> Self {
+        Self::error(4)
+    }
+
+    fn error(tag: u8) -> Self {
+        Self {
+            tag,
+            status: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn into_output(self) -> Result<CommandOutput, RunnerError> {
+        match self.tag {
+            0 => Ok(CommandOutput {
+                status: self.status,
+                stdout: self.stdout,
+                stderr: self.stderr,
+            }),
+            1 => Err(RunnerError::timeout(
+                "adapter command exceeded its deadline",
+            )),
+            2 => Err(RunnerError::cancelled()),
+            3 => Err(RunnerError::spawn("adapter executable is unavailable")),
+            _ => Err(RunnerError::new(
+                RunnerErrorKind::Io,
+                "adapter command supervisor failed",
+            )),
+        }
+    }
+}
+
+fn command_supervisor_path() -> Result<PathBuf, RunnerError> {
+    let current = std::env::current_exe().map_err(|error| {
+        RunnerError::new(
+            RunnerErrorKind::Io,
+            format!("could not locate current executable: {error}"),
+        )
+    })?;
+    if current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "sleepy-sessiond")
+    {
+        return Ok(current);
+    }
+    if let Some(directory) = current.parent() {
+        if directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "deps")
+        {
+            if let Some(debug_dir) = directory.parent() {
+                let candidate = debug_dir.join("sleepy-sessiond");
+                if candidate.exists() {
+                    return Ok(candidate);
                 }
-                Ok(None) if started.elapsed() < spec.timeout && !control.remaining().is_zero() => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Ok(None) => {
-                    terminate_process_boundary(&mut child, process_group, &mut process_tree);
-                    drain_closed_boundary(
-                        &mut stdout,
-                        &mut stderr,
-                        &mut stdout_capture,
-                        &mut stderr_capture,
-                    );
-                    return Err(RunnerError::timeout(
-                        "adapter command exceeded its deadline",
-                    ));
-                }
-                Err(error) => {
-                    terminate_process_boundary(&mut child, process_group, &mut process_tree);
-                    drain_closed_boundary(
-                        &mut stdout,
-                        &mut stderr,
-                        &mut stdout_capture,
-                        &mut stderr_capture,
-                    );
+            }
+        }
+        let candidate = directory.join("sleepy-sessiond");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(RunnerError::spawn(
+        "adapter command supervisor executable is unavailable",
+    ))
+}
+
+fn write_supervisor_request(
+    stdin: &mut ChildStdin,
+    request: &SupervisorRequest,
+) -> Result<(), RunnerError> {
+    let bytes = serde_json::to_vec(request).map_err(|_| {
+        RunnerError::new(
+            RunnerErrorKind::Io,
+            "could not encode adapter command supervisor request",
+        )
+    })?;
+    let length = u32::try_from(bytes.len()).map_err(|_| {
+        RunnerError::new(
+            RunnerErrorKind::Io,
+            "adapter command supervisor request exceeded its bounded limit",
+        )
+    })?;
+    stdin
+        .write_all(&length.to_le_bytes())
+        .and_then(|()| stdin.write_all(&bytes))
+        .and_then(|()| stdin.flush())
+        .map_err(|error| {
+            RunnerError::new(
+                RunnerErrorKind::Io,
+                format!("could not send adapter command supervisor request: {error}"),
+            )
+        })
+}
+
+fn supervisor_response_limit(max_output_bytes: usize) -> usize {
+    SUPERVISOR_RESULT_HEADER.saturating_add(max_output_bytes.saturating_mul(2))
+}
+
+fn read_supervisor_response_bytes(
+    stdout: &mut ChildStdout,
+    response: &mut Vec<u8>,
+    limit: usize,
+) -> Result<bool, RunnerError> {
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match stdout.read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                if response.len().saturating_add(count) > limit {
                     return Err(RunnerError::new(
                         RunnerErrorKind::Io,
-                        format!("could not wait for adapter command: {error}"),
+                        "adapter command supervisor response exceeded its bounded limit",
                     ));
                 }
+                response.extend_from_slice(&chunk[..count]);
             }
-        };
-        let stdout = stdout_capture.finish()?;
-        let stderr = stderr_capture.finish()?;
-        Ok((
-            CommandOutput {
-                status: status.code().unwrap_or(128),
-                stdout,
-                stderr,
-            },
-            started,
-        ))
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(output_error(error)),
+        }
     }
 }
 
-struct OwnedProcessTree {
-    root: libc::pid_t,
-    descendants: BTreeMap<libc::pid_t, u64>,
+fn drain_supervisor_response(
+    stdout: &mut ChildStdout,
+    response: &mut Vec<u8>,
+    limit: usize,
+) -> Result<(), RunnerError> {
+    while !read_supervisor_response_bytes(stdout, response, limit)? {
+        thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
 }
 
-impl OwnedProcessTree {
-    fn new(root: libc::pid_t) -> Self {
-        Self {
-            root,
-            descendants: BTreeMap::new(),
-        }
+fn parse_supervisor_response(bytes: &[u8]) -> Result<SupervisorResponse, RunnerError> {
+    if bytes.len() < SUPERVISOR_RESULT_HEADER || &bytes[..8] != SUPERVISOR_MAGIC {
+        return Err(RunnerError::new(
+            RunnerErrorKind::Io,
+            "adapter command supervisor response was malformed",
+        ));
     }
-
-    fn refresh(&mut self) -> io::Result<()> {
-        self.descendants
-            .retain(|pid, start| process_start_time(*pid).ok().flatten() == Some(*start));
-        let mut pending = Vec::with_capacity(self.descendants.len() + 1);
-        pending.push(self.root);
-        pending.extend(self.descendants.keys().copied());
-        let mut visited = BTreeSet::new();
-        while let Some(parent) = pending.pop() {
-            if !visited.insert(parent) {
-                continue;
-            }
-            for child in process_children(parent)? {
-                if child <= 0 || child == self.root {
-                    continue;
-                }
-                let Some(start_time) = process_start_time(child)? else {
-                    continue;
-                };
-                match self.descendants.get(&child) {
-                    Some(existing) if *existing != start_time => continue,
-                    Some(_) => {}
-                    None => {
-                        self.descendants.insert(child, start_time);
-                    }
-                }
-                pending.push(child);
-            }
-        }
-        Ok(())
+    let tag = bytes[8];
+    let status = i32::from_le_bytes(bytes[9..13].try_into().expect("status bytes"));
+    let stdout_len =
+        u32::from_le_bytes(bytes[13..17].try_into().expect("stdout length bytes")) as usize;
+    let stderr_len =
+        u32::from_le_bytes(bytes[17..21].try_into().expect("stderr length bytes")) as usize;
+    let expected = SUPERVISOR_RESULT_HEADER
+        .saturating_add(stdout_len)
+        .saturating_add(stderr_len);
+    if bytes.len() != expected {
+        return Err(RunnerError::new(
+            RunnerErrorKind::Io,
+            "adapter command supervisor response size was invalid",
+        ));
     }
+    let stdout_start = SUPERVISOR_RESULT_HEADER;
+    let stderr_start = stdout_start + stdout_len;
+    Ok(SupervisorResponse {
+        tag,
+        status,
+        stdout: bytes[stdout_start..stderr_start].to_vec(),
+        stderr: bytes[stderr_start..].to_vec(),
+    })
+}
 
-    fn kill_all(&self) {
-        for (&pid, &start_time) in &self.descendants {
-            if process_start_time(pid).ok().flatten() == Some(start_time) {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
+fn wait_for_supervisor(
+    child: &mut std::process::Child,
+    supervisor_stdin: &mut Option<ChildStdin>,
+    supervisor_stdout: &mut ChildStdout,
+    control: &RunControl,
+    max_output_bytes: usize,
+) -> Result<SupervisorResponse, RunnerError> {
+    let mut response = Vec::new();
+    let response_limit = supervisor_response_limit(max_output_bytes);
+    loop {
+        read_supervisor_response_bytes(supervisor_stdout, &mut response, response_limit)?;
+        if control.is_cancelled() {
+            supervisor_stdin.take();
         }
-    }
-
-    fn reap_all(&mut self) {
-        let deadline = Instant::now() + Duration::from_millis(50);
-        while !self.descendants.is_empty() && Instant::now() < deadline {
-            self.kill_all();
-            self.descendants.retain(|pid, start_time| {
-                if process_start_time(*pid).ok().flatten() != Some(*start_time) {
-                    return false;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                supervisor_stdin.take();
+                drain_supervisor_response(supervisor_stdout, &mut response, response_limit)?;
+                if !status.success() {
+                    return Err(RunnerError::new(
+                        RunnerErrorKind::Io,
+                        "adapter command supervisor exited before reporting",
+                    ));
                 }
-                let mut status = 0;
-                let waited = unsafe { libc::waitpid(*pid, &mut status, libc::WNOHANG) };
-                if waited == *pid {
-                    return false;
-                }
-                process_start_time(*pid).ok().flatten() == Some(*start_time)
-            });
-            if !self.descendants.is_empty() {
-                thread::sleep(Duration::from_millis(1));
+                return parse_supervisor_response(&response);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => {
+                supervisor_stdin.take();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunnerError::new(
+                    RunnerErrorKind::Io,
+                    format!("could not wait for adapter command supervisor: {error}"),
+                ));
             }
         }
     }
 }
 
 fn process_children(pid: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
-    let path = format!("/proc/{pid}/task/{pid}/children");
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
+    let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    contents
-        .split_ascii_whitespace()
-        .map(|value| {
-            value
-                .parse::<libc::pid_t>()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid child PID"))
-        })
-        .collect()
-}
-
-fn process_start_time(pid: libc::pid_t) -> io::Result<Option<u64>> {
-    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let fields = stat
-        .rsplit_once(") ")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat is malformed"))?
-        .1;
-    let start_time = fields
-        .split_ascii_whitespace()
-        .nth(19)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "process stat is incomplete"))?
-        .parse::<u64>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "process start time is invalid"))?;
-    Ok(Some(start_time))
-}
-
-fn process_ownership_error(error: io::Error) -> RunnerError {
-    RunnerError::new(
-        RunnerErrorKind::Io,
-        format!("could not track adapter descendants: {error}"),
-    )
-}
-
-fn terminate_process_boundary(
-    child: &mut std::process::Child,
-    process_group: libc::pid_t,
-    process_tree: &mut OwnedProcessTree,
-) {
-    let _ = process_tree.refresh();
-    kill_process_group(process_group);
-    process_tree.kill_all();
-    let _ = child.kill();
-    let _ = child.wait();
-    reap_process_group(process_group);
-    process_tree.reap_all();
+    let mut children = BTreeSet::new();
+    for task in tasks {
+        let task = task?;
+        let thread = task
+            .file_name()
+            .to_string_lossy()
+            .parse::<libc::pid_t>()
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid thread PID"))?;
+        let contents = match fs::read_to_string(format!("/proc/{pid}/task/{thread}/children")) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for value in contents.split_ascii_whitespace() {
+            children.insert(
+                value
+                    .parse::<libc::pid_t>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid child PID"))?,
+            );
+        }
+    }
+    Ok(children.into_iter().collect())
 }
 
 fn kill_process_group(process_group: libc::pid_t) {
@@ -467,36 +707,6 @@ fn kill_process_group(process_group: libc::pid_t) {
         unsafe {
             libc::kill(-process_group, libc::SIGKILL);
         }
-    }
-}
-
-fn ensure_process_subreaper() -> Result<(), RunnerError> {
-    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
-        Ok(())
-    } else {
-        Err(RunnerError::new(
-            RunnerErrorKind::Io,
-            format!(
-                "could not establish the adapter process boundary: {}",
-                io::Error::last_os_error()
-            ),
-        ))
-    }
-}
-
-fn reap_process_group(process_group: libc::pid_t) {
-    let deadline = Instant::now() + Duration::from_millis(50);
-    loop {
-        let mut status = 0;
-        let reaped = unsafe { libc::waitpid(-process_group, &mut status, libc::WNOHANG) };
-        if reaped > 0 {
-            continue;
-        }
-        let group_exists = unsafe { libc::kill(-process_group, 0) } == 0;
-        if !group_exists || Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -514,6 +724,231 @@ fn drain_closed_boundary(
             return;
         }
         thread::sleep(Duration::from_millis(1));
+    }
+}
+
+pub fn run_command_supervisor() -> io::Result<()> {
+    let mut stdin = io::stdin();
+    let request = read_supervisor_request(&mut stdin)?;
+    set_nonblocking(stdin.as_raw_fd())?;
+    let response = supervise_command(request, &mut stdin);
+    let mut stdout = io::stdout();
+    write_supervisor_response(&mut stdout, &response)?;
+    stdout.flush()
+}
+
+fn read_supervisor_request(stdin: &mut impl Read) -> io::Result<SupervisorRequest> {
+    let mut length = [0_u8; 4];
+    stdin.read_exact(&mut length)?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > SUPERVISOR_REQUEST_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "command supervisor request exceeded its bounded limit",
+        ));
+    }
+    let mut bytes = vec![0_u8; length];
+    stdin.read_exact(&mut bytes)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn supervise_command(request: SupervisorRequest, parent: &mut impl Read) -> SupervisorResponse {
+    if ensure_supervisor_subreaper().is_err() {
+        return SupervisorResponse::io();
+    }
+    let mut command = Command::new(&request.program);
+    command
+        .args(&request.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove(SUPERVISOR_ENV)
+        .process_group(0);
+    for (key, value) in &request.env {
+        command.env(key, value);
+    }
+    let started = Instant::now();
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return SupervisorResponse::spawn(),
+    };
+    let process_group = child.id() as libc::pid_t;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    if set_nonblocking(stdout.as_raw_fd()).is_err() || set_nonblocking(stderr.as_raw_fd()).is_err()
+    {
+        let _ = terminate_supervised_boundary(process_group);
+        return SupervisorResponse::io();
+    }
+    let mut stdout_capture = OutputCapture::new(request.max_output_bytes);
+    let mut stderr_capture = OutputCapture::new(request.max_output_bytes);
+    let status = loop {
+        if stdout_capture.read_available(&mut stdout).is_err()
+            || stderr_capture.read_available(&mut stderr).is_err()
+        {
+            let _ = terminate_supervised_boundary(process_group);
+            drain_closed_boundary(
+                &mut stdout,
+                &mut stderr,
+                &mut stdout_capture,
+                &mut stderr_capture,
+            );
+            return SupervisorResponse::io();
+        }
+        match parent_control_cancelled(parent) {
+            Ok(true) => {
+                let _ = terminate_supervised_boundary(process_group);
+                drain_closed_boundary(
+                    &mut stdout,
+                    &mut stderr,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
+                return SupervisorResponse::cancelled();
+            }
+            Ok(false) => {}
+            Err(_) => {
+                let _ = terminate_supervised_boundary(process_group);
+                return SupervisorResponse::io();
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if terminate_supervised_boundary(process_group).is_err() {
+                    return SupervisorResponse::io();
+                }
+                drain_closed_boundary(
+                    &mut stdout,
+                    &mut stderr,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
+                break status;
+            }
+            Ok(None) if started.elapsed() < request.timeout() => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(None) => {
+                let _ = terminate_supervised_boundary(process_group);
+                drain_closed_boundary(
+                    &mut stdout,
+                    &mut stderr,
+                    &mut stdout_capture,
+                    &mut stderr_capture,
+                );
+                return SupervisorResponse::timeout();
+            }
+            Err(_) => {
+                let _ = terminate_supervised_boundary(process_group);
+                return SupervisorResponse::io();
+            }
+        }
+    };
+    match (stdout_capture.finish(), stderr_capture.finish()) {
+        (Ok(stdout), Ok(stderr)) => {
+            SupervisorResponse::exited(status.code().unwrap_or(128), stdout, stderr)
+        }
+        _ => SupervisorResponse::io(),
+    }
+}
+
+fn parent_control_cancelled(parent: &mut impl Read) -> io::Result<bool> {
+    let mut byte = [0_u8; 1];
+    match parent.read(&mut byte) {
+        Ok(0) => Ok(true),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_supervisor_response(
+    stdout: &mut impl Write,
+    response: &SupervisorResponse,
+) -> io::Result<()> {
+    let stdout_len = u32::try_from(response.stdout.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "supervisor stdout response exceeded its bounded limit",
+        )
+    })?;
+    let stderr_len = u32::try_from(response.stderr.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "supervisor stderr response exceeded its bounded limit",
+        )
+    })?;
+    stdout.write_all(SUPERVISOR_MAGIC)?;
+    stdout.write_all(&[response.tag])?;
+    stdout.write_all(&response.status.to_le_bytes())?;
+    stdout.write_all(&stdout_len.to_le_bytes())?;
+    stdout.write_all(&stderr_len.to_le_bytes())?;
+    stdout.write_all(&response.stdout)?;
+    stdout.write_all(&response.stderr)
+}
+
+fn ensure_supervisor_subreaper() -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn terminate_supervised_boundary(process_group: libc::pid_t) -> io::Result<()> {
+    loop {
+        kill_process_group(process_group);
+        kill_supervisor_children()?;
+        if !reap_supervisor_children()? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn kill_supervisor_children() -> io::Result<()> {
+    let mut descendants = BTreeSet::new();
+    collect_descendants(unsafe { libc::getpid() }, &mut descendants)?;
+    for pid in descendants {
+        if pid > 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_descendants(
+    parent: libc::pid_t,
+    descendants: &mut BTreeSet<libc::pid_t>,
+) -> io::Result<()> {
+    for child in process_children(parent)? {
+        if descendants.insert(child) {
+            collect_descendants(child, descendants)?;
+        }
+    }
+    Ok(())
+}
+
+fn reap_supervisor_children() -> io::Result<bool> {
+    loop {
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if reaped > 0 {
+            continue;
+        }
+        if reaped == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ECHILD) => return Ok(false),
+            Some(libc::EINTR) => continue,
+            _ => return Err(error),
+        }
     }
 }
 

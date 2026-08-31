@@ -225,16 +225,27 @@ impl ProductionDailyBackend {
                 if query.len() > 512 || query.contains('\0') {
                     return Err(invalid("launcher query is invalid"));
                 }
+                ensure_active(control, "launcher search")?;
                 let entries = self.launcher.entries();
                 let ids = entries
                     .iter()
                     .map(|entry| entry.desktop_id.as_str())
                     .collect::<Vec<_>>();
-                let ranked = self
+                let metrics = self
                     .metrics
-                    .lock()
-                    .map_err(|_| io::Error::other("launcher metrics lock poisoned"))?
-                    .rank(&query, &ids);
+                    .try_lock()
+                    .map_err(|error| match error {
+                        std::sync::TryLockError::Poisoned(_) => {
+                            io::Error::other("launcher metrics lock poisoned")
+                        }
+                        std::sync::TryLockError::WouldBlock => {
+                            io::Error::new(io::ErrorKind::WouldBlock, "launcher metrics are busy")
+                        }
+                    })?
+                    .snapshot();
+                ensure_active(control, "launcher search")?;
+                let ranked = metrics.rank(&query, &ids);
+                ensure_active(control, "launcher search")?;
                 let result = ranked
                     .into_iter()
                     .filter_map(|id| self.launcher.get(&id))
@@ -297,6 +308,22 @@ impl ProductionDailyBackend {
             )
             .map_err(io::Error::other),
         }
+    }
+}
+
+fn ensure_active(control: &RunControl, operation: &str) -> io::Result<()> {
+    if control.is_cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!("{operation} was cancelled"),
+        ))
+    } else if control.remaining().is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{operation} exceeded its deadline"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -687,6 +714,33 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn test_launcher_backend(root: &Path) -> ProductionDailyBackend {
+        let applications = root.join("applications");
+        fs::create_dir_all(&applications).unwrap();
+        fs::write(
+            applications.join("sleepy-test.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Sleepy Test\nExec=sleepy-test\n",
+        )
+        .unwrap();
+        let launcher = DesktopEntryIndex::scan(&[applications], &[], |_| true).unwrap();
+        let metrics = LauncherMetrics::open(&root.join("state/sleepy/launcher.json")).unwrap();
+        let (_sender, overview_events) = overview_event_channel(1);
+        ProductionDailyBackend {
+            launcher,
+            metrics: Mutex::new(metrics),
+            calendar: ProviderSlot::Degraded("calendar disabled in test".into()),
+            weather: ProviderSlot::Degraded("weather disabled in test".into()),
+            geocoder: ProviderSlot::Degraded("geocoder disabled in test".into()),
+            runner: ProcessCommandRunner,
+            overview: Mutex::new(NiriOverview::new(
+                ProcessOverviewRunner::default(),
+                overview_events,
+                Duration::from_millis(1500),
+            )),
+            fallback_overview_sender: None,
+        }
+    }
+
     #[test]
     fn try_exec_requires_regular_executable_access() {
         let root = tempfile::tempdir().unwrap();
@@ -737,5 +791,37 @@ mod tests {
         .unwrap();
         assert_eq!(resources.urls.len(), 3);
         assert_eq!(resources.files, ["/tmp/local:name", "relative-file"]);
+    }
+
+    #[test]
+    fn launcher_search_treats_metrics_contention_as_no_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(test_launcher_backend(root.path()));
+        let _held_metrics = backend.metrics.lock().unwrap();
+        let worker_backend = Arc::clone(&backend);
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_backend.handle_controlled(
+                DailyOperation::LauncherSearch {
+                    query: "sleepy".into(),
+                },
+                &RunControl::for_timeout(Duration::from_millis(50)),
+            );
+            result_sender.send(result).unwrap();
+        });
+
+        match result_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                drop(_held_metrics);
+                worker.join().unwrap();
+                panic!("launcher search blocked behind mutation-owned metrics persistence");
+            }
+            Err(error) => panic!("launcher search worker disconnected: {error}"),
+        }
+        drop(_held_metrics);
+        worker.join().unwrap();
     }
 }

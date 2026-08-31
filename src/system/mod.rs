@@ -19,9 +19,10 @@ use std::{
 };
 
 pub use runner::{
-    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunControl, RunnerError,
-    RunnerErrorKind,
+    run_command_supervisor, CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner,
+    RunControl, RunnerError, RunnerErrorKind,
 };
+pub(crate) use runner::{RunCancellation, RunCommitGuard};
 use sleepy_sdk::{
     validate_session_action_result, validate_system_mutation_result, validate_system_snapshot,
     AudioRuntimeState, AudioState, BatteryRuntimeState, BluetoothRuntimeState, BluetoothState,

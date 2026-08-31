@@ -380,7 +380,7 @@ pub trait DesktopProducer: Send + Sync {
 #[derive(Clone)]
 pub struct DesktopProducerContext {
     cancellation: CancellationToken,
-    blocking_cancelled: Arc<AtomicBool>,
+    blocking_cancellation: crate::system::RunCancellation,
     blocking_tasks: Arc<BlockingTaskTracker>,
     observation_domain: Option<DesktopDomainId>,
     observation_revision: Option<Arc<AtomicU64>>,
@@ -390,7 +390,7 @@ impl DesktopProducerContext {
     fn new(cancellation: CancellationToken, blocking_tasks: Arc<BlockingTaskTracker>) -> Self {
         Self {
             cancellation,
-            blocking_cancelled: Arc::new(AtomicBool::new(false)),
+            blocking_cancellation: crate::system::RunCancellation::new(),
             blocking_tasks,
             observation_domain: None,
             observation_revision: None,
@@ -405,7 +405,7 @@ impl DesktopProducerContext {
     ) -> Self {
         Self {
             cancellation,
-            blocking_cancelled: Arc::new(AtomicBool::new(false)),
+            blocking_cancellation: crate::system::RunCancellation::new(),
             blocking_tasks,
             observation_domain: Some(domain),
             observation_revision: Some(observation_revision),
@@ -417,7 +417,7 @@ impl DesktopProducerContext {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.blocking_cancelled.load(Ordering::SeqCst) || self.cancellation.is_cancelled()
+        self.blocking_cancellation.is_cancelled() || self.cancellation.is_cancelled()
     }
 
     pub fn begin_observation(&self) -> DesktopObservation {
@@ -443,18 +443,20 @@ impl DesktopProducerContext {
         T: Send + 'static,
     {
         if self.cancellation.is_cancelled() || self.blocking_tasks.is_cancelled() {
-            self.blocking_cancelled.store(true, Ordering::SeqCst);
+            self.blocking_cancellation.cancel();
         }
-        let control =
-            crate::system::RunControl::for_request(deadline, Arc::clone(&self.blocking_cancelled));
+        let control = crate::system::RunControl::for_cancellation(
+            deadline,
+            self.blocking_cancellation.clone(),
+        );
         let worker = tokio::task::spawn_blocking(move || operation(control));
         self.blocking_tasks
-            .register(worker.abort_handle(), Arc::clone(&self.blocking_cancelled));
+            .register(worker.abort_handle(), self.blocking_cancellation.clone());
         worker
     }
 
     fn cancel(&self) {
-        self.blocking_cancelled.store(true, Ordering::SeqCst);
+        self.blocking_cancellation.cancel();
         self.cancellation.cancel();
     }
 }
@@ -467,18 +469,25 @@ struct BlockingTaskTracker {
 
 struct BlockingTask {
     abort: tokio::task::AbortHandle,
-    cancelled: Arc<AtomicBool>,
+    cancellation: crate::system::RunCancellation,
 }
 
 impl BlockingTaskTracker {
-    fn register(&self, abort: tokio::task::AbortHandle, cancelled: Arc<AtomicBool>) {
+    fn register(
+        &self,
+        abort: tokio::task::AbortHandle,
+        cancellation: crate::system::RunCancellation,
+    ) {
         let mut tasks = self.tasks.lock().unwrap_or_else(|error| error.into_inner());
         tasks.retain(|task| !task.abort.is_finished());
         if self.cancelled.load(Ordering::SeqCst) {
-            cancelled.store(true, Ordering::SeqCst);
+            cancellation.cancel();
             abort.abort();
         }
-        tasks.push(BlockingTask { abort, cancelled });
+        tasks.push(BlockingTask {
+            abort,
+            cancellation,
+        });
     }
 
     fn is_cancelled(&self) -> bool {
@@ -492,7 +501,7 @@ impl BlockingTaskTracker {
             if task.abort.is_finished() {
                 false
             } else {
-                task.cancelled.store(true, Ordering::SeqCst);
+                task.cancellation.cancel();
                 task.abort.abort();
                 true
             }
@@ -1230,7 +1239,7 @@ fn publish_domain_transaction(
     let generation = match control {
         Some(control) => transaction
             .generations
-            .next_generation_while(|| control.is_cancelled() || control.remaining().is_zero())?,
+            .next_generation_controlled(control)?,
         None => transaction.generations.next_generation()?,
     };
     ensure_publication_active(control)?;
@@ -1249,6 +1258,11 @@ fn publish_domain_transaction(
         DesktopEvent::FullSnapshot(Box::new(snapshot)),
     )?;
     ensure_publication_active(control)?;
+    let _commit = match control {
+        Some(control) => control.begin_commit()?,
+        None => None,
+    };
+    before_desktop_publication_commit();
     if advances_observation_revision {
         observation_revision.fetch_add(1, Ordering::SeqCst);
     }
@@ -1258,6 +1272,53 @@ fn publish_domain_transaction(
     let _ = events.send(incremental.clone());
     Ok(Some(incremental))
 }
+
+#[cfg(test)]
+type PublicationCommitHook = Box<dyn Fn() + Send + Sync + 'static>;
+
+#[cfg(test)]
+static BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK: std::sync::OnceLock<
+    StdMutex<Option<PublicationCommitHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct PublicationCommitHookGuard;
+
+#[cfg(test)]
+impl Drop for PublicationCommitHookGuard {
+    fn drop(&mut self) {
+        *BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
+            .get_or_init(|| StdMutex::new(None))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn install_before_desktop_publication_commit_hook(
+    hook: PublicationCommitHook,
+) -> PublicationCommitHookGuard {
+    *BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(hook);
+    PublicationCommitHookGuard
+}
+
+#[cfg(test)]
+fn before_desktop_publication_commit() {
+    if let Some(hook) = BEFORE_DESKTOP_PUBLICATION_COMMIT_HOOK
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+    {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn before_desktop_publication_commit() {}
 
 fn lock_publication_transaction<'a>(
     transaction: &'a StdMutex<DesktopAuthorityTransaction>,
@@ -2690,6 +2751,85 @@ mod tests {
             .await
             .expect("installed attempt missed shutdown cancellation")
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn controlled_publication_commit_wins_before_cancellation_is_observable() {
+        let temp = tempfile::tempdir().unwrap();
+        let authority =
+            DesktopStateAuthority::open(test_registry(), temp.path().join("generation"), 8)
+                .await
+                .unwrap();
+        authority.initialize().await.unwrap();
+        let revision = Arc::clone(
+            authority
+                .observation_revisions
+                .get(&DesktopDomainId::Network)
+                .unwrap(),
+        );
+        let context = DesktopProducerContext::for_domain(
+            CancellationToken::new(),
+            Arc::new(BlockingTaskTracker::default()),
+            DesktopDomainId::Network,
+            revision,
+        );
+        let update = context
+            .begin_observation()
+            .finish(
+                DesktopDomainState::available(
+                    DesktopDomainId::Network,
+                    DesktopDomainValue::empty(DesktopDomainId::Network),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (entered_commit, commit_entered) = std::sync::mpsc::channel();
+        let commit_gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        let hook_gate = Arc::clone(&commit_gate);
+        let _hook = install_before_desktop_publication_commit_hook(Box::new(move || {
+            entered_commit.send(()).unwrap();
+            let (open, changed) = &*hook_gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = changed.wait(open).unwrap();
+            }
+        }));
+        let publishing_context = context.clone();
+        let publishing_authority = Arc::clone(&authority);
+        let publishing = tokio::spawn(async move {
+            publishing_authority
+                .publish_domain_controlled(
+                    update,
+                    EventCause {
+                        kind: EventCauseKind::External,
+                        request_id: None,
+                    },
+                    &publishing_context,
+                )
+                .await
+        });
+        commit_entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        let cancelling_context = context.clone();
+        let (cancelled, cancellation_observed) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            cancelling_context.cancel();
+            cancelled.send(()).unwrap();
+        });
+        let observed_cancellation = cancellation_observed.recv_timeout(Duration::from_millis(20));
+        let (open, changed) = &*commit_gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+        assert!(publishing.await.unwrap().unwrap().is_some());
+        cancellation_observed
+            .recv_timeout(Duration::from_secs(1))
+            .ok();
+        cancellation.join().unwrap();
+        assert_eq!(
+            observed_cancellation,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "producer cancellation became observable during final publication commit"
+        );
+        assert!(authority.current_generation() > 1);
     }
 
     #[async_trait]

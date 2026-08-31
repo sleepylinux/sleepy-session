@@ -19,9 +19,9 @@ use sleepy_sdk::{
     BluetoothCommand, CapabilityAvailability, CapabilityFailure, CapabilityRecord, CapabilityValue,
     DesktopCommand, DesktopDomainUpdate as SdkDomainUpdate, DesktopEnvelope, DesktopEvent,
     DesktopRequest, DesktopResultStatus, DesktopSessionCommand, DesktopSystemUpdate,
-    DesktopUtilityUpdate, EventCause, EventCauseKind, LockState, MediaCommand, MediaTransport,
-    NetworkAccessPoint, NetworkCommand, NetworkRuntimeState, NetworkSnapshot, RuntimeCapabilityId,
-    StableId, UtilityCommand, DESKTOP_WIRE_VERSION,
+    DesktopUtilityUpdate, EventCause, EventCauseKind, LauncherCommand, LockState, MediaCommand,
+    MediaTransport, NetworkAccessPoint, NetworkCommand, NetworkRuntimeState, NetworkSnapshot,
+    RuntimeCapabilityId, StableId, UtilityCommand, DESKTOP_WIRE_VERSION, WIRE_SCHEMA_VERSION,
 };
 use sleepy_session::desktop::adapters::AppearanceProducer;
 use sleepy_session::desktop::core::{state_from_record, CoreSystemProducer};
@@ -85,6 +85,14 @@ struct RegisteredBlockingProducer {
 struct IdleReadbackExecutor;
 
 struct PausedIdleObservationProducer {
+    sampled: Arc<AtomicBool>,
+    release: Arc<tokio::sync::Notify>,
+    enqueued: Arc<AtomicBool>,
+}
+
+struct LauncherReadbackExecutor;
+
+struct PausedLauncherObservationProducer {
     sampled: Arc<AtomicBool>,
     release: Arc<tokio::sync::Notify>,
     enqueued: Arc<AtomicBool>,
@@ -311,6 +319,64 @@ impl DesktopMutationExecutor for IdleReadbackExecutor {
     }
 }
 
+#[async_trait]
+impl DesktopProducer for PausedLauncherObservationProducer {
+    fn domain(&self) -> DesktopDomainId {
+        DesktopDomainId::Launcher
+    }
+
+    async fn initial(&self) -> DesktopDomainState {
+        DesktopDomainState::available(
+            DesktopDomainId::Launcher,
+            DesktopDomainValue::Launcher(Vec::new()),
+        )
+        .unwrap()
+    }
+
+    async fn run(
+        &self,
+        sender: mpsc::Sender<sleepy_session::desktop::DesktopDomainUpdate>,
+        context: DesktopProducerContext,
+    ) -> Result<(), ProducerError> {
+        let observation = context.begin_observation();
+        self.sampled.store(true, Ordering::SeqCst);
+        self.release.notified().await;
+        sender
+            .send(
+                observation
+                    .finish(
+                        DesktopDomainState::available(
+                            DesktopDomainId::Launcher,
+                            DesktopDomainValue::Launcher(Vec::new()),
+                        )
+                        .unwrap(),
+                    )
+                    .map_err(|error| ProducerError::new(error.to_string()))?,
+            )
+            .await
+            .map_err(|_| ProducerError::new("desktop state authority stopped"))?;
+        self.enqueued.store(true, Ordering::SeqCst);
+        context.cancelled().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DesktopMutationExecutor for LauncherReadbackExecutor {
+    async fn execute(
+        &self,
+        _request: &DesktopRequest,
+    ) -> Result<DesktopMutationOutcome, ProducerError> {
+        Ok(DesktopMutationOutcome::Confirmed(vec![
+            DesktopDomainState::available(
+                DesktopDomainId::Launcher,
+                DesktopDomainValue::Launcher(Vec::new()),
+            )
+            .unwrap(),
+        ]))
+    }
+}
+
 #[derive(Clone)]
 struct BlockingProcessRunner {
     pid_path: Arc<PathBuf>,
@@ -325,6 +391,16 @@ struct DescendantPipeRunner {
 #[derive(Clone)]
 struct EscapedDescendantRunner {
     parent_pid_path: Arc<PathBuf>,
+    descendant_pid_path: Arc<PathBuf>,
+}
+
+#[derive(Clone)]
+struct FastEscapedDescendantRunner {
+    descendant_pid_path: Arc<PathBuf>,
+}
+
+#[derive(Clone)]
+struct DelayedZombieDescendantRunner {
     descendant_pid_path: Arc<PathBuf>,
 }
 
@@ -396,6 +472,56 @@ impl CommandRunner for EscapedDescendantRunner {
                     .to_owned(),
                 "sleepy-producer-escaped-descendant-test".to_owned(),
                 self.parent_pid_path.to_string_lossy().into_owned(),
+                self.descendant_pid_path.to_string_lossy().into_owned(),
+            ],
+        );
+        command.timeout = Duration::from_secs(30);
+        ProcessCommandRunner.run_controlled(&command, control)
+    }
+}
+
+impl CommandRunner for FastEscapedDescendantRunner {
+    fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+        self.run_controlled(command, &RunControl::for_timeout(Duration::from_secs(30)))
+    }
+
+    fn run_controlled(
+        &self,
+        _command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        let mut command = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                "setsid sh -c '(sh -c '\\''printf \"%s\" \"$$\" > \"$1\"; exec /bin/sleep 30'\\'' sleepy-fast \"$1\" &) ; exit 0' sleepy-stage \"$1\" & while [ ! -s \"$1\" ]; do /bin/sleep 0.001; done; exit 0"
+                    .to_owned(),
+                "sleepy-fast-escaped-root".to_owned(),
+                self.descendant_pid_path.to_string_lossy().into_owned(),
+            ],
+        );
+        command.timeout = Duration::from_secs(30);
+        ProcessCommandRunner.run_controlled(&command, control)
+    }
+}
+
+impl CommandRunner for DelayedZombieDescendantRunner {
+    fn run(&self, command: &CommandSpec) -> Result<CommandOutput, RunnerError> {
+        self.run_controlled(command, &RunControl::for_timeout(Duration::from_secs(30)))
+    }
+
+    fn run_controlled(
+        &self,
+        _command: &CommandSpec,
+        control: &RunControl,
+    ) -> Result<CommandOutput, RunnerError> {
+        let mut command = CommandSpec::new(
+            "sh",
+            [
+                "-c".to_owned(),
+                "setsid sh -c '(sh -c '\\''printf \"%s\" \"$$\" > \"$1\"; /bin/sleep 0.12; exit 0'\\'' sleepy-delayed \"$1\" &) ; exit 0' sleepy-stage \"$1\" & while [ ! -s \"$1\" ]; do /bin/sleep 0.001; done; exit 0"
+                    .to_owned(),
+                "sleepy-delayed-escaped-root".to_owned(),
                 self.descendant_pid_path.to_string_lossy().into_owned(),
             ],
         );
@@ -1888,6 +2014,74 @@ async fn process_cancellation_reaps_an_escaped_descendant_without_reaping_unrela
     assert!(shutdown.unwrap().is_ok());
 }
 
+#[test]
+fn process_runner_reaps_a_fast_double_forked_setsid_descendant() {
+    let temp = tempfile::tempdir().unwrap();
+    let descendant_pid_path = Arc::new(temp.path().join("fast-escaped.pid"));
+    let runner = FastEscapedDescendantRunner {
+        descendant_pid_path: Arc::clone(&descendant_pid_path),
+    };
+    let command = CommandSpec::new("unused", std::iter::empty::<String>());
+
+    let output = runner.run(&command).unwrap();
+    assert_eq!(output.status, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !descendant_pid_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let descendant_pid = fs::read_to_string(descendant_pid_path.as_ref())
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    let descendant_alive = unsafe { libc::kill(descendant_pid, 0) } == 0;
+    if descendant_alive {
+        unsafe {
+            libc::kill(descendant_pid, libc::SIGKILL);
+        }
+    }
+
+    assert!(
+        !descendant_alive,
+        "fast double-forked session descendant survived command completion"
+    );
+}
+
+#[test]
+fn process_runner_reaps_a_late_exiting_escaped_descendant_before_return() {
+    let temp = tempfile::tempdir().unwrap();
+    let descendant_pid_path = Arc::new(temp.path().join("delayed-escaped.pid"));
+    let runner = DelayedZombieDescendantRunner {
+        descendant_pid_path: Arc::clone(&descendant_pid_path),
+    };
+    let command = CommandSpec::new("unused", std::iter::empty::<String>());
+
+    let output = runner.run(&command).unwrap();
+    assert_eq!(output.status, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !descendant_pid_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let descendant_pid = fs::read_to_string(descendant_pid_path.as_ref())
+        .unwrap()
+        .parse::<libc::pid_t>()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(180));
+    let descendant_alive_or_zombie = unsafe { libc::kill(descendant_pid, 0) } == 0;
+    if descendant_alive_or_zombie {
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(descendant_pid, &mut status, libc::WNOHANG);
+        }
+    }
+
+    assert!(
+        !descendant_alive_or_zombie,
+        "late-exiting escaped command descendant was not reaped before runner return"
+    );
+}
+
 #[tokio::test]
 async fn idle_poll_sampled_before_a_confirmed_mutation_cannot_publish_after_it() {
     let sampled = Arc::new(AtomicBool::new(false));
@@ -1968,6 +2162,96 @@ async fn idle_poll_sampled_before_a_confirmed_mutation_cannot_publish_after_it()
             .await
             .is_err(),
         "older idle observation published after the confirmed mutation"
+    );
+    assert_eq!(authority.current_generation(), result.generation);
+    runtime.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test]
+async fn launcher_search_sampled_before_a_confirmed_launch_cannot_publish_after_it() {
+    let sampled = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let enqueued = Arc::new(AtomicBool::new(false));
+    let launcher = Arc::new(PausedLauncherObservationProducer {
+        sampled: Arc::clone(&sampled),
+        release: Arc::clone(&release),
+        enqueued: Arc::clone(&enqueued),
+    }) as Arc<dyn DesktopProducer>;
+    let registry = Arc::new(
+        DesktopRegistry::new(complete_registry_with(Some((
+            DesktopDomainId::Launcher,
+            launcher,
+        ))))
+        .unwrap(),
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let authority =
+        DesktopStateAuthority::open(available_registry(), temp.path().join("generation"), 16)
+            .await
+            .unwrap();
+    authority.initialize().await.unwrap();
+    let control = DesktopControlAuthority::open(
+        Arc::clone(&authority),
+        Arc::new(LauncherReadbackExecutor),
+        temp.path().join("dedupe.json"),
+        8,
+    )
+    .await
+    .unwrap();
+    let mut events = authority.subscribe().await.unwrap();
+    events.recv().await.unwrap();
+    let runtime = registry.start(Arc::clone(&authority), 16).unwrap();
+    let sample_deadline = Instant::now() + Duration::from_secs(1);
+    while !sampled.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < sample_deadline,
+            "launcher poll did not reach the paused search seam"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let request = DesktopRequest {
+        schema_version: DESKTOP_WIRE_VERSION,
+        request_id: "00000000-0000-4000-8000-000000000101".into(),
+        expected_generation: authority.current_generation(),
+        command: DesktopCommand::Launcher(LauncherCommand::Launch(
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": WIRE_SCHEMA_VERSION,
+                "desktopId": "sleepy-test.desktop",
+                "resources": []
+            }))
+            .unwrap(),
+        )),
+    };
+    let result = control
+        .handle_json(&serde_json::to_string(&request).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(result.status, DesktopResultStatus::Succeeded);
+    let readback = events.recv().await.unwrap();
+    assert!(matches!(
+        readback.payload,
+        DesktopEvent::DomainUpdate(SdkDomainUpdate::Launcher(_))
+    ));
+    assert!(matches!(
+        events.recv().await.unwrap().payload,
+        DesktopEvent::CommandResult(_)
+    ));
+
+    release.notify_one();
+    let enqueue_deadline = Instant::now() + Duration::from_secs(1);
+    while !enqueued.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < enqueue_deadline,
+            "older launcher observation was not enqueued"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .is_err(),
+        "older launcher search observation published after the confirmed launch"
     );
     assert_eq!(authority.current_generation(), result.generation);
     runtime.shutdown(Duration::from_secs(1)).await.unwrap();
