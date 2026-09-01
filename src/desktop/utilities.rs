@@ -1410,7 +1410,7 @@ impl ProductionLogind {
         execute_session_with(
             command,
             request_secure_lock,
-            execute_suspend_via_logind,
+            execute_sleep_via_logind,
             |command| {
                 let connection = dbus::blocking::Connection::new_system().map_err(dbus_error)?;
                 invoke_logind_action(&connection, command, deadline)
@@ -1422,7 +1422,7 @@ impl ProductionLogind {
 fn execute_session_with(
     command: DesktopSessionCommand,
     mut request_lock: impl FnMut() -> io::Result<()>,
-    mut suspend: impl FnMut() -> io::Result<()>,
+    mut suspend: impl FnMut(DesktopSessionCommand) -> io::Result<()>,
     mut invoke: impl FnMut(DesktopSessionCommand) -> io::Result<()>,
 ) -> io::Result<Option<DesktopDomainState>> {
     match command {
@@ -1434,8 +1434,8 @@ fn execute_session_with(
             )
             .map(Some)
         }
-        DesktopSessionCommand::Suspend => {
-            suspend()?;
+        DesktopSessionCommand::Suspend | DesktopSessionCommand::Hibernate => {
+            invoke_sleep(command, &mut suspend)?;
             Ok(None)
         }
         DesktopSessionCommand::Logout
@@ -1501,7 +1501,23 @@ where
     Ok(())
 }
 
-fn execute_suspend_via_logind() -> io::Result<()> {
+fn invoke_sleep(
+    command: DesktopSessionCommand,
+    suspend: &mut impl FnMut(DesktopSessionCommand) -> io::Result<()>,
+) -> io::Result<()> {
+    suspend(command)
+}
+
+fn execute_sleep_via_logind(command: DesktopSessionCommand) -> io::Result<()> {
+    if !matches!(
+        command,
+        DesktopSessionCommand::Suspend | DesktopSessionCommand::Hibernate
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sleep lifecycle only accepts suspend or hibernate",
+        ));
+    }
     let connection = dbus::blocking::Connection::new_system().map_err(dbus_error)?;
     let (sender, receiver) = std_mpsc::sync_channel(4);
     let rule = MatchRule::new_signal(LOGIN1_MANAGER, "PrepareForSleep")
@@ -1517,13 +1533,7 @@ fn execute_suspend_via_logind() -> io::Result<()> {
     execute_suspend_lifecycle(
         || acquire_sleep_delay_inhibitor(&connection, prepare_deadline),
         acquire_suspend_hold,
-        || {
-            invoke_logind_action(
-                &connection,
-                DesktopSessionCommand::Suspend,
-                prepare_deadline,
-            )
-        },
+        || invoke_logind_action(&connection, command, prepare_deadline),
         SuspendTransitionWait::new(LOGIND_ACTION_TIMEOUT, |expected, resume_deadline| {
             wait_for_sleep_transition(
                 &connection,
@@ -1626,6 +1636,11 @@ fn invoke_logind_action(
         DesktopSessionCommand::Suspend => {
             let _: () = manager
                 .method_call(LOGIN1_MANAGER, "Suspend", (true,))
+                .map_err(dbus_error)?;
+        }
+        DesktopSessionCommand::Hibernate => {
+            let _: () = manager
+                .method_call(LOGIN1_MANAGER, "Hibernate", (true,))
                 .map_err(dbus_error)?;
         }
         DesktopSessionCommand::Reboot => {
@@ -2394,7 +2409,7 @@ mod tests {
                 steps.borrow_mut().push("locker-lock");
                 Ok(())
             },
-            || panic!("lock does not enter suspend lifecycle"),
+            |_| panic!("lock does not enter sleep lifecycle"),
             |command| {
                 steps.borrow_mut().push(match command {
                     DesktopSessionCommand::Lock => "unexpected-logind-lock",
@@ -2412,7 +2427,8 @@ mod tests {
         let error = execute_session_with(
             DesktopSessionCommand::Suspend,
             || panic!("suspend does not use the one-shot lock request"),
-            || {
+            |command| {
+                assert_eq!(command, DesktopSessionCommand::Suspend);
                 steps.borrow_mut().push("suspend-lifecycle");
                 Err(io::Error::new(io::ErrorKind::TimedOut, "fixture timeout"))
             },
@@ -2432,7 +2448,8 @@ mod tests {
         assert!(execute_session_with(
             DesktopSessionCommand::Suspend,
             || panic!("suspend does not use the one-shot lock request"),
-            || {
+            |command| {
+                assert_eq!(command, DesktopSessionCommand::Suspend);
                 steps.borrow_mut().push("suspend-lifecycle");
                 Ok(())
             },
@@ -2448,11 +2465,28 @@ mod tests {
         .is_none());
         assert_eq!(steps.into_inner(), ["suspend-lifecycle"]);
 
+        let sleep_actions = RefCell::new(Vec::new());
+        assert!(execute_session_with(
+            DesktopSessionCommand::Hibernate,
+            || panic!("hibernate does not use the one-shot lock request"),
+            |command| {
+                sleep_actions.borrow_mut().push(command);
+                Ok(())
+            },
+            |_| panic!("hibernate must use the guarded sleep lifecycle"),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            sleep_actions.into_inner(),
+            [DesktopSessionCommand::Hibernate]
+        );
+
         let actions = RefCell::new(Vec::new());
         assert!(execute_session_with(
             DesktopSessionCommand::Reboot,
             || panic!("reboot does not request the locker"),
-            || panic!("reboot does not enter suspend lifecycle"),
+            |_| panic!("reboot does not enter sleep lifecycle"),
             |command| {
                 actions.borrow_mut().push(command);
                 Ok(())
