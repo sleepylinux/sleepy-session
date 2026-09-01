@@ -14,8 +14,8 @@ use sleepy_session::desktop::{
     DesktopStateAuthority,
 };
 use sleepy_session::notifications::{
-    FreedesktopNotificationProvider, NotificationDbusServer, NotificationEventService,
-    NotificationSocket, NotificationStore,
+    notification_bus_owner, FreedesktopNotificationProvider, NotificationBusOwner,
+    NotificationDbusServer, NotificationEventService, NotificationSocket, NotificationStore,
 };
 use sleepy_session::osd::{spawn_osd_runtime, OsdPublicationHub, OsdSocket};
 use sleepy_session::overview::overview_event_channel;
@@ -59,6 +59,8 @@ fn is_internal_command_supervisor() -> bool {
 
 async fn run() -> io::Result<()> {
     let runtime_dir = required_path("XDG_RUNTIME_DIR")?;
+    let notification_bus_owner =
+        notification_bus_owner(env::var_os("SLEEPY_NOTIFICATION_BUS_OWNER").as_deref())?;
     let state_dir = state_home()?;
     let config_dir = config_home()?;
     let cache_dir = cache_home()?;
@@ -209,20 +211,28 @@ async fn run() -> io::Result<()> {
     let desktop_events_startup = startup.required_task("desktop-events");
     let desktop_requests_startup = startup.required_task("desktop-requests");
     let secret_startup = startup.required_task("network-secret");
-    let notification_dbus_startup = startup.required_task("notification-dbus");
+    let notification_dbus_startup = (notification_bus_owner == NotificationBusOwner::Session)
+        .then(|| startup.required_task("notification-dbus"));
 
     // D-Bus ownership is acquired after all Unix listeners bind. Its worker
     // thread acknowledges startup, then remains gated before process()/timer
     // activity so it cannot mutate or publish before READY.
-    let mut notification_bus = NotificationDbusServer::start_session_gated(
-        Arc::clone(&notification_service),
-        tokio::runtime::Handle::current(),
-        notification_dbus_startup,
-    )?;
-    let notification_action_dispatcher = notification_bus.action_dispatcher();
-    *desktop_notification_actions.lock().await = Some(notification_action_dispatcher.clone());
-    let notification_socket =
-        Arc::new(notification_socket.with_action_dispatcher(notification_action_dispatcher));
+    let mut notification_bus = match notification_dbus_startup {
+        Some(startup) => Some(NotificationDbusServer::start_session_gated(
+            Arc::clone(&notification_service),
+            tokio::runtime::Handle::current(),
+            startup,
+        )?),
+        None => None,
+    };
+    let notification_socket = if let Some(bus) = notification_bus.as_ref() {
+        let notification_action_dispatcher = bus.action_dispatcher();
+        *desktop_notification_actions.lock().await = Some(notification_action_dispatcher.clone());
+        notification_socket.with_action_dispatcher(notification_action_dispatcher)
+    } else {
+        notification_socket
+    };
+    let notification_socket = Arc::new(notification_socket);
     let lifecycle = DaemonLifecycle::new(Arc::new(SystemdNotifier));
     let session_serving = Arc::clone(&socket);
     let mut session_task =
@@ -342,6 +352,13 @@ async fn run() -> io::Result<()> {
     let mut osd_task = Some(osd_task);
     let mut osd_bridge = Some(osd_bridge);
     let result = {
+        let notification_failure = async {
+            match notification_bus.as_mut() {
+                Some(bus) => bus.wait_for_failure().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(notification_failure);
         tokio::select! {
             result = &mut session_task => socket_task_result(result, "session socket"),
             result = &mut control_task => socket_task_result(result, "control socket"),
@@ -367,7 +384,7 @@ async fn run() -> io::Result<()> {
                     Err(error) => Err(io::Error::other(format!("OSD runtime failed: {error}"))),
                 }
             },
-            error = notification_bus.wait_for_failure() => {
+            error = &mut notification_failure => {
                 let _ = authority
                     .lock()
                     .await
