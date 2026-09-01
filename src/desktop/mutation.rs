@@ -252,7 +252,7 @@ impl<B: DailyBackend> DesktopMutationExecutor for ProductionDesktopMutationExecu
                 .expect("matching appearance domain")])
             }
             DesktopCommand::Utility(command) => {
-                if let sleepy_sdk::UtilityCommand::StartRecording { output_id }
+                if let sleepy_sdk::UtilityCommand::StartRecording { output_id, .. }
                 | sleepy_sdk::UtilityCommand::Screenshot { output_id } = command
                 {
                     self.validate_output(output_id.as_str()).await?;

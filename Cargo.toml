@@ -15,7 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 sd-notify = { version = "0.4.5", default-features = false }
-sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "d935d3d83ef3c01627cd315230607c4b04554d42" }
+sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "63b2370a39f47f2b361310c12c0333da0faaee9d" }
 tokio = { version = "=1.43.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.12", default-features = false }
 uuid = { version = "1.24", features = ["v4"] }

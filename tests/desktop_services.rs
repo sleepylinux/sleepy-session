@@ -1093,6 +1093,7 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
     let recording = utilities::action_spec(
         &UtilityCommand::StartRecording {
             output_id: StableId("output:eDP-1".into()),
+            audio: true,
         },
         "/run/user/1000/sleepy/captures/recording.mkv",
     )
@@ -1108,6 +1109,7 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
             "eDP-1",
             "--output-path",
             "/run/user/1000/sleepy/captures/recording.mkv",
+            "--audio",
             "--status-fd",
             "1"
         ]
@@ -1124,6 +1126,9 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
         UtilityCommand::SetIdleInhibited { enabled: true },
         UtilityCommand::PauseRecording,
         UtilityCommand::StopRecording,
+        UtilityCommand::DeleteRecording {
+            recording_id: StableId("recording_20260901_12-34-56.mp4".into()),
+        },
         UtilityCommand::SetGameMode { enabled: true },
     ] {
         assert!(utilities::action_spec(&command, "unused")
@@ -1140,6 +1145,33 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
         ("org.example.Item", "/StatusNotifierItem")
     );
     assert!(tray::split_registration("--invalid").is_err());
+}
+
+#[test]
+fn recording_deletion_is_confined_to_owned_regular_capture_files() {
+    use sleepy_session::desktop::utilities::ProductionUtilityService;
+
+    let temp = tempfile::tempdir().unwrap();
+    let recording = "recording_20260901_12-34-56.mp4";
+    fs::write(temp.path().join(recording), b"video").unwrap();
+    let service = ProductionUtilityService::open(temp.path()).unwrap();
+    service
+        .execute(&UtilityCommand::DeleteRecording {
+            recording_id: StableId(recording.into()),
+        })
+        .unwrap();
+    assert!(!temp.path().join(recording).exists());
+
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    let link = "recording_20260901_12-34-57.mp4";
+    std::os::unix::fs::symlink(outside.path(), temp.path().join(link)).unwrap();
+    let error = service
+        .execute(&UtilityCommand::DeleteRecording {
+            recording_id: StableId(link.into()),
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(outside.path().exists());
 }
 
 #[tokio::test]

@@ -66,21 +66,21 @@ pub fn action_spec(command: &UtilityCommand, output_path: &str) -> io::Result<Op
             "sleepy-capture-helper",
             ["pick-color", "--interactive-consent", "--clipboard"],
         ),
-        UtilityCommand::StartRecording { output_id } => {
+        UtilityCommand::StartRecording { output_id, audio } => {
             validate_output_path(output_path)?;
-            CommandSpec::new(
-                "sleepy-capture-helper",
-                [
-                    "record",
-                    "--interactive-consent",
-                    "--output-id",
-                    output_name(output_id)?,
-                    "--output-path",
-                    output_path,
-                    "--status-fd",
-                    "1",
-                ],
-            )
+            let mut args = vec![
+                "record".to_owned(),
+                "--interactive-consent".to_owned(),
+                "--output-id".to_owned(),
+                output_name(output_id)?.to_owned(),
+                "--output-path".to_owned(),
+                output_path.to_owned(),
+            ];
+            if *audio {
+                args.push("--audio".to_owned());
+            }
+            args.extend(["--status-fd".to_owned(), "1".to_owned()]);
+            CommandSpec::new("sleepy-capture-helper", args)
         }
         UtilityCommand::InvokeTrayMenu { .. }
         | UtilityCommand::PasteClipboard { .. }
@@ -88,6 +88,7 @@ pub fn action_spec(command: &UtilityCommand, output_path: &str) -> io::Result<Op
         | UtilityCommand::SetIdleInhibited { .. }
         | UtilityCommand::PauseRecording
         | UtilityCommand::StopRecording
+        | UtilityCommand::DeleteRecording { .. }
         | UtilityCommand::SetGameMode { .. } => return Ok(None),
     };
     Ok(Some(spec))
@@ -153,7 +154,7 @@ impl Default for RecordingRuntime {
 pub struct ProductionUtilityService {
     runner: ProcessCommandRunner,
     capture_root: PathBuf,
-    _capture_directory: crate::store::SecureDir,
+    capture_directory: crate::store::SecureDir,
     tray: super::tray::TrayService,
     recording: StdMutex<RecordingRuntime>,
     idle_inhibitor: StdMutex<Option<dbus::arg::OwnedFd>>,
@@ -168,7 +169,7 @@ impl ProductionUtilityService {
         Ok(Self {
             runner: ProcessCommandRunner,
             capture_root,
-            _capture_directory: capture_directory,
+            capture_directory,
             tray: super::tray::TrayService::default(),
             recording: StdMutex::new(RecordingRuntime::default()),
             idle_inhibitor: StdMutex::new(None),
@@ -295,8 +296,8 @@ impl ProductionUtilityService {
                 self.set_idle_inhibited(*enabled)?;
                 Ok(self.state(DesktopDomainId::IdleInhibit))
             }
-            UtilityCommand::StartRecording { output_id } => {
-                self.start_recording(output_id)?;
+            UtilityCommand::StartRecording { output_id, audio } => {
+                self.start_recording(output_id, *audio)?;
                 Ok(self.state(DesktopDomainId::Recording))
             }
             UtilityCommand::PauseRecording => {
@@ -305,6 +306,10 @@ impl ProductionUtilityService {
             }
             UtilityCommand::StopRecording => {
                 self.stop_recording()?;
+                Ok(self.state(DesktopDomainId::Recording))
+            }
+            UtilityCommand::DeleteRecording { recording_id } => {
+                self.delete_recording(recording_id)?;
                 Ok(self.state(DesktopDomainId::Recording))
             }
             UtilityCommand::Screenshot { .. } => {
@@ -416,7 +421,7 @@ impl ProductionUtilityService {
         Ok(runtime.state.clone())
     }
 
-    fn start_recording(&self, output_id: &sleepy_sdk::StableId) -> io::Result<()> {
+    fn start_recording(&self, output_id: &sleepy_sdk::StableId, audio: bool) -> io::Result<()> {
         let mut runtime = self
             .recording
             .lock()
@@ -427,14 +432,18 @@ impl ProductionUtilityService {
                 "a recording is already active",
             ));
         }
-        let recording_id = uuid::Uuid::new_v4().hyphenated().to_string();
-        let path = self
-            .capture_root
-            .join(format!("recording-{recording_id}.mkv"));
+        let now: chrono::DateTime<chrono::Utc> = std::time::SystemTime::now().into();
+        let recording_id = format!(
+            "recording_{}_{}.mp4",
+            now.format("%Y%m%d_%H-%M-%S"),
+            uuid::Uuid::new_v4().simple()
+        );
+        let path = self.capture_root.join(&recording_id);
         let path_text = path_to_string(&path)?;
         let spec = action_spec(
             &UtilityCommand::StartRecording {
                 output_id: output_id.clone(),
+                audio,
             },
             path_text,
         )?
@@ -463,6 +472,38 @@ impl ProductionUtilityService {
         runtime.child = Some(child.disarm()?);
         runtime.status = Some(status);
         Ok(())
+    }
+
+    fn delete_recording(&self, recording_id: &sleepy_sdk::StableId) -> io::Result<()> {
+        let name = recording_id.as_str();
+        if !name.starts_with("recording_")
+            || !name.ends_with(".mp4")
+            || name.len() > 96
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid recording basename",
+            ));
+        }
+        let metadata = self
+            .capture_directory
+            .entry_metadata(std::ffi::OsStr::new(name))
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "recording not found"))?;
+        if metadata.mode & libc::S_IFMT != libc::S_IFREG
+            || metadata.uid != unsafe { libc::geteuid() }
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recording must be a regular file owned by the session user",
+            ));
+        }
+        self.capture_directory
+            .remove_file(std::ffi::OsStr::new(name))
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     fn pause_recording(&self) -> io::Result<()> {
