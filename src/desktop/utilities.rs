@@ -1233,30 +1233,27 @@ fn acquire_suspend_hold_at(
             let mut stream = connect_verified_locker(socket).await?;
             stream.write_all(b"suspend\n").await?;
             stream.flush().await?;
-            let mut reply = [0_u8; 7];
-            stream.read_exact(&mut reply).await?;
-            if &reply != b"locked\n" {
+            let mut reply = Vec::with_capacity(8);
+            (&mut stream).take(8).read_to_end(&mut reply).await?;
+            if reply != b"locked\n" {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "locker returned an invalid suspend acknowledgement",
                 ));
             }
-            let mut extra = [0_u8; 1];
-            match stream.try_read(&mut extra) {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "locker closed the suspend hold before sleep",
-                    ))
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "locker returned an oversized suspend acknowledgement",
-                    ))
-                }
-                Err(error) => return Err(error),
+            let mut descriptor = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: 0,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut descriptor, 1, 0) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if descriptor.revents & libc::POLLHUP != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "locker closed the suspend hold after acknowledgement",
+                ));
             }
             Ok(LockerSuspendHold {
                 stream: Some(stream.into_std()?),
@@ -1409,15 +1406,32 @@ fn execute_session_with(
     }
 }
 
-fn execute_suspend_lifecycle<I, H>(
+struct SuspendTransitionWait<F> {
+    resume_timeout: Duration,
+    wait: F,
+}
+
+impl<F> SuspendTransitionWait<F> {
+    fn new(resume_timeout: Duration, wait: F) -> Self {
+        Self {
+            resume_timeout,
+            wait,
+        }
+    }
+}
+
+fn execute_suspend_lifecycle<I, H, F>(
     acquire_inhibitor: impl FnOnce() -> io::Result<I>,
     acquire_hold: impl FnOnce() -> io::Result<H>,
     invoke_suspend: impl FnOnce() -> io::Result<()>,
-    mut wait_transition: impl FnMut(bool) -> io::Result<()>,
+    mut transitions: SuspendTransitionWait<F>,
     release_inhibitor: impl FnOnce(I),
     release_hold: impl FnOnce(H),
     fail_closed_hold: impl FnOnce(H),
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    F: FnMut(bool, Option<Instant>) -> io::Result<()>,
+{
     let inhibitor = acquire_inhibitor()?;
     let hold = match acquire_hold() {
         Ok(hold) => hold,
@@ -1431,13 +1445,14 @@ fn execute_suspend_lifecycle<I, H>(
         release_inhibitor(inhibitor);
         return Err(error);
     }
-    if let Err(error) = wait_transition(true) {
+    if let Err(error) = (transitions.wait)(true, None) {
         fail_closed_hold(hold);
         release_inhibitor(inhibitor);
         return Err(error);
     }
+    let resume_deadline = Instant::now() + transitions.resume_timeout;
     release_inhibitor(inhibitor);
-    if let Err(error) = wait_transition(false) {
+    if let Err(error) = (transitions.wait)(false, Some(resume_deadline)) {
         fail_closed_hold(hold);
         return Err(error);
     }
@@ -1468,14 +1483,18 @@ fn execute_suspend_via_logind() -> io::Result<()> {
                 prepare_deadline,
             )
         },
-        |expected| {
+        SuspendTransitionWait::new(LOGIND_ACTION_TIMEOUT, |expected, resume_deadline| {
             wait_for_sleep_transition(
                 &connection,
                 &receiver,
                 expected,
-                expected.then_some(prepare_deadline),
+                if expected {
+                    Some(prepare_deadline)
+                } else {
+                    resume_deadline
+                },
             )
-        },
+        }),
         drop,
         LockerSuspendHold::release,
         LockerSuspendHold::fail_closed,
@@ -1686,6 +1705,7 @@ mod tests {
     use std::{
         cell::RefCell,
         io::Read,
+        net::Shutdown,
         os::unix::{fs::symlink, net::UnixListener},
         rc::Rc,
         sync::Mutex,
@@ -1833,6 +1853,61 @@ mod tests {
     }
 
     #[test]
+    fn suspend_locker_transaction_rejects_delayed_extra_byte_and_post_ack_close() {
+        for action in [
+            HeldFixtureAction::DelayedExtra,
+            HeldFixtureAction::DelayedClose,
+        ] {
+            let (runtime, socket, server) = held_locker_fixture(action);
+            let error =
+                match acquire_suspend_hold_at(&socket, runtime.path(), Duration::from_secs(1)) {
+                    Ok(hold) => {
+                        hold.release();
+                        panic!("unstable suspend acknowledgement was accepted")
+                    }
+                    Err(error) => error,
+                };
+            assert!(matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ));
+            assert_eq!(server.join().unwrap(), b"suspend\n");
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum HeldFixtureAction {
+        DelayedExtra,
+        DelayedClose,
+    }
+
+    fn held_locker_fixture(
+        action: HeldFixtureAction,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<Vec<u8>>) {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = runtime.path().join("sleepy");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = directory.join("locker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0_u8; 8];
+            stream.read_exact(&mut request).unwrap();
+            stream.write_all(b"locked\n").unwrap();
+            std::thread::sleep(Duration::from_millis(15));
+            if matches!(action, HeldFixtureAction::DelayedExtra) {
+                stream.write_all(b"x").unwrap();
+                stream.shutdown(Shutdown::Write).unwrap();
+            }
+            request
+        });
+        (runtime, socket, server)
+    }
+
+    #[test]
     fn locker_path_rejects_symlink_non_socket_and_dirty_components() {
         let runtime = tempfile::tempdir().unwrap();
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1902,6 +1977,7 @@ mod tests {
             stream.read_exact(&mut request).unwrap();
             stream.write_all(reply).unwrap();
             if wait_for_release {
+                stream.shutdown(Shutdown::Write).unwrap();
                 let mut trailing = Vec::new();
                 stream.read_to_end(&mut trailing).unwrap();
                 assert!(trailing.is_empty());
@@ -1914,6 +1990,8 @@ mod tests {
     #[test]
     fn suspend_lifecycle_releases_delay_only_for_prepare_and_hold_only_for_resume() {
         let steps = Rc::new(RefCell::new(Vec::new()));
+        let inhibitor_released_at = Rc::new(RefCell::new(None));
+        let resume_timeout = Duration::from_millis(40);
         let record = |step: &'static str, steps: &Rc<RefCell<Vec<&'static str>>>| {
             steps.borrow_mut().push(step);
         };
@@ -1940,16 +2018,32 @@ mod tests {
                     Ok(())
                 }
             },
-            {
+            SuspendTransitionWait::new(resume_timeout, {
                 let steps = Rc::clone(&steps);
-                move |expected| {
+                let inhibitor_released_at = Rc::clone(&inhibitor_released_at);
+                move |expected, deadline: Option<Instant>| {
                     record(if expected { "prepare" } else { "resume" }, &steps);
+                    if expected {
+                        assert!(deadline.is_none());
+                        std::thread::sleep(resume_timeout + Duration::from_millis(20));
+                    } else {
+                        let deadline = deadline.expect("resume must be bounded");
+                        let released_at = inhibitor_released_at
+                            .borrow()
+                            .expect("inhibitor must be released before resume wait");
+                        assert!(deadline > released_at);
+                        assert!(deadline - resume_timeout <= released_at);
+                    }
                     Ok(())
                 }
-            },
+            }),
             {
                 let steps = Rc::clone(&steps);
-                move |_| record("release-inhibitor", &steps)
+                let inhibitor_released_at = Rc::clone(&inhibitor_released_at);
+                move |_| {
+                    *inhibitor_released_at.borrow_mut() = Some(Instant::now());
+                    record("release-inhibitor", &steps)
+                }
             },
             {
                 let steps = Rc::clone(&steps);
@@ -1979,17 +2073,25 @@ mod tests {
     #[test]
     fn suspend_lifecycle_keeps_locker_hold_on_transition_error() {
         let steps = Rc::new(RefCell::new(Vec::new()));
+        let resume_timeout = Duration::from_millis(20);
         let error = execute_suspend_lifecycle(
             || Ok("inhibitor"),
             || Ok("hold"),
             || Ok(()),
-            {
+            SuspendTransitionWait::new(resume_timeout, {
                 let steps = Rc::clone(&steps);
-                move |_| {
-                    steps.borrow_mut().push("transition-error");
+                move |expected, deadline: Option<Instant>| {
+                    if expected {
+                        steps.borrow_mut().push("prepare");
+                        return Ok(());
+                    }
+                    let deadline = deadline.expect("resume must be bounded");
+                    std::thread::sleep(resume_timeout + Duration::from_millis(10));
+                    assert!(Instant::now() >= deadline);
+                    steps.borrow_mut().push("resume-timeout");
                     Err(io::Error::new(io::ErrorKind::TimedOut, "fixture"))
                 }
-            },
+            }),
             {
                 let steps = Rc::clone(&steps);
                 move |_| steps.borrow_mut().push("release-inhibitor")
@@ -2007,7 +2109,12 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(
             steps.borrow().as_slice(),
-            ["transition-error", "fail-closed-hold", "release-inhibitor"]
+            [
+                "prepare",
+                "release-inhibitor",
+                "resume-timeout",
+                "fail-closed-hold"
+            ]
         );
     }
 
