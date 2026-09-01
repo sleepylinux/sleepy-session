@@ -1142,20 +1142,6 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
     assert!(tray::split_registration("--invalid").is_err());
 }
 
-#[test]
-fn suspend_requires_a_confirmed_secure_lock_precondition() {
-    use sleepy_session::desktop::utilities::validate_session_precondition;
-
-    assert_eq!(
-        validate_session_precondition(DesktopSessionCommand::Suspend, false)
-            .unwrap_err()
-            .kind(),
-        io::ErrorKind::PermissionDenied
-    );
-    assert!(validate_session_precondition(DesktopSessionCommand::Suspend, true).is_ok());
-    assert!(validate_session_precondition(DesktopSessionCommand::Reboot, false).is_ok());
-}
-
 #[tokio::test]
 async fn appearance_actions_persist_and_return_confirmed_mature_theme_readback() {
     use sleepy_session::{desktop::appearance::AppearanceService, theme::ThemeManager};
