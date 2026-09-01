@@ -6,6 +6,7 @@ use std::{
     os::unix::io::AsRawFd,
     path::Path,
     pin::Pin,
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -790,8 +791,28 @@ async fn reconnect_once(path: &Path) {
     client.read_to_end(&mut bytes).await.unwrap();
 }
 
+#[test]
+fn completed_tasks_and_file_descriptors_return_to_baseline_after_1000_reconnects() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "completed_tasks_and_file_descriptors_return_to_baseline_in_isolated_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated descriptor regression failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[tokio::test]
-async fn completed_tasks_and_file_descriptors_return_to_baseline_after_1000_reconnects() {
+#[ignore = "run by the public regression in an isolated test process"]
+async fn completed_tasks_and_file_descriptors_return_to_baseline_in_isolated_process() {
     let _serial = serial_test().await;
     let temp = tempfile::tempdir().unwrap();
     let parent = temp.path().join("sleepy");

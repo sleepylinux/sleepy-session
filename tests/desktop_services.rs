@@ -468,7 +468,7 @@ impl CommandRunner for EscapedDescendantRunner {
             "sh",
             [
                 "-c".to_owned(),
-                "printf '%s' \"$$\" > \"$1\"; setsid sh -c 'printf \"%s\" \"$$\" > \"$1\"; exec /bin/sleep 30' sleepy-escaped \"$2\" & wait"
+                "printf '%s' \"$$\" > \"$1\"; setsid sh -c 'printf \"%s\" \"$$\" > \"$1\"; exec sleep 30' sleepy-escaped \"$2\" & wait"
                     .to_owned(),
                 "sleepy-producer-escaped-descendant-test".to_owned(),
                 self.parent_pid_path.to_string_lossy().into_owned(),
@@ -494,7 +494,7 @@ impl CommandRunner for FastEscapedDescendantRunner {
             "sh",
             [
                 "-c".to_owned(),
-                "setsid sh -c '(sh -c '\\''printf \"%s\" \"$$\" > \"$1\"; exec /bin/sleep 30'\\'' sleepy-fast \"$1\" &) ; exit 0' sleepy-stage \"$1\" & while [ ! -s \"$1\" ]; do /bin/sleep 0.001; done; exit 0"
+                "setsid sh -c '(sh -c '\\''printf \"%s\" \"$$\" > \"$1\"; exec sleep 30'\\'' sleepy-fast \"$1\" &) ; exit 0' sleepy-stage \"$1\" & while [ ! -s \"$1\" ]; do sleep 0.001; done; exit 0"
                     .to_owned(),
                 "sleepy-fast-escaped-root".to_owned(),
                 self.descendant_pid_path.to_string_lossy().into_owned(),
@@ -519,7 +519,7 @@ impl CommandRunner for DelayedZombieDescendantRunner {
             "sh",
             [
                 "-c".to_owned(),
-                "setsid sh -c '(sh -c '\\''printf \"%s\" \"$$\" > \"$1\"; /bin/sleep 0.12; exit 0'\\'' sleepy-delayed \"$1\" &) ; exit 0' sleepy-stage \"$1\" & while [ ! -s \"$1\" ]; do /bin/sleep 0.001; done; exit 0"
+                "setsid sh -c '(sh -c '\\''printf \"%s\" \"$$\" > \"$1\"; sleep 0.12; exit 0'\\'' sleepy-delayed \"$1\" &) ; exit 0' sleepy-stage \"$1\" & while [ ! -s \"$1\" ]; do sleep 0.001; done; exit 0"
                     .to_owned(),
                 "sleepy-delayed-escaped-root".to_owned(),
                 self.descendant_pid_path.to_string_lossy().into_owned(),
@@ -2251,18 +2251,23 @@ fn real_clipboard_hanging_child_is_cancelled_and_reaped_before_runtime_shutdown_
     let cliphist = bin.join("cliphist");
     fs::write(
         &cliphist,
-        "#!/bin/sh\nprintf '%s' \"$$\" > \"$SLEEPY_TEST_CLIPHIST_PID\"\nexec /bin/sleep 30\n",
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$SLEEPY_TEST_CLIPHIST_PID\"\nexec sleep 30\n",
     )
     .unwrap();
     fs::set_permissions(&cliphist, fs::Permissions::from_mode(0o700)).unwrap();
     let pid_path = temp.path().join("cliphist.pid");
+    let original_path = std::env::var_os("PATH").unwrap_or_default();
+    let command_path = std::env::join_paths(
+        std::iter::once(bin.clone()).chain(std::env::split_paths(&original_path)),
+    )
+    .unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "clipboard_runtime_shutdown_helper",
             "--nocapture",
         ])
-        .env("PATH", &bin)
+        .env("PATH", command_path)
         .env("SLEEPY_TEST_CLIPHIST_PID", &pid_path)
         .output()
         .unwrap();

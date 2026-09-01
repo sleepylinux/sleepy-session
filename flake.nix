@@ -28,6 +28,7 @@
             allowBuiltinFetchGit = true;
           };
           nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ];
+          nativeCheckInputs = [ pkgs.coreutils pkgs.util-linux ];
           buildInputs = [ pkgs.dbus ];
           SLEEPY_DBUS_SESSION_CONF = "${pkgs.dbus}/share/dbus-1/session.conf";
           TZDIR = "${pkgs.tzdata}/share/zoneinfo";

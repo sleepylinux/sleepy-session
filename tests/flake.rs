@@ -46,3 +46,12 @@ fn flake_puts_the_dbus_daemon_on_the_native_check_path() {
     assert!(flake.contains("buildInputs = [ pkgs.dbus ]"));
     assert!(flake.contains("SLEEPY_DBUS_SESSION_CONF = \"${pkgs.dbus}/share/dbus-1/session.conf\""));
 }
+
+#[test]
+fn process_supervision_fixtures_use_nix_visible_check_tools() {
+    let flake = read_repository_file("flake.nix");
+    let fixtures = read_repository_file("tests/desktop_services.rs");
+
+    assert!(flake.contains("nativeCheckInputs = [ pkgs.coreutils pkgs.util-linux ]"));
+    assert!(!fixtures.contains("/bin/sleep"));
+}
