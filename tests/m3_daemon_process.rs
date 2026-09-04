@@ -176,24 +176,52 @@ fn daemon_sigint_reconciles_lifecycle_before_socket_cleanup() {
     let replay = validate_event_envelope(lines.next().unwrap().unwrap().trim()).unwrap();
     assert!(matches!(replay.payload, SessionEvent::FullSnapshot(_)));
 
-    let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
-    theme
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    theme
-        .write_all(
+    // Source events can advance the generation after replay. Force the first
+    // request to be stale so the recovery path is exercised on every run.
+    let mut expected_generation = u64::MAX;
+    let mut stale_rejections = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _pending_theme = loop {
+        assert!(
+            Instant::now() < deadline,
+            "theme setup kept racing source events"
+        );
+        let mut theme = std::os::unix::net::UnixStream::connect(&theme_socket).unwrap();
+        theme
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        theme.write_all(
             format!(
-                "{{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{{\"type\":\"apply\",\"data\":{{\"themeId\":\"builtin.sleepy-light\",\"expectedGeneration\":{}}}}}}}\n",
-                replay.generation
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-    let mut theme_lines = BufReader::new(theme).lines();
-    assert!(matches!(
-        serde_json::from_str::<ThemeMessage>(&theme_lines.next().unwrap().unwrap()).unwrap(),
-        ThemeMessage::Candidate { .. }
-    ));
+                "{{\"schemaVersion\":2,\"requestId\":\"d78951f8-c6f5-4f7d-8599-d72ed0b34803\",\"operation\":{{\"type\":\"apply\",\"data\":{{\"themeId\":\"builtin.sleepy-light\",\"expectedGeneration\":{expected_generation}}}}}}}\n"
+            ).as_bytes(),
+        ).unwrap();
+        let mut theme_lines = BufReader::new(theme).lines();
+        let reply =
+            serde_json::from_str::<ThemeMessage>(&theme_lines.next().unwrap().unwrap()).unwrap();
+        match reply {
+            ThemeMessage::Candidate { .. } => break theme_lines,
+            ThemeMessage::Result {
+                status: ThemeStatus::Error,
+                error: Some(ref error),
+                ..
+            } if error.starts_with("stale theme generation:") => {
+                stale_rejections += 1;
+                let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let snapshot = BufReader::new(stream).lines().next().unwrap().unwrap();
+                let snapshot = validate_event_envelope(snapshot.trim()).unwrap();
+                assert!(matches!(snapshot.payload, SessionEvent::FullSnapshot(_)));
+                expected_generation = snapshot.generation;
+            }
+            other => panic!("unexpected theme setup response: {other:?}"),
+        }
+    };
+    assert!(
+        stale_rejections > 0,
+        "the deliberately stale request was accepted"
+    );
 
     let daemon_pid = daemon.0.as_ref().unwrap().id() as libc::pid_t;
     assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGINT) }, 0);
