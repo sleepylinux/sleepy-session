@@ -2447,16 +2447,23 @@ async fn shutdown_drains_an_in_flight_publication_before_it_can_advance_after_re
     }
     tokio::time::sleep(Duration::from_millis(25)).await;
 
+    let shutdown_started = Instant::now();
     let shutdown = tokio::time::timeout(
         Duration::from_millis(400),
         runtime.shutdown(Duration::from_millis(100)),
     )
     .await;
+    let shutdown_elapsed = shutdown_started.elapsed();
     FileExt::unlock(&generation_lock).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let generation_after_return = authority.current_generation();
 
     assert_eq!(generation_after_return, baseline_generation);
+    // A synchronous cancellation wait can starve Tokio's timeout itself.
+    assert!(
+        shutdown_elapsed < Duration::from_millis(400),
+        "publication shutdown blocked the executor for {shutdown_elapsed:?}"
+    );
     assert!(
         shutdown.is_ok(),
         "publication shutdown exceeded its hard bound"
