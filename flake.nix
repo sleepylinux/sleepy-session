@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     sleepy-sdk = {
-      url = "github:sleepylinux/sleepy-sdk/152173b470fa7d1e90c6d3d6be103a4a4d3529bc";
+      url = "github:sleepylinux/sleepy-sdk/1ee5b424887eb6f7acfe3b931b37a2c610ff6498";
       flake = false;
     };
   };
@@ -28,6 +28,7 @@
             allowBuiltinFetchGit = true;
           };
           nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ];
+          nativeCheckInputs = [ pkgs.coreutils pkgs.util-linux ];
           buildInputs = [ pkgs.dbus ];
           SLEEPY_DBUS_SESSION_CONF = "${pkgs.dbus}/share/dbus-1/session.conf";
           TZDIR = "${pkgs.tzdata}/share/zoneinfo";

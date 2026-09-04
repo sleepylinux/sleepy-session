@@ -7,15 +7,14 @@ fn read_repository_file(path: &str) -> String {
 
 #[test]
 fn dependency_contract_pins_the_reviewed_gpl_sdk_revision() {
+    const SDK_REVISION: &str = "1ee5b424887eb6f7acfe3b931b37a2c610ff6498";
     let flake = read_repository_file("flake.nix");
     let manifest = read_repository_file("Cargo.toml");
     let lockfile = read_repository_file("Cargo.lock");
 
-    assert!(
-        flake.contains("github:sleepylinux/sleepy-sdk/152173b470fa7d1e90c6d3d6be103a4a4d3529bc")
-    );
-    assert!(manifest.contains("rev = \"152173b470fa7d1e90c6d3d6be103a4a4d3529bc\""));
-    assert!(lockfile.contains("#152173b470fa7d1e90c6d3d6be103a4a4d3529bc"));
+    assert!(flake.contains(&format!("github:sleepylinux/sleepy-sdk/{SDK_REVISION}")));
+    assert!(manifest.contains(&format!("rev = \"{SDK_REVISION}\"")));
+    assert!(lockfile.contains(&format!("#{SDK_REVISION}")));
     assert_eq!(flake.matches("github:sleepylinux/sleepy-sdk/").count(), 1);
     assert_eq!(manifest.matches("sleepy-sdk =").count(), 1);
     assert_eq!(lockfile.matches("name = \"sleepy-sdk\"").count(), 1);
@@ -46,4 +45,13 @@ fn flake_puts_the_dbus_daemon_on_the_native_check_path() {
     assert!(flake.contains("nativeBuildInputs = [ pkgs.pkg-config pkgs.dbus ]"));
     assert!(flake.contains("buildInputs = [ pkgs.dbus ]"));
     assert!(flake.contains("SLEEPY_DBUS_SESSION_CONF = \"${pkgs.dbus}/share/dbus-1/session.conf\""));
+}
+
+#[test]
+fn process_supervision_fixtures_use_nix_visible_check_tools() {
+    let flake = read_repository_file("flake.nix");
+    let fixtures = read_repository_file("tests/desktop_services.rs");
+
+    assert!(flake.contains("nativeCheckInputs = [ pkgs.coreutils pkgs.util-linux ]"));
+    assert!(!fixtures.contains("/bin/sleep"));
 }

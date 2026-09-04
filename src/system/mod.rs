@@ -19,9 +19,10 @@ use std::{
 };
 
 pub use runner::{
-    CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner, RunControl, RunnerError,
-    RunnerErrorKind,
+    run_command_supervisor, CommandOutput, CommandRunner, CommandSpec, ProcessCommandRunner,
+    RunControl, RunnerError, RunnerErrorKind,
 };
+pub(crate) use runner::{RunCancellation, RunCommitGuard};
 use sleepy_sdk::{
     validate_session_action_result, validate_system_mutation_result, validate_system_snapshot,
     AudioRuntimeState, AudioState, BatteryRuntimeState, BluetoothRuntimeState, BluetoothState,
@@ -179,9 +180,15 @@ impl<R: CommandRunner> SystemFacade<R> {
         }
     }
 
+    /// Clone the narrow fixed-argv runner for v3 adapters that need richer
+    /// domain state than the wire-v2 compatibility snapshot exposes.
+    pub fn runner(&self) -> R {
+        self.runner.clone()
+    }
+
     /// Bounded, capability-local readback used by the event-driven session
     /// adapters. Unlike `snapshot`, this never probes unrelated providers.
-    pub(crate) fn runtime_capability(&self, id: RuntimeCapabilityId) -> CapabilityRecord {
+    pub fn runtime_capability(&self, id: RuntimeCapabilityId) -> CapabilityRecord {
         let value = match id {
             RuntimeCapabilityId::Network => network::probe(&self.runner).map(|state| {
                 CapabilityValue::Network(NetworkRuntimeState {

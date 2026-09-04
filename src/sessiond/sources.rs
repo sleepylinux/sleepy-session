@@ -14,8 +14,9 @@ use std::{
 use dbus::{blocking::Connection, message::MatchRule};
 use serde_json::Value;
 use sleepy_sdk::{
-    CapabilityAvailability, CapabilityFailure, CapabilityRecord, CapabilityValue, EventCause,
-    EventCauseKind, NiriEvent, NiriRuntimeState, RuntimeCapabilityId, SessionEvent,
+    CapabilityAvailability, CapabilityFailure, CapabilityRecord, CapabilityValue,
+    DesktopCapability, EventCause, EventCauseKind, HyprlandSnapshot, NiriEvent, NiriRuntimeState,
+    RuntimeCapabilityId, SessionEvent,
 };
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, BufReader},
@@ -25,6 +26,7 @@ use tokio::{
 };
 
 use crate::{
+    compositor::{CompositorError, CompositorErrorKind, HyprlandAdapter, HyprlandEvent},
     overview::{OverviewEvent, OverviewEventSender},
     sessiond::GenerationAuthority,
     system::{ProcessCommandRunner, SystemFacade},
@@ -72,6 +74,62 @@ impl DbusSourceSpec {
 pub struct ProductionSources {
     shutdown: watch::Sender<bool>,
     tasks: Vec<JoinHandle<io::Result<()>>>,
+    hyprland: Option<HyprlandSource>,
+}
+
+pub struct HyprlandSource {
+    state: watch::Receiver<DesktopCapability<HyprlandSnapshot>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    task: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl HyprlandSource {
+    pub fn start(adapter: HyprlandAdapter) -> Self {
+        let cancellation = adapter.cancellation_token();
+        let (state_sender, state) = watch::channel(unavailable_hyprland(
+            "Hyprland compositor state has not reconciled yet",
+        ));
+        let task = tokio::spawn(run_hyprland_source(adapter, state_sender));
+        Self {
+            state,
+            cancellation,
+            task: Some(task),
+        }
+    }
+
+    pub fn unavailable(error: CompositorError) -> Self {
+        let (_sender, state) = watch::channel(hyprland_failure(&error));
+        Self {
+            state,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            task: None,
+        }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<DesktopCapability<HyprlandSnapshot>> {
+        self.state.clone()
+    }
+
+    pub async fn shutdown_and_join(mut self, timeout: Duration) -> io::Result<()> {
+        self.cancellation.cancel();
+        let Some(mut task) = self.task.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(io::Error::other(format!(
+                "Hyprland source task failed: {error}"
+            ))),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Hyprland source task did not stop after cancellation",
+                ))
+            }
+        }
+    }
 }
 
 impl ProductionSources {
@@ -95,6 +153,10 @@ impl ProductionSources {
         let focused_output = Arc::new(RwLock::new(None::<String>));
         let mut tasks = Vec::new();
         let mut triggers = BTreeMap::new();
+        let hyprland = match HyprlandAdapter::discover(tokio_util::sync::CancellationToken::new()) {
+            Ok(adapter) => HyprlandSource::start(adapter),
+            Err(error) => HyprlandSource::unavailable(error),
+        };
 
         for id in [
             RuntimeCapabilityId::Audio,
@@ -152,13 +214,30 @@ impl ProductionSources {
             shutdown_receiver,
         )));
 
-        Self { shutdown, tasks }
+        Self {
+            shutdown,
+            tasks,
+            hyprland: Some(hyprland),
+        }
+    }
+
+    pub fn hyprland_state(&self) -> watch::Receiver<DesktopCapability<HyprlandSnapshot>> {
+        self.hyprland
+            .as_ref()
+            .expect("production Hyprland source is present until shutdown")
+            .subscribe()
     }
 
     pub async fn shutdown_and_join(mut self, timeout: Duration) -> io::Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         let _ = self.shutdown.send(true);
         let mut first_error = None;
+        if let Some(hyprland) = self.hyprland.take() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if let Err(error) = hyprland.shutdown_and_join(remaining).await {
+                first_error = Some(error);
+            }
+        }
         for mut task in self.tasks.drain(..) {
             match tokio::time::timeout_at(deadline, &mut task).await {
                 Ok(Ok(Ok(()))) => {}
@@ -196,6 +275,100 @@ impl ProductionSources {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+async fn run_hyprland_source(
+    adapter: HyprlandAdapter,
+    state: watch::Sender<DesktopCapability<HyprlandSnapshot>>,
+) -> io::Result<()> {
+    let (sender, mut events) = mpsc::channel(16);
+    let event_loop = adapter.run_events(sender);
+    tokio::pin!(event_loop);
+    loop {
+        tokio::select! {
+            result = &mut event_loop => {
+                if let Err(error) = result {
+                    state.send_replace(hyprland_failure(&error));
+                }
+                return Ok(());
+            }
+            event = events.recv() => match event {
+                Some(HyprlandEvent::Snapshot(snapshot)) => {
+                    state.send_replace(DesktopCapability {
+                        status: CapabilityAvailability::Available,
+                        data: Some(snapshot),
+                        diagnostic: None,
+                    });
+                }
+                Some(HyprlandEvent::Degraded { kind }) => {
+                    state.send_replace(DesktopCapability {
+                        status: availability_for_compositor_error(kind),
+                        data: None,
+                        diagnostic: Some(CapabilityFailure {
+                            message: safe_hyprland_diagnostic(kind).into(),
+                        }),
+                    });
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+}
+
+fn unavailable_hyprland(message: impl Into<String>) -> DesktopCapability<HyprlandSnapshot> {
+    DesktopCapability {
+        status: CapabilityAvailability::Unavailable,
+        data: None,
+        diagnostic: Some(CapabilityFailure {
+            message: message.into(),
+        }),
+    }
+}
+
+fn hyprland_failure(error: &CompositorError) -> DesktopCapability<HyprlandSnapshot> {
+    DesktopCapability {
+        status: availability_for_compositor_error(error.kind()),
+        data: None,
+        diagnostic: Some(CapabilityFailure {
+            message: safe_hyprland_diagnostic(error.kind()).into(),
+        }),
+    }
+}
+
+fn safe_hyprland_diagnostic(kind: CompositorErrorKind) -> &'static str {
+    match kind {
+        CompositorErrorKind::Unavailable | CompositorErrorKind::UnsafeInstance => {
+            "Hyprland compositor is unavailable"
+        }
+        CompositorErrorKind::Timeout => "Hyprland compositor reconciliation timed out",
+        CompositorErrorKind::Parse
+        | CompositorErrorKind::Inconsistent
+        | CompositorErrorKind::Bounds => "Hyprland compositor protocol data was invalid",
+        CompositorErrorKind::Io => "Hyprland compositor transport failed",
+        CompositorErrorKind::Rejected
+        | CompositorErrorKind::Unsupported
+        | CompositorErrorKind::Unconfirmed => "Hyprland compositor command failed",
+        CompositorErrorKind::Lagged => "Hyprland compositor event consumer lagged",
+        CompositorErrorKind::Cancelled => "Hyprland compositor reconciliation stopped",
+    }
+}
+
+fn availability_for_compositor_error(kind: CompositorErrorKind) -> CapabilityAvailability {
+    match kind {
+        CompositorErrorKind::Unavailable | CompositorErrorKind::UnsafeInstance => {
+            CapabilityAvailability::Unavailable
+        }
+        CompositorErrorKind::Timeout => CapabilityAvailability::Timeout,
+        CompositorErrorKind::Parse
+        | CompositorErrorKind::Inconsistent
+        | CompositorErrorKind::Bounds => CapabilityAvailability::Parse,
+        CompositorErrorKind::Io
+        | CompositorErrorKind::Rejected
+        | CompositorErrorKind::Unsupported
+        | CompositorErrorKind::Unconfirmed
+        | CompositorErrorKind::Lagged
+        | CompositorErrorKind::Cancelled => CapabilityAvailability::Error,
     }
 }
 

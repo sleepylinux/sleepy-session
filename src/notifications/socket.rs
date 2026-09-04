@@ -2,6 +2,7 @@
 
 use super::{NotificationActionDispatcher, NotificationCommand, NotificationEventService};
 use crate::sessiond::private_socket::{peer_uid, read_bounded_line, PrivateSocketEndpoint};
+use crate::sessiond::supervisor::RequiredStartupTask;
 use serde::{Deserialize, Serialize};
 use sleepy_sdk::{NotificationDocument, WIRE_SCHEMA_VERSION};
 use std::{
@@ -14,6 +15,7 @@ use std::{
     time::Duration,
 };
 use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Mutex};
+use tokio_util::sync::CancellationToken;
 
 const MAX_LINE: usize = 256 * 1024;
 const MAX_CONNECTIONS: usize = 16;
@@ -98,7 +100,7 @@ pub struct NotificationSocket {
     endpoint: PrivateSocketEndpoint,
     service: Arc<Mutex<NotificationEventService>>,
     actions: Option<NotificationActionDispatcher>,
-    shutdown: tokio::sync::broadcast::Sender<()>,
+    shutdown: CancellationToken,
     connections: Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
     permits: Arc<tokio::sync::Semaphore>,
     serving: AtomicBool,
@@ -111,12 +113,11 @@ impl NotificationSocket {
         expected_uid: libc::uid_t,
         service: Arc<Mutex<NotificationEventService>>,
     ) -> io::Result<Self> {
-        let (shutdown, _) = tokio::sync::broadcast::channel(1);
         Ok(Self {
             endpoint: PrivateSocketEndpoint::bind(path, expected_uid).await?,
             service,
             actions: None,
-            shutdown,
+            shutdown: CancellationToken::new(),
             connections: Mutex::new(Vec::new()),
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
             serving: AtomicBool::new(false),
@@ -144,6 +145,12 @@ impl NotificationSocket {
         Ok(())
     }
     pub async fn serve(&self) -> io::Result<()> {
+        self.serve_inner(None).await
+    }
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        self.serve_inner(Some(startup)).await
+    }
+    async fn serve_inner(&self, startup: Option<RequiredStartupTask>) -> io::Result<()> {
         if self.serving.swap(true, Ordering::AcqRel) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -154,9 +161,12 @@ impl NotificationSocket {
             flag: &self.serving,
             stopped: &self.stopped,
         };
-        let mut shutdown = self.shutdown.subscribe();
+        let shutdown = self.shutdown.child_token();
+        if let Some(startup) = startup {
+            startup.ready_and_wait().await?;
+        }
         loop {
-            let stream = tokio::select! { stream = self.endpoint.accept() => stream?, _ = shutdown.recv() => return Ok(()) };
+            let stream = tokio::select! { stream = self.endpoint.accept() => stream?, _ = shutdown.cancelled() => return Ok(()) };
             let expected_uid = self.endpoint.expected_uid();
             let service = Arc::clone(&self.service);
             let actions = self.actions.clone();
@@ -182,7 +192,7 @@ impl NotificationSocket {
     }
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<usize> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let _ = self.shutdown.send(());
+        self.shutdown.cancel();
         if self.serving.load(Ordering::Acquire) {
             tokio::time::timeout_at(deadline, async {
                 while self.serving.load(Ordering::Acquire) {

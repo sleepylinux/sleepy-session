@@ -8,6 +8,7 @@ mod mutation;
 pub(crate) mod private_socket;
 mod socket;
 mod sources;
+pub mod supervisor;
 
 pub use authority::{GenerationAuthority, GenerationGuard};
 pub use control_socket::ControlSocket;
@@ -16,8 +17,9 @@ pub use hub::{EventHub, EventSubscriber, PublishError};
 pub use lifecycle::{LifecycleReconciler, ReconciliationReport, ShutdownCoordinator};
 pub use mutation::{MutationBackend, MutationPipeline, PipelineError, ProductionMutationBackend};
 pub use private_socket::PrivateSocketBindObserver as SessionSocketBindObserver;
-pub use socket::{SessionSocket, SocketDrainReport};
-pub use sources::ProductionSources;
+pub use socket::SessionSocket;
+pub use sources::{HyprlandSource, ProductionSources};
+pub use supervisor::SocketDrainReport;
 
 use sleepy_sdk::{
     CapabilityAvailability, CapabilityFailure, CapabilityRecord, EventCause, EventCauseKind,

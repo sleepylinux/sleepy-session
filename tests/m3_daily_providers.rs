@@ -14,6 +14,7 @@ use sleepy_session::{
         overview_event_channel, NiriOverview, ObservedOverviewEvent, OverviewEvent,
         OverviewEventSender, OverviewEventSource, OverviewRunner, ProcessOverviewRunner,
     },
+    sessiond::supervisor::{DaemonLifecycle, DaemonNotification, DaemonNotifier, StartupBarrier},
     system::{CommandOutput, CommandRunner, CommandSpec, RunControl},
     weather::{
         HttpRequest, HttpResponse, HttpTransport, ManualClock, MetNoProvider, NominatimProvider,
@@ -1058,6 +1059,43 @@ async fn daily_socket_is_private_uid_checked_strict_and_reachable() {
         .await
         .unwrap();
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn daily_socket_cannot_lose_shutdown_immediately_after_startup_release() {
+    struct Notifier;
+    impl DaemonNotifier for Notifier {
+        fn notify(&self, _state: DaemonNotification) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let root = tempdir().unwrap();
+    let path = root.path().join("sleepy/daily.sock");
+    let socket = Arc::new(
+        DailySocket::bind(&path, unsafe { libc::geteuid() }, Arc::new(FakeDaily))
+            .await
+            .unwrap(),
+    );
+    let mut startup = StartupBarrier::new();
+    let worker = startup.required_task("daily");
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve_with_startup(worker).await });
+    let lifecycle = DaemonLifecycle::new(Arc::new(Notifier));
+
+    lifecycle
+        .complete_startup(&[&path], &mut startup, || async {
+            socket.shutdown_and_drain(Duration::from_millis(100)).await
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("daily accept worker must observe immediate shutdown")
+        .unwrap()
+        .unwrap();
+    drop(socket);
+    assert!(!path.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

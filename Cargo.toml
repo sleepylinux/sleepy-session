@@ -5,6 +5,8 @@ edition = "2021"
 license = "GPL-3.0-only"
 
 [dependencies]
+async-trait = "0.1"
+zeroize = "1.8"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 dbus = "0.9.12"
 fs2 = "0.4"
@@ -12,9 +14,12 @@ libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "152173b470fa7d1e90c6d3d6be103a4a4d3529bc" }
+sd-notify = { version = "0.4.5", default-features = false }
+sleepy-sdk = { git = "https://github.com/sleepylinux/sleepy-sdk", rev = "1ee5b424887eb6f7acfe3b931b37a2c610ff6498" }
 tokio = { version = "=1.43.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.12", default-features = false }
 uuid = { version = "1.24", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.27"
+tokio = { version = "=1.43.0", features = ["test-util"] }

@@ -32,6 +32,26 @@ pub const DEFAULT_ACTIVE_NOTIFICATION_CAPACITY: usize = 500;
 pub const DEFAULT_NOTIFICATION_STATE_BYTES: usize = 48 * 1024 * 1024;
 const MAX_DURABLE_FILE_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationBusOwner {
+    Session,
+    Shell,
+}
+
+pub fn notification_bus_owner(value: Option<&OsStr>) -> io::Result<NotificationBusOwner> {
+    let Some(value) = value else {
+        return Ok(NotificationBusOwner::Session);
+    };
+    match value.to_str() {
+        Some("session") => Ok(NotificationBusOwner::Session),
+        Some("shell") => Ok(NotificationBusOwner::Shell),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SLEEPY_NOTIFICATION_BUS_OWNER must be session or shell",
+        )),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NotifyRequest {
     pub origin: String,

@@ -18,6 +18,7 @@ use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     calendar::IcsCalendarProvider,
@@ -25,7 +26,10 @@ use crate::{
     overview::{
         overview_event_channel, ChannelOverviewEvents, NiriOverview, ProcessOverviewRunner,
     },
-    sessiond::private_socket::{peer_uid, NoopBindObserver, PrivateSocketEndpoint},
+    sessiond::{
+        private_socket::{peer_uid, NoopBindObserver, PrivateSocketEndpoint},
+        supervisor::RequiredStartupTask,
+    },
     system::{CommandRunner, CommandSpec, ProcessCommandRunner, RunControl},
     weather::{CurlTransport, MetNoProvider, NominatimProvider, SystemClock},
 };
@@ -221,16 +225,27 @@ impl ProductionDailyBackend {
                 if query.len() > 512 || query.contains('\0') {
                     return Err(invalid("launcher query is invalid"));
                 }
+                ensure_active(control, "launcher search")?;
                 let entries = self.launcher.entries();
                 let ids = entries
                     .iter()
                     .map(|entry| entry.desktop_id.as_str())
                     .collect::<Vec<_>>();
-                let ranked = self
+                let metrics = self
                     .metrics
-                    .lock()
-                    .map_err(|_| io::Error::other("launcher metrics lock poisoned"))?
-                    .rank(&query, &ids);
+                    .try_lock()
+                    .map_err(|error| match error {
+                        std::sync::TryLockError::Poisoned(_) => {
+                            io::Error::other("launcher metrics lock poisoned")
+                        }
+                        std::sync::TryLockError::WouldBlock => {
+                            io::Error::new(io::ErrorKind::WouldBlock, "launcher metrics are busy")
+                        }
+                    })?
+                    .snapshot();
+                ensure_active(control, "launcher search")?;
+                let ranked = metrics.rank(&query, &ids);
+                ensure_active(control, "launcher search")?;
                 let result = ranked
                     .into_iter()
                     .filter_map(|id| self.launcher.get(&id))
@@ -293,6 +308,22 @@ impl ProductionDailyBackend {
             )
             .map_err(io::Error::other),
         }
+    }
+}
+
+fn ensure_active(control: &RunControl, operation: &str) -> io::Result<()> {
+    if control.is_cancelled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!("{operation} was cancelled"),
+        ))
+    } else if control.remaining().is_zero() {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{operation} exceeded its deadline"),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -392,7 +423,7 @@ fn executable_regular_file(path: &Path) -> bool {
 pub struct DailySocket<B> {
     endpoint: PrivateSocketEndpoint,
     backend: Arc<B>,
-    shutdown: tokio::sync::broadcast::Sender<()>,
+    shutdown: CancellationToken,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
     workers: Arc<tokio::sync::Semaphore>,
     admission: Arc<tokio::sync::Semaphore>,
@@ -425,11 +456,10 @@ impl<B: DailyBackend> DailySocket<B> {
             Arc::new(NoopBindObserver),
         )
         .await?;
-        let (shutdown, _) = tokio::sync::broadcast::channel(1);
         Ok(Self {
             endpoint,
             backend,
-            shutdown,
+            shutdown: CancellationToken::new(),
             tasks: tokio::sync::Mutex::new(Vec::new()),
             workers: Arc::new(tokio::sync::Semaphore::new(max_workers)),
             admission: Arc::new(tokio::sync::Semaphore::new(max_workers)),
@@ -438,9 +468,18 @@ impl<B: DailyBackend> DailySocket<B> {
         })
     }
     pub async fn serve(&self) -> io::Result<()> {
-        let mut shutdown = self.shutdown.subscribe();
+        self.serve_inner(None).await
+    }
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        self.serve_inner(Some(startup)).await
+    }
+    async fn serve_inner(&self, startup: Option<RequiredStartupTask>) -> io::Result<()> {
+        let shutdown = self.shutdown.child_token();
+        if let Some(startup) = startup {
+            startup.ready_and_wait().await?;
+        }
         loop {
-            let stream = tokio::select! { accepted = self.endpoint.accept() => accepted?, _ = shutdown.recv() => return Ok(()) };
+            let stream = tokio::select! { accepted = self.endpoint.accept() => accepted?, _ = shutdown.cancelled() => return Ok(()) };
             if self.stopping.load(Ordering::SeqCst) {
                 return Ok(());
             }
@@ -456,7 +495,7 @@ impl<B: DailyBackend> DailySocket<B> {
             };
             let backend = Arc::clone(&self.backend);
             let workers = Arc::clone(&self.workers);
-            let client_shutdown = self.shutdown.subscribe();
+            let client_shutdown = self.shutdown.child_token();
             let request_timeout = self.request_timeout;
             let stopping = Arc::clone(&self.stopping);
             let mut tasks = self.tasks.lock().await;
@@ -488,7 +527,7 @@ impl<B: DailyBackend> DailySocket<B> {
     }
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
-        let _ = self.shutdown.send(());
+        self.shutdown.cancel();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut deadline_missed = false;
         let mut first_error = None;
@@ -531,7 +570,7 @@ async fn serve_client<B: DailyBackend>(
     stream: UnixStream,
     backend: Arc<B>,
     workers: Arc<tokio::sync::Semaphore>,
-    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    shutdown: CancellationToken,
     request_timeout: Duration,
     stopping: Arc<AtomicBool>,
     _connection_permit: tokio::sync::OwnedSemaphorePermit,
@@ -544,7 +583,7 @@ async fn serve_client<B: DailyBackend>(
         }
         let line = tokio::select! {
             biased;
-            _ = shutdown.recv() => return Ok(()),
+            _ = shutdown.cancelled() => return Ok(()),
             line = read_bounded_line(&mut reader) => line?,
         };
         let Some(line) = line else {
@@ -558,7 +597,7 @@ async fn serve_client<B: DailyBackend>(
             {
                 let permit = tokio::select! {
                     biased;
-                    _ = shutdown.recv() => return Ok(()),
+                    _ = shutdown.cancelled() => return Ok(()),
                     permit = Arc::clone(&workers).acquire_owned() => permit.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "daily worker pool closed"))?,
                 };
                 let cancelled = Arc::new(AtomicBool::new(false));
@@ -571,7 +610,7 @@ async fn serve_client<B: DailyBackend>(
                 });
                 let handled = tokio::select! {
                     biased;
-                    _ = shutdown.recv() => {
+                    _ = shutdown.cancelled() => {
                         cancelled.store(true, Ordering::SeqCst);
                         let _ = worker.await.map_err(|error| io::Error::other(format!("daily worker failed: {error}")))?;
                         return Ok(());
@@ -611,7 +650,7 @@ async fn serve_client<B: DailyBackend>(
         }
         tokio::select! {
             biased;
-            _ = shutdown.recv() => return Ok(()),
+            _ = shutdown.cancelled() => return Ok(()),
             written = tokio::time::timeout(remaining, write.write_all(&bytes)) => {
                 written
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daily response write exceeded request deadline"))??;
@@ -675,6 +714,33 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn test_launcher_backend(root: &Path) -> ProductionDailyBackend {
+        let applications = root.join("applications");
+        fs::create_dir_all(&applications).unwrap();
+        fs::write(
+            applications.join("sleepy-test.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Sleepy Test\nExec=sleepy-test\n",
+        )
+        .unwrap();
+        let launcher = DesktopEntryIndex::scan(&[applications], &[], |_| true).unwrap();
+        let metrics = LauncherMetrics::open(&root.join("state/sleepy/launcher.json")).unwrap();
+        let (_sender, overview_events) = overview_event_channel(1);
+        ProductionDailyBackend {
+            launcher,
+            metrics: Mutex::new(metrics),
+            calendar: ProviderSlot::Degraded("calendar disabled in test".into()),
+            weather: ProviderSlot::Degraded("weather disabled in test".into()),
+            geocoder: ProviderSlot::Degraded("geocoder disabled in test".into()),
+            runner: ProcessCommandRunner,
+            overview: Mutex::new(NiriOverview::new(
+                ProcessOverviewRunner::default(),
+                overview_events,
+                Duration::from_millis(1500),
+            )),
+            fallback_overview_sender: None,
+        }
+    }
+
     #[test]
     fn try_exec_requires_regular_executable_access() {
         let root = tempfile::tempdir().unwrap();
@@ -725,5 +791,37 @@ mod tests {
         .unwrap();
         assert_eq!(resources.urls.len(), 3);
         assert_eq!(resources.files, ["/tmp/local:name", "relative-file"]);
+    }
+
+    #[test]
+    fn launcher_search_treats_metrics_contention_as_no_observation() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(test_launcher_backend(root.path()));
+        let _held_metrics = backend.metrics.lock().unwrap();
+        let worker_backend = Arc::clone(&backend);
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_backend.handle_controlled(
+                DailyOperation::LauncherSearch {
+                    query: "sleepy".into(),
+                },
+                &RunControl::for_timeout(Duration::from_millis(50)),
+            );
+            result_sender.send(result).unwrap();
+        });
+
+        match result_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                drop(_held_metrics);
+                worker.join().unwrap();
+                panic!("launcher search blocked behind mutation-owned metrics persistence");
+            }
+            Err(error) => panic!("launcher search worker disconnected: {error}"),
+        }
+        drop(_held_metrics);
+        worker.join().unwrap();
     }
 }

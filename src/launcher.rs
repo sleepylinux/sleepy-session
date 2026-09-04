@@ -484,6 +484,11 @@ pub struct LauncherMetrics {
     entries: BTreeMap<String, Usage>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LauncherMetricsSnapshot {
+    entries: BTreeMap<String, Usage>,
+}
+
 impl LauncherMetrics {
     pub fn open(path: &Path) -> io::Result<Self> {
         let parent = path.parent().ok_or_else(|| {
@@ -540,6 +545,33 @@ impl LauncherMetrics {
     }
 
     pub fn rank(&self, query: &str, candidates: &[&str]) -> Vec<String> {
+        LauncherMetricsSnapshot {
+            entries: self.entries.clone(),
+        }
+        .rank(query, candidates)
+    }
+
+    pub fn snapshot(&self) -> LauncherMetricsSnapshot {
+        LauncherMetricsSnapshot {
+            entries: self.entries.clone(),
+        }
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        let document = MetricsDocument {
+            schema_version: METRICS_VERSION,
+            entries: self.entries.clone(),
+        };
+        let mut bytes = serde_json::to_vec(&document).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        self.directory
+            .atomic_replace(&self.name, &bytes, || Ok(()), || Ok(()), || Ok(()))
+            .map_err(io::Error::other)
+    }
+}
+
+impl LauncherMetricsSnapshot {
+    pub fn rank(&self, query: &str, candidates: &[&str]) -> Vec<String> {
         let query = query.to_lowercase();
         let mut scored = candidates
             .iter()
@@ -557,18 +589,6 @@ impl LauncherMetrics {
                 .then_with(|| a.0.cmp(&b.0))
         });
         scored.into_iter().map(|value| value.0).collect()
-    }
-
-    fn persist(&self) -> io::Result<()> {
-        let document = MetricsDocument {
-            schema_version: METRICS_VERSION,
-            entries: self.entries.clone(),
-        };
-        let mut bytes = serde_json::to_vec(&document).map_err(io::Error::other)?;
-        bytes.push(b'\n');
-        self.directory
-            .atomic_replace(&self.name, &bytes, || Ok(()), || Ok(()), || Ok(()))
-            .map_err(io::Error::other)
     }
 }
 

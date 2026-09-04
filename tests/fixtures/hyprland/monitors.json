@@ -1,0 +1,38 @@
+[
+  {
+    "id": 0,
+    "name": "DP-1",
+    "description": "Acme Display 27",
+    "make": "Acme",
+    "model": "Display 27",
+    "serial": "fixture-only",
+    "width": 2560,
+    "height": 1440,
+    "refreshRate": 143.998,
+    "x": 0,
+    "y": 0,
+    "activeWorkspace": { "id": 2, "name": "2" },
+    "specialWorkspace": { "id": -99, "name": "special:magic" },
+    "reserved": [0, 32, 0, 0],
+    "scale": 1.25,
+    "transform": 0,
+    "focused": true,
+    "dpmsStatus": true,
+    "disabled": false,
+    "additiveFutureField": { "ignored": true }
+  },
+  {
+    "id": 1,
+    "name": "HDMI-A-1",
+    "description": "Fixture HDMI",
+    "width": 1920,
+    "height": 1080,
+    "refreshRate": 60.0,
+    "x": 2048,
+    "y": 0,
+    "activeWorkspace": { "id": 3, "name": "3" },
+    "specialWorkspace": { "id": 0, "name": "" },
+    "scale": 1.0,
+    "focused": false
+  }
+]

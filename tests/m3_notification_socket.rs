@@ -9,9 +9,13 @@ use sleepy_session::{
         FreedesktopNotificationProvider, NotificationEventService, NotificationSocket,
         NotificationStore, NotifyRequest,
     },
-    sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
+    sessiond::{
+        full_snapshot_event,
+        supervisor::{DaemonLifecycle, DaemonNotification, DaemonNotifier, StartupBarrier},
+        EventHub, GenerationAllocator, GenerationAuthority,
+    },
 };
-use std::{os::unix::fs::PermissionsExt, sync::Arc};
+use std::{io, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
@@ -82,6 +86,58 @@ async fn notification_socket_returns_real_history_and_mutates_shared_dnd_state()
     assert_eq!(expired["error"]["code"], "expired");
     assert!(expired.get("data").is_none());
     task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn notification_socket_cannot_lose_shutdown_immediately_after_startup_release() {
+    struct Notifier;
+    impl DaemonNotifier for Notifier {
+        fn notify(&self, _state: DaemonNotification) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = NotificationStore::open(temp.path().join("notifications"), 500).unwrap();
+    let provider = FreedesktopNotificationProvider::new(store).unwrap();
+    let allocator = GenerationAllocator::open(temp.path().join("generation"), 16).unwrap();
+    let authority = GenerationAuthority::new(
+        allocator,
+        0,
+        EventHub::new(full_snapshot_event(0).unwrap(), 16),
+    );
+    let service = Arc::new(tokio::sync::Mutex::new(NotificationEventService::new(
+        provider, authority,
+    )));
+    let path = temp.path().join("notification.sock");
+    let socket = Arc::new(
+        NotificationSocket::bind(&path, unsafe { libc::geteuid() }, service)
+            .await
+            .unwrap(),
+    );
+    let mut startup = StartupBarrier::new();
+    let worker = startup.required_task("notification");
+    let serving = Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve_with_startup(worker).await });
+    let lifecycle = DaemonLifecycle::new(Arc::new(Notifier));
+
+    lifecycle
+        .complete_startup(&[socket.path()], &mut startup, || async {
+            socket
+                .shutdown_and_drain(Duration::from_millis(100))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("notification accept worker must observe immediate shutdown")
+        .unwrap()
+        .unwrap();
+    drop(socket);
+    assert!(!path.exists());
 }
 
 async fn request(path: &std::path::Path, line: &str) -> serde_json::Value {

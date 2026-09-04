@@ -4,9 +4,16 @@ use sleepy_session::{
         spawn_osd_runtime, spawn_osd_runtime_with_timing, FocusedOsdRequest, OsdPublication,
         OsdPublicationHub, OsdRouteError, OsdRouter, OsdSocket,
     },
-    sessiond::{full_snapshot_event, EventHub, GenerationAllocator, GenerationAuthority},
+    sessiond::{
+        full_snapshot_event,
+        supervisor::{DaemonLifecycle, DaemonNotification, DaemonNotifier, StartupBarrier},
+        EventHub, GenerationAllocator, GenerationAuthority,
+    },
 };
-use std::time::{Duration, Instant};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -639,4 +646,48 @@ async fn osd_socket_replays_latest_then_monotonic_live_publications() {
         .await
         .unwrap();
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn osd_socket_cannot_lose_shutdown_immediately_after_startup_release() {
+    struct Notifier;
+    impl DaemonNotifier for Notifier {
+        fn notify(&self, _state: DaemonNotification) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("runtime/sleepy/osd.sock");
+    let socket = std::sync::Arc::new(
+        OsdSocket::bind(
+            &socket_path,
+            unsafe { libc::geteuid() },
+            OsdPublicationHub::new(8),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut startup = StartupBarrier::new();
+    let worker = startup.required_task("osd");
+    let serving = std::sync::Arc::clone(&socket);
+    let task = tokio::spawn(async move { serving.serve_with_startup(worker).await });
+    let lifecycle = DaemonLifecycle::new(std::sync::Arc::new(Notifier));
+
+    lifecycle
+        .complete_startup(&[socket.path()], &mut startup, || async {
+            socket
+                .shutdown_and_drain(Duration::from_millis(100))
+                .await
+                .map(|_| ())
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(100), task)
+        .await
+        .expect("OSD accept worker must observe immediate shutdown")
+        .unwrap()
+        .unwrap();
+    drop(socket);
+    assert!(!socket_path.exists());
 }

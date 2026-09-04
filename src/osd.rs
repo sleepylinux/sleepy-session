@@ -20,9 +20,11 @@ use tokio::{
     net::UnixStream,
     sync::{broadcast, mpsc, oneshot},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::sessiond::{
     private_socket::{peer_uid, PrivateSocketEndpoint},
+    supervisor::RequiredStartupTask,
     EventSubscriber, SocketDrainReport,
 };
 
@@ -65,7 +67,7 @@ pub struct OsdPublicationSubscriber {
 pub struct OsdSocket {
     endpoint: PrivateSocketEndpoint,
     hub: OsdPublicationHub,
-    shutdown: broadcast::Sender<()>,
+    shutdown: CancellationToken,
     connections: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
     serving: AtomicBool,
     serve_stopped: tokio::sync::Notify,
@@ -508,11 +510,10 @@ impl OsdSocket {
         hub: OsdPublicationHub,
     ) -> io::Result<Self> {
         let endpoint = PrivateSocketEndpoint::bind(path, expected_uid).await?;
-        let (shutdown, _) = broadcast::channel(1);
         Ok(Self {
             endpoint,
             hub,
-            shutdown,
+            shutdown: CancellationToken::new(),
             connections: tokio::sync::Mutex::new(Vec::new()),
             serving: AtomicBool::new(false),
             serve_stopped: tokio::sync::Notify::new(),
@@ -520,6 +521,14 @@ impl OsdSocket {
     }
 
     pub async fn serve(&self) -> io::Result<()> {
+        self.serve_inner(None).await
+    }
+
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        self.serve_inner(Some(startup)).await
+    }
+
+    async fn serve_inner(&self, startup: Option<RequiredStartupTask>) -> io::Result<()> {
         if self.serving.swap(true, Ordering::AcqRel) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -530,15 +539,18 @@ impl OsdSocket {
             serving: &self.serving,
             stopped: &self.serve_stopped,
         };
-        let mut listener_shutdown = self.shutdown.subscribe();
+        let listener_shutdown = self.shutdown.child_token();
+        if let Some(startup) = startup {
+            startup.ready_and_wait().await?;
+        }
         loop {
             let stream = tokio::select! {
                 accepted = self.endpoint.accept() => accepted?,
-                _ = listener_shutdown.recv() => return Ok(()),
+                _ = listener_shutdown.cancelled() => return Ok(()),
             };
             let expected_uid = self.endpoint.expected_uid();
             let subscriber = self.hub.subscribe()?;
-            let shutdown = self.shutdown.subscribe();
+            let shutdown = self.shutdown.child_token();
             self.connections.lock().await.push(tokio::spawn(async move {
                 serve_osd_stream(stream, expected_uid, subscriber, shutdown).await
             }));
@@ -547,7 +559,7 @@ impl OsdSocket {
 
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<SocketDrainReport> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let _ = self.shutdown.send(());
+        self.shutdown.cancel();
         if self.serving.load(Ordering::Acquire) {
             tokio::time::timeout_at(deadline, async {
                 while self.serving.load(Ordering::Acquire) {
@@ -590,7 +602,7 @@ impl OsdSocket {
 
 impl Drop for OsdSocket {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(());
+        self.shutdown.cancel();
     }
 }
 
@@ -610,7 +622,7 @@ async fn serve_osd_stream(
     mut stream: UnixStream,
     expected_uid: libc::uid_t,
     mut subscriber: OsdPublicationSubscriber,
-    mut shutdown: broadcast::Receiver<()>,
+    shutdown: CancellationToken,
 ) -> io::Result<()> {
     if peer_uid(&stream)? != expected_uid {
         return Err(io::Error::new(
@@ -622,7 +634,7 @@ async fn serve_osd_stream(
         let publication = tokio::select! {
             biased;
             publication = subscriber.recv() => publication?,
-            _ = shutdown.recv() => return Ok(()),
+            _ = shutdown.cancelled() => return Ok(()),
         };
         let mut line = serde_json::to_vec(&publication)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;

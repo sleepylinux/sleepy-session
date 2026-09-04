@@ -15,12 +15,13 @@ use sleepy_sdk::{ThemeDocument, WIRE_SCHEMA_VERSION};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
     net::UnixStream,
-    sync::{broadcast, Mutex},
+    sync::Mutex,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     sessiond::private_socket::{NoopBindObserver, PrivateSocketEndpoint},
-    sessiond::{private_socket::peer_uid, GenerationAuthority},
+    sessiond::{private_socket::peer_uid, supervisor::RequiredStartupTask, GenerationAuthority},
     system::RunControl,
     theme::{DesktopThemeSink, ThemeError, ThemeErrorKind, ThemeManager},
 };
@@ -168,7 +169,7 @@ pub struct ThemeSocket {
     endpoint: PrivateSocketEndpoint,
     manager: Arc<Mutex<ThemeManager>>,
     authority: GenerationAuthority,
-    shutdown: broadcast::Sender<()>,
+    shutdown: CancellationToken,
     connections: Mutex<Vec<tokio::task::JoinHandle<io::Result<()>>>>,
     serving: AtomicBool,
     stopped: tokio::sync::Notify,
@@ -189,12 +190,11 @@ impl ThemeSocket {
             Arc::new(NoopBindObserver),
         )
         .await?;
-        let (shutdown, _) = broadcast::channel(1);
         Ok(Self {
             endpoint,
             manager: Arc::new(Mutex::new(manager)),
             authority,
-            shutdown,
+            shutdown: CancellationToken::new(),
             connections: Mutex::new(Vec::new()),
             serving: AtomicBool::new(false),
             stopped: tokio::sync::Notify::new(),
@@ -204,6 +204,14 @@ impl ThemeSocket {
     }
 
     pub async fn serve(&self) -> io::Result<()> {
+        self.serve_inner(None).await
+    }
+
+    pub async fn serve_with_startup(&self, startup: RequiredStartupTask) -> io::Result<()> {
+        self.serve_inner(Some(startup)).await
+    }
+
+    async fn serve_inner(&self, startup: Option<RequiredStartupTask>) -> io::Result<()> {
         if self.serving.swap(true, Ordering::AcqRel) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -211,16 +219,19 @@ impl ThemeSocket {
             ));
         }
         let _guard = ServeGuard { socket: self };
-        let mut shutdown = self.shutdown.subscribe();
+        let shutdown = self.shutdown.child_token();
+        if let Some(startup) = startup {
+            startup.ready_and_wait().await?;
+        }
         loop {
             let stream = tokio::select! {
                 accepted = self.endpoint.accept() => accepted?,
-                _ = shutdown.recv() => return Ok(()),
+                _ = shutdown.cancelled() => return Ok(()),
             };
             let manager = Arc::clone(&self.manager);
             let authority = self.authority.clone();
             let expected_uid = self.endpoint.expected_uid();
-            let connection_shutdown = self.shutdown.subscribe();
+            let connection_shutdown = self.shutdown.child_token();
             let cancelled = Arc::clone(&self.cancelled);
             let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
                 drop(stream);
@@ -254,7 +265,7 @@ impl ThemeSocket {
     pub async fn shutdown_and_drain(&self, timeout: Duration) -> io::Result<usize> {
         let deadline = tokio::time::Instant::now() + timeout;
         self.cancelled.store(true, Ordering::SeqCst);
-        let _ = self.shutdown.send(());
+        self.shutdown.cancel();
         if self.serving.load(Ordering::Acquire) {
             tokio::time::timeout_at(deadline, async {
                 while self.serving.load(Ordering::Acquire) {
@@ -304,7 +315,7 @@ async fn serve_connection(
     expected_uid: libc::uid_t,
     manager: Arc<Mutex<ThemeManager>>,
     authority: GenerationAuthority,
-    mut shutdown: broadcast::Receiver<()>,
+    shutdown: CancellationToken,
     cancelled: Arc<AtomicBool>,
 ) -> io::Result<()> {
     if peer_uid(&stream)? != expected_uid {
@@ -318,7 +329,7 @@ async fn serve_connection(
     let writer = Arc::new(Mutex::new(write));
     let request_bytes = tokio::select! {
         biased;
-        _ = shutdown.recv() => return Ok(()),
+        _ = shutdown.cancelled() => return Ok(()),
         line = tokio::time::timeout(READ_TIMEOUT, read_line(&reader)) => line
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "theme request read timed out"))??,
     };
