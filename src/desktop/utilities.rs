@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use dbus::message::MatchRule;
 use sleepy_sdk::{
     CapabilityAvailability, ClipboardEntry, DesktopSessionCommand, LockState, RecordingState,
-    RecordingStatus, UtilityCommand,
+    RecordingStatus, RecordingTarget, UtilityCommand,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -66,21 +66,36 @@ pub fn action_spec(command: &UtilityCommand, output_path: &str) -> io::Result<Op
             "sleepy-capture-helper",
             ["pick-color", "--interactive-consent", "--clipboard"],
         ),
-        UtilityCommand::StartRecording { output_id, audio } => {
+        UtilityCommand::StartRecording {
+            output_id,
+            target,
+            region,
+            audio,
+        } => {
             validate_output_path(output_path)?;
             let mut args = vec![
                 "record".to_owned(),
                 "--interactive-consent".to_owned(),
                 "--output-id".to_owned(),
                 output_name(output_id)?.to_owned(),
-                "--output-path".to_owned(),
-                output_path.to_owned(),
             ];
+            if *target == RecordingTarget::Region {
+                let region = region.filter(|r| r.is_valid()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "region geometry required")
+                })?;
+                args.extend(["--region".to_owned(), serde_json::to_string(&region)?]);
+            } else if region.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "output recording cannot include a region",
+                ));
+            }
+            args.extend(["--output-path".to_owned(), output_path.to_owned()]);
             if *audio {
                 args.push("--audio".to_owned());
             }
             args.extend(["--status-fd".to_owned(), "1".to_owned()]);
-            CommandSpec::new("sleepy-capture-helper", args)
+            CommandSpec::new("sleepy-recording-helper", args)
         }
         UtilityCommand::InvokeTrayMenu { .. }
         | UtilityCommand::PasteClipboard { .. }
@@ -296,8 +311,13 @@ impl ProductionUtilityService {
                 self.set_idle_inhibited(*enabled)?;
                 Ok(self.state(DesktopDomainId::IdleInhibit))
             }
-            UtilityCommand::StartRecording { output_id, audio } => {
-                self.start_recording(output_id, *audio)?;
+            UtilityCommand::StartRecording {
+                output_id,
+                target,
+                region,
+                audio,
+            } => {
+                self.start_recording(output_id, *target, *region, *audio)?;
                 Ok(self.state(DesktopDomainId::Recording))
             }
             UtilityCommand::PauseRecording => {
@@ -390,7 +410,8 @@ impl ProductionUtilityService {
     }
 
     fn recording_snapshot(&self) -> io::Result<RecordingState> {
-        ensure_executable("sleepy-capture-helper")?;
+        ensure_executable("sleepy-recording-helper")?;
+        ensure_executable("gpu-screen-recorder")?;
         let mut runtime = self
             .recording
             .lock()
@@ -412,7 +433,8 @@ impl ProductionUtilityService {
                 io::Error::new(io::ErrorKind::WouldBlock, "recording state is busy")
             }
         })?;
-        ensure_executable("sleepy-capture-helper")?;
+        ensure_executable("sleepy-recording-helper")?;
+        ensure_executable("gpu-screen-recorder")?;
         if let Some(child) = runtime.child.as_mut() {
             if child.try_wait()?.is_some() {
                 *runtime = RecordingRuntime::default();
@@ -421,7 +443,13 @@ impl ProductionUtilityService {
         Ok(runtime.state.clone())
     }
 
-    fn start_recording(&self, output_id: &sleepy_sdk::StableId, audio: bool) -> io::Result<()> {
+    fn start_recording(
+        &self,
+        output_id: &sleepy_sdk::StableId,
+        target: RecordingTarget,
+        region: Option<sleepy_sdk::RecordingRegion>,
+        audio: bool,
+    ) -> io::Result<()> {
         let mut runtime = self
             .recording
             .lock()
@@ -443,6 +471,8 @@ impl ProductionUtilityService {
         let spec = action_spec(
             &UtilityCommand::StartRecording {
                 output_id: output_id.clone(),
+                target,
+                region,
                 audio,
             },
             path_text,
@@ -1434,7 +1464,9 @@ fn execute_session_with(
             )
             .map(Some)
         }
-        DesktopSessionCommand::Suspend | DesktopSessionCommand::Hibernate => {
+        DesktopSessionCommand::Suspend
+        | DesktopSessionCommand::Hibernate
+        | DesktopSessionCommand::SuspendThenHibernate => {
             invoke_sleep(command, &mut suspend)?;
             Ok(None)
         }
@@ -1511,7 +1543,9 @@ fn invoke_sleep(
 fn execute_sleep_via_logind(command: DesktopSessionCommand) -> io::Result<()> {
     if !matches!(
         command,
-        DesktopSessionCommand::Suspend | DesktopSessionCommand::Hibernate
+        DesktopSessionCommand::Suspend
+            | DesktopSessionCommand::Hibernate
+            | DesktopSessionCommand::SuspendThenHibernate
     ) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1641,6 +1675,11 @@ fn invoke_logind_action(
         DesktopSessionCommand::Hibernate => {
             let _: () = manager
                 .method_call(LOGIN1_MANAGER, "Hibernate", (true,))
+                .map_err(dbus_error)?;
+        }
+        DesktopSessionCommand::SuspendThenHibernate => {
+            let _: () = manager
+                .method_call(LOGIN1_MANAGER, "SuspendThenHibernate", (true,))
                 .map_err(dbus_error)?;
         }
         DesktopSessionCommand::Reboot => {
@@ -2480,6 +2519,23 @@ mod tests {
         assert_eq!(
             sleep_actions.into_inner(),
             [DesktopSessionCommand::Hibernate]
+        );
+
+        let sleep_actions = RefCell::new(Vec::new());
+        assert!(execute_session_with(
+            DesktopSessionCommand::SuspendThenHibernate,
+            || panic!("suspend-then-hibernate does not use the one-shot lock request"),
+            |command| {
+                sleep_actions.borrow_mut().push(command);
+                Ok(())
+            },
+            |_| panic!("suspend-then-hibernate must use the guarded sleep lifecycle"),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            sleep_actions.into_inner(),
+            [DesktopSessionCommand::SuspendThenHibernate]
         );
 
         let actions = RefCell::new(Vec::new());

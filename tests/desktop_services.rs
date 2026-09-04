@@ -1093,13 +1093,20 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
     let recording = utilities::action_spec(
         &UtilityCommand::StartRecording {
             output_id: StableId("output:eDP-1".into()),
+            target: sleepy_sdk::RecordingTarget::Region,
+            region: Some(sleepy_sdk::RecordingRegion {
+                x: -100,
+                y: 20,
+                width: 640,
+                height: 480,
+            }),
             audio: true,
         },
         "/run/user/1000/sleepy/captures/recording.mkv",
     )
     .unwrap()
     .unwrap();
-    assert_eq!(recording.program, "sleepy-capture-helper");
+    assert_eq!(recording.program, "sleepy-recording-helper");
     assert_eq!(
         recording.args,
         [
@@ -1107,6 +1114,8 @@ fn every_utility_action_has_a_typed_bounded_transport_contract() {
             "--interactive-consent",
             "--output-id",
             "eDP-1",
+            "--region",
+            r#"{"x":-100,"y":20,"width":640,"height":480}"#,
             "--output-path",
             "/run/user/1000/sleepy/captures/recording.mkv",
             "--audio",

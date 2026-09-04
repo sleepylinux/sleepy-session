@@ -7,7 +7,7 @@ fn read_repository_file(path: &str) -> String {
 
 #[test]
 fn dependency_contract_pins_the_reviewed_gpl_sdk_revision() {
-    const SDK_REVISION: &str = "f9178fd920877744db54ddccc59fd7efdc68bb6e";
+    const SDK_REVISION: &str = "1ee5b424887eb6f7acfe3b931b37a2c610ff6498";
     let flake = read_repository_file("flake.nix");
     let manifest = read_repository_file("Cargo.toml");
     let lockfile = read_repository_file("Cargo.lock");
