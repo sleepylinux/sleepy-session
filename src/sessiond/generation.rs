@@ -92,20 +92,26 @@ impl GenerationAllocator {
         Ok(generation)
     }
 
-    pub(crate) fn next_generation_in_commit(&mut self, control: &RunControl) -> io::Result<u64> {
+    pub(crate) fn next_generation_with_commit(
+        &mut self,
+        control: &RunControl,
+    ) -> io::Result<(u64, Option<RunCommitGuard>)> {
         let cancelled = || control.is_cancelled() || control.remaining().is_zero();
         ensure_not_cancelled(&cancelled)?;
-        if self.next == self.end {
-            self.reserve_block_with(&cancelled, || Ok(None))?;
+        let commit = if self.next == self.end {
+            // Wait for the file lock while cancellation is still observable.
+            // The atomic write starts the guard immediately before rename;
+            // return it to protect the caller's final publication as well.
+            self.reserve_block_with(&cancelled, || control.begin_commit())?
         } else {
-            ensure_not_cancelled(&cancelled)?;
-        }
+            control.begin_commit()?
+        };
         let generation = self.next;
         self.next = self
             .next
             .checked_add(1)
             .ok_or_else(|| io::Error::other("generation exhausted"))?;
-        Ok(generation)
+        Ok((generation, commit))
     }
 
     pub fn next_after(&mut self, floor: u64) -> io::Result<u64> {
@@ -121,14 +127,14 @@ impl GenerationAllocator {
     }
 
     fn reserve_block(&mut self) -> io::Result<()> {
-        self.reserve_block_with(&|| false, || Ok(None))
+        self.reserve_block_with(&|| false, || Ok(None)).map(drop)
     }
 
     fn reserve_block_with(
         &mut self,
         cancelled: &impl Fn() -> bool,
         mut begin_commit: impl FnMut() -> io::Result<Option<RunCommitGuard>>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<RunCommitGuard>> {
         let lock = self
             .directory
             .open_lock(&self.lock_name)
@@ -165,8 +171,7 @@ impl GenerationAllocator {
         self.next = start;
         self.end = end;
         FileExt::unlock(&lock)?;
-        drop(commit_guard);
-        Ok(())
+        Ok(commit_guard)
     }
 }
 

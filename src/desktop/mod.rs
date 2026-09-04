@@ -1266,13 +1266,11 @@ fn publish_domain_transaction(
         }
     };
     ensure_publication_active(control)?;
-    let _commit = match control {
-        Some(control) => control.begin_commit()?,
-        None => None,
-    };
-    let generation = match control {
-        Some(control) => transaction.generations.next_generation_in_commit(control)?,
-        None => transaction.generations.next_generation()?,
+    let (generation, _commit) = match control {
+        Some(control) => transaction
+            .generations
+            .next_generation_with_commit(control)?,
+        None => (transaction.generations.next_generation()?, None),
     };
     after_desktop_generation_reserved(environment.hook_scope, control.is_some());
     let advances_observation_revision = cause.kind == EventCauseKind::Request;
