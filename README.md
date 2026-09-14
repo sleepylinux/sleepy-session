@@ -46,8 +46,22 @@ desktop protocol intentionally defines no unlock command.
 
 ## CLI
 
-All successful commands print one JSON document to standard output. Failures
-print `{ "error": { "code", "message" } }` JSON to standard error.
+`sleepyctl doctor` prints a concise health report from the current desktop
+session. `sleepyctl doctor --json` prints the same report as one JSON document.
+Both are read-only: they authenticate the local daemon's socket UID and read its
+existing v3 capability snapshot, without invoking hardware tools or changing
+settings. The complete operation is limited to two seconds and a 1 MiB frame.
+
+The report contains fixed capability names and availability states, never SSIDs,
+MAC addresses, window titles, clipboard contents or free-form provider messages.
+Absent optional hardware is informational. An unavailable compositor or locker,
+a provider error, or an unreachable/invalid session stream returns exit status 1;
+a healthy report returns 0. Unsupported arguments return 2. This is a report of
+existing session capabilities, not a GPU/Vulkan self-test or verification of all
+systemd services. Run it as your desktop user, without sudo.
+
+Other successful commands print one JSON document to standard output. Their
+failures print `{ "error": { "code", "message" } }` JSON to standard error.
 
 ```sh
 sleepyctl settings show
