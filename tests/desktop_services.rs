@@ -3,7 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io,
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -377,6 +377,35 @@ impl DesktopMutationExecutor for LauncherReadbackExecutor {
     }
 }
 
+// PID publication is a record protocol: shell redirection creates the file
+// before printf writes it, and even a digit-only partial record is not ready.
+fn completed_child_pid(path: &Path) -> Option<libc::pid_t> {
+    let record = fs::read_to_string(path).ok()?;
+    let pid = record.strip_suffix('\n')?.parse::<libc::pid_t>().ok()?;
+    (pid > 1).then_some(pid)
+}
+
+#[test]
+fn child_pid_readiness_requires_a_complete_positive_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("child.pid");
+    assert_eq!(completed_child_pid(&path), None);
+    for partial_or_invalid in [
+        "",
+        "123",
+        "0\n",
+        "1\n",
+        "-1\n",
+        "2147483648\n",
+        "123\n456\n",
+    ] {
+        fs::write(&path, partial_or_invalid).unwrap();
+        assert_eq!(completed_child_pid(&path), None, "{partial_or_invalid:?}");
+    }
+    fs::write(&path, "123\n").unwrap();
+    assert_eq!(completed_child_pid(&path), Some(123));
+}
+
 #[derive(Clone)]
 struct BlockingProcessRunner {
     pid_path: Arc<PathBuf>,
@@ -418,7 +447,7 @@ impl CommandRunner for BlockingProcessRunner {
             "sh",
             [
                 "-c".to_owned(),
-                "printf '%s' \"$$\" > \"$1\"; exec sleep 30".to_owned(),
+                "printf '%s\\n' \"$$\" > \"$1\"; exec sleep 30".to_owned(),
                 "sleepy-producer-test".to_owned(),
                 self.pid_path.to_string_lossy().into_owned(),
             ],
@@ -1819,17 +1848,16 @@ async fn runtime_timeout_is_bounded_and_reaps_a_production_command_child() {
     authority.initialize().await.unwrap();
     let runtime = registry.start(authority, 16).unwrap();
     let child_start_deadline = Instant::now() + Duration::from_secs(3);
-    while !pid_path.exists() {
+    let child_pid = loop {
+        if let Some(pid) = completed_child_pid(pid_path.as_ref()) {
+            break pid;
+        }
         assert!(
             Instant::now() < child_start_deadline,
-            "producer child did not start"
+            "producer child did not publish a complete PID record"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let child_pid = std::fs::read_to_string(pid_path.as_ref())
-        .unwrap()
-        .parse::<libc::pid_t>()
-        .unwrap();
+    };
 
     let before = Instant::now();
     let result = tokio::time::timeout(
