@@ -206,6 +206,15 @@ async fn assert_stale_readback_is_unconfirmed(
     dispatches: Vec<&'static [u8]>,
 ) {
     let (_directory, paths, listener) = command_fixture().await;
+    tokio::time::pause();
+    // Keep the paused runtime runnable while real Unix socket I/O progresses;
+    // otherwise Tokio can auto-advance the deadline before the kernel responds.
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let (readback_ready, ready) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut expected = vec![
             b"j/monitors" as &'static [u8],
@@ -226,10 +235,19 @@ async fn assert_stale_readback_is_unconfirmed(
             };
             stream.write_all(response).await.unwrap();
         }
+        let mut readbacks = 0;
+        let mut readback_ready = Some(readback_ready);
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
             stream.read_to_end(&mut request).await.unwrap();
+            readbacks += 1;
+            if readbacks == 3 {
+                // Stale monitors/workspaces were consumed. Hold clients
+                // so expiry is deliberately inside a readback transport await.
+                readback_ready.take().unwrap().send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
             let response = match request.as_slice() {
                 b"j/monitors" => MONITORS.as_bytes(),
                 b"j/workspaces" => WORKSPACES.as_bytes(),
@@ -242,10 +260,16 @@ async fn assert_stale_readback_is_unconfirmed(
     let mut timing = test_timing();
     timing.operation_timeout = Duration::from_millis(40);
     let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), timing);
-    let error = adapter.execute(command).await.unwrap_err();
+    let operation = tokio::spawn(async move { adapter.execute(command).await });
+    ready.await.unwrap();
+    tokio::time::advance(Duration::from_millis(41)).await;
+    let error = operation.await.unwrap().unwrap_err();
     assert_eq!(error.kind(), CompositorErrorKind::Unconfirmed);
     server.abort();
     let _ = server.await;
+    clock_guard.abort();
+    let _ = clock_guard.await;
+    tokio::time::resume();
 }
 
 #[test]
@@ -1220,6 +1244,48 @@ async fn workspace_commands_distinguish_numeric_named_and_special_selectors() {
         .unwrap_err();
     assert_eq!(error.kind(), CompositorErrorKind::Rejected);
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn execute_predispatch_deadline_remains_timeout() {
+    let (_directory, paths, listener) = command_fixture().await;
+    tokio::time::pause();
+    let clock_guard = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).await.unwrap();
+        assert_eq!(request, b"j/monitors");
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let mut timing = test_timing();
+    timing.operation_timeout = Duration::from_millis(40);
+    let adapter = HyprlandAdapter::with_timing(paths, CancellationToken::new(), timing);
+    let operation = tokio::spawn(async move {
+        adapter
+            .execute(HyprlandCommand::CloseWindow {
+                window_id: StableId("0xabc".into()),
+            })
+            .await
+    });
+    ready.await.unwrap();
+    // Cross the timer's millisecond boundary without any wall-clock delay.
+    tokio::time::advance(Duration::from_millis(41)).await;
+    assert_eq!(
+        operation.await.unwrap().unwrap_err().kind(),
+        CompositorErrorKind::Timeout
+    );
+    server.abort();
+    clock_guard.abort();
+    let _ = server.await;
+    let _ = clock_guard.await;
+    tokio::time::resume();
 }
 
 #[tokio::test]
