@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    os::unix::fs::PermissionsExt,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -631,7 +630,9 @@ fn process_runner_kills_and_reaps_a_superseded_real_child() {
         ),
     )
     .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    // A concurrent fork can inherit a writer before it execs. Reproduce that
+    // ETXTBSY window deterministically instead of depending on scheduler load.
+    let _inherited_writer = fs::OpenOptions::new().write(true).open(&script).unwrap();
 
     let latest = Arc::new(AtomicU64::new(1));
     let control = RunControl::for_generation(
@@ -640,8 +641,9 @@ fn process_runner_kills_and_reaps_a_superseded_real_child() {
         Arc::clone(&latest),
     );
     let command = CommandSpec {
-        program: script.to_string_lossy().into_owned(),
+        program: executable_on_path("sh").to_string_lossy().into_owned(),
         args: vec![
+            script.to_string_lossy().into_owned(),
             pid_file.to_string_lossy().into_owned(),
             survived.to_string_lossy().into_owned(),
         ],
@@ -652,6 +654,12 @@ fn process_runner_kills_and_reaps_a_superseded_real_child() {
     let child = std::thread::spawn(move || ProcessCommandRunner.run_controlled(&command, &control));
     let readiness_deadline = Instant::now() + Duration::from_secs(4);
     while !pid_file.exists() && Instant::now() < readiness_deadline {
+        if child.is_finished() {
+            panic!(
+                "observable child exited before readiness: {:?}",
+                child.join()
+            );
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(pid_file.exists(), "child did not start before its deadline");
