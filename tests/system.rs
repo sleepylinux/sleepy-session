@@ -653,21 +653,27 @@ fn process_runner_kills_and_reaps_a_superseded_real_child() {
     };
     let child = std::thread::spawn(move || ProcessCommandRunner.run_controlled(&command, &control));
     let readiness_deadline = Instant::now() + Duration::from_secs(4);
-    while !pid_file.exists() && Instant::now() < readiness_deadline {
+    // Creating the file precedes writing its contents; only a complete PID is ready.
+    let pid: i32 = loop {
+        if let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        {
+            break pid;
+        }
         if child.is_finished() {
             panic!(
                 "observable child exited before readiness: {:?}",
                 child.join()
             );
         }
+        if Instant::now() >= readiness_deadline {
+            latest.store(2, Ordering::SeqCst);
+            panic!("child did not become ready: {:?}", child.join());
+        }
         std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(pid_file.exists(), "child did not start before its deadline");
-    let pid: i32 = fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    };
     latest.store(2, Ordering::SeqCst);
     let error = child.join().unwrap().unwrap_err();
     assert_eq!(error.kind(), RunnerErrorKind::Cancelled);
