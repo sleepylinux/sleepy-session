@@ -132,7 +132,19 @@ impl HyprlandAdapter {
                     "Hyprland readback did not confirm the requested postcondition",
                 ));
             }
-            let post = self.snapshot_at(deadline).await?;
+            let post = self.snapshot_at(deadline).await.map_err(|error| {
+                // Dispatch has been acknowledged: expiry while fetching its
+                // readback means the postcondition is unconfirmed, just like
+                // expiry between polls. Predispatch timeouts stay Timeout.
+                if error.kind() == CompositorErrorKind::Timeout {
+                    CompositorError::new(
+                        CompositorErrorKind::Unconfirmed,
+                        "Hyprland readback did not confirm the requested postcondition",
+                    )
+                } else {
+                    error
+                }
+            })?;
             if plan.expected.confirms(&post) {
                 return Ok(CompositorExecution::Snapshot(post));
             }
