@@ -6,6 +6,7 @@ pub mod cli;
 pub mod compositor;
 pub mod daily;
 pub mod desktop;
+pub mod doctor;
 pub mod launcher;
 pub mod notifications;
 pub mod osd;
