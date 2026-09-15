@@ -1,6 +1,6 @@
 # Absence fixtures
 
-These two fixtures are minimal examples derived from upstream renderers, **not
+The original two fixtures below are minimal examples derived from upstream renderers, **not
 captured VM output**. The prior VM doctor observed `audio=parse`, `battery=parse`,
 and `bluetooth=timeout`; it did not retain raw provider output, so these tests do
 not establish the exact cause of each VM diagnostic.
@@ -33,3 +33,23 @@ still bounds a service that disappears after the ownership check.
 
 These versions match the installed alpha's root nixpkgs revision
 `2c423e03bbafcff28bfadc6781a4a8257f205cb5` (systemd format reference v258).
+
+## Captured installed VM absence
+
+`upower-display-absent-vm.txt` is the verbatim UPower output from the installed
+candidate VM on 2026-09-15 (the command was `upower --show-info
+/org/freedesktop/UPower/devices/DisplayDevice`). Client and daemon both reported
+version **1.91.3**. This is distinct from the source-derived fixture above.
+
+- Image source: `7231d4b2bf320440365b0f51a323f3466c724dd1`.
+- ISO SHA-256: `8237aeac149bc6d281a13b55bd01da1fa5cc998768525efb3bd52048af1a8608`.
+- The image used sleepy-session `004e81dbfd10ebcec569129aa9eb6ae1559dab5f`.
+- Capture: root workspace `work/debug-usability/read-providers-report.txt`,
+  first command's stdout only; the following version lines confirmed 1.91.3.
+
+The aggregate has kind `unknown`, no state, warning level `none`, and a valid
+`power supply: no` header. Rejecting that boolean caused `battery=parse` on
+this VM. Both valid boolean values are accepted; malformed boolean, state and
+warning output remain parse errors. The fixture retains the actual timestamp,
+zero percentage and missing-battery icon. This proves the parser regression,
+not a complete new installed-system acceptance run.

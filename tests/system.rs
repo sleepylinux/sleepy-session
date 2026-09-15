@@ -1393,6 +1393,41 @@ fn successful_upower_unknown_display_device_means_no_battery() {
 }
 
 #[test]
+fn captured_upower_vm_without_power_supply_means_no_battery() {
+    let captured = include_str!("fixtures/system/upower-display-absent-vm.txt");
+    for (output, expected) in [
+        (
+            captured.to_owned(),
+            sleepy_sdk::CapabilityAvailability::Unsupported,
+        ),
+        (
+            captured.replace("power supply:         no", "power supply:         maybe"),
+            sleepy_sdk::CapabilityAvailability::Parse,
+        ),
+        (
+            captured.replace("warning-level:       none", "warning-level:       broken"),
+            sleepy_sdk::CapabilityAvailability::Parse,
+        ),
+        (
+            captured.replace("  unknown", "  unknown\n    state: broken"),
+            sleepy_sdk::CapabilityAvailability::Parse,
+        ),
+    ] {
+        let facade = SystemFacade::new(base_runner().output(
+            "upower",
+            &[
+                "--show-info",
+                "/org/freedesktop/UPower/devices/DisplayDevice",
+            ],
+            &output,
+        ));
+        let record = facade.runtime_capability(sleepy_sdk::RuntimeCapabilityId::Battery);
+        assert_eq!(record.status, expected);
+        assert!(record.value.is_none());
+    }
+}
+
+#[test]
 fn broken_upower_is_not_hidden_by_an_unknown_word() {
     for output in [
         "unknown\n",

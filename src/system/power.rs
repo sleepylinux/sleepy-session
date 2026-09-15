@@ -80,7 +80,7 @@ pub(crate) fn probe_battery<R: CommandRunner>(
     // Require its structured header; an arbitrary "unknown" is not absence.
     if battery.lines().any(|line| line.trim() == "unknown")
         && field(battery, "state:").is_none()
-        && field(battery, "power supply:") == Some("yes")
+        && matches!(field(battery, "power supply:"), Some("yes" | "no"))
         && matches!(field(battery, "has history:"), Some("yes" | "no"))
         && matches!(field(battery, "has statistics:"), Some("yes" | "no"))
         && field(battery, "warning-level:") == Some("none")
