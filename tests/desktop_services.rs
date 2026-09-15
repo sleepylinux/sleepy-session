@@ -406,6 +406,59 @@ fn child_pid_readiness_requires_a_complete_positive_record() {
     assert_eq!(completed_child_pid(&path), Some(123));
 }
 
+async fn wait_for_child_pids(
+    parent: &Path,
+    descendant: &Path,
+    deadline: Instant,
+    message: &str,
+) -> (libc::pid_t, libc::pid_t) {
+    loop {
+        if let Some(pids) = completed_child_pid(parent).zip(completed_child_pid(descendant)) {
+            return pids;
+        }
+        assert!(Instant::now() < deadline, "{message}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn child_pair_readiness_waits_for_both_complete_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("parent.pid");
+    let descendant = temp.path().join("descendant.pid");
+    fs::write(&parent, "").unwrap();
+    fs::write(&descendant, "").unwrap();
+    let waiter = tokio::spawn({
+        let parent = parent.clone();
+        let descendant = descendant.clone();
+        async move {
+            wait_for_child_pids(
+                &parent,
+                &descendant,
+                Instant::now() + Duration::from_secs(3),
+                "incomplete fixture record was not completed",
+            )
+            .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "empty files are not process readiness"
+    );
+    fs::write(&parent, "123\n").unwrap();
+    fs::write(&descendant, "4").unwrap();
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "a partial PID is not process readiness"
+    );
+    fs::write(&descendant, "456\n").unwrap();
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(waiter.await.unwrap(), (123, 456));
+}
+
 #[derive(Clone)]
 struct BlockingProcessRunner {
     pid_path: Arc<PathBuf>,
@@ -471,7 +524,7 @@ impl CommandRunner for DescendantPipeRunner {
             "sh",
             [
                 "-c".to_owned(),
-                "printf '%s' \"$$\" > \"$1\"; sleep 30 & printf '%s' \"$!\" > \"$2\"; wait"
+                "printf '%s\\n' \"$$\" > \"$1\"; sleep 30 & printf '%s\\n' \"$!\" > \"$2\"; wait"
                     .to_owned(),
                 "sleepy-producer-descendant-test".to_owned(),
                 self.parent_pid_path.to_string_lossy().into_owned(),
@@ -497,7 +550,7 @@ impl CommandRunner for EscapedDescendantRunner {
             "sh",
             [
                 "-c".to_owned(),
-                "printf '%s' \"$$\" > \"$1\"; setsid sh -c 'printf \"%s\" \"$$\" > \"$1\"; exec sleep 30' sleepy-escaped \"$2\" & wait"
+                "printf '%s\\n' \"$$\" > \"$1\"; setsid sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; exec sleep 30' sleepy-escaped \"$2\" & wait"
                     .to_owned(),
                 "sleepy-producer-escaped-descendant-test".to_owned(),
                 self.parent_pid_path.to_string_lossy().into_owned(),
@@ -1956,23 +2009,13 @@ async fn process_cancellation_kills_the_pipe_owning_group_and_reaps_descendant_o
             .unwrap();
     authority.initialize().await.unwrap();
     let runtime = registry.start(authority, 16).unwrap();
-    let child_start_deadline = Instant::now() + Duration::from_secs(3);
-    while !parent_pid_path.exists() || !descendant_pid_path.exists() {
-        assert!(
-            Instant::now() < child_start_deadline,
-            "pipe-owning process group did not start"
-        );
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    let parent_pid = std::fs::read_to_string(parent_pid_path.as_ref())
-        .unwrap()
-        .parse::<libc::pid_t>()
-        .unwrap();
-    let descendant_pid = std::fs::read_to_string(descendant_pid_path.as_ref())
-        .unwrap()
-        .parse::<libc::pid_t>()
-        .unwrap();
-
+    let (parent_pid, descendant_pid) = wait_for_child_pids(
+        parent_pid_path.as_ref(),
+        descendant_pid_path.as_ref(),
+        Instant::now() + Duration::from_secs(3),
+        "pipe-owning process group did not start",
+    )
+    .await;
     let shutdown = tokio::time::timeout(
         Duration::from_millis(400),
         runtime.shutdown(Duration::from_millis(100)),
@@ -2023,22 +2066,13 @@ async fn process_cancellation_reaps_an_escaped_descendant_without_reaping_unrela
             .unwrap();
     authority.initialize().await.unwrap();
     let runtime = registry.start(authority, 16).unwrap();
-    let child_start_deadline = Instant::now() + Duration::from_secs(3);
-    while !parent_pid_path.exists() || !descendant_pid_path.exists() {
-        assert!(
-            Instant::now() < child_start_deadline,
-            "escaped process tree did not start"
-        );
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    let parent_pid = fs::read_to_string(parent_pid_path.as_ref())
-        .unwrap()
-        .parse::<libc::pid_t>()
-        .unwrap();
-    let descendant_pid = fs::read_to_string(descendant_pid_path.as_ref())
-        .unwrap()
-        .parse::<libc::pid_t>()
-        .unwrap();
+    let (parent_pid, descendant_pid) = wait_for_child_pids(
+        parent_pid_path.as_ref(),
+        descendant_pid_path.as_ref(),
+        Instant::now() + Duration::from_secs(3),
+        "escaped process tree did not start",
+    )
+    .await;
     let mut unrelated = Command::new("sh")
         .args(["-c", "exit 0"])
         .spawn()
