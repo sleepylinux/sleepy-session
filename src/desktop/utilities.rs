@@ -1494,6 +1494,7 @@ impl<F> SuspendTransitionWait<F> {
 }
 
 fn execute_suspend_lifecycle<I, H, F>(
+    check_capability: impl FnOnce() -> io::Result<()>,
     acquire_inhibitor: impl FnOnce() -> io::Result<I>,
     acquire_hold: impl FnOnce() -> io::Result<H>,
     invoke_suspend: impl FnOnce() -> io::Result<()>,
@@ -1505,6 +1506,7 @@ fn execute_suspend_lifecycle<I, H, F>(
 where
     F: FnMut(bool, Option<Instant>) -> io::Result<()>,
 {
+    check_capability()?;
     let inhibitor = acquire_inhibitor()?;
     let hold = match acquire_hold() {
         Ok(hold) => hold,
@@ -1541,17 +1543,7 @@ fn invoke_sleep(
 }
 
 fn execute_sleep_via_logind(command: DesktopSessionCommand) -> io::Result<()> {
-    if !matches!(
-        command,
-        DesktopSessionCommand::Suspend
-            | DesktopSessionCommand::Hibernate
-            | DesktopSessionCommand::SuspendThenHibernate
-    ) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "sleep lifecycle only accepts suspend or hibernate",
-        ));
-    }
+    let capability_method = sleep_capability_method(&command)?;
     let connection = dbus::blocking::Connection::new_system().map_err(dbus_error)?;
     let (sender, receiver) = std_mpsc::sync_channel(4);
     let rule = MatchRule::new_signal(LOGIN1_MANAGER, "PrepareForSleep")
@@ -1565,6 +1557,7 @@ fn execute_sleep_via_logind(command: DesktopSessionCommand) -> io::Result<()> {
         .map_err(dbus_error)?;
     let prepare_deadline = Instant::now() + LOGIND_ACTION_TIMEOUT;
     execute_suspend_lifecycle(
+        || check_sleep_capability(&connection, capability_method, prepare_deadline),
         || acquire_sleep_delay_inhibitor(&connection, prepare_deadline),
         acquire_suspend_hold,
         || invoke_logind_action(&connection, command, prepare_deadline),
@@ -1584,6 +1577,52 @@ fn execute_sleep_via_logind(command: DesktopSessionCommand) -> io::Result<()> {
         LockerSuspendHold::release,
         LockerSuspendHold::fail_closed,
     )
+}
+
+// Query before taking any hold: a machine that cannot sleep must remain unlockable.
+// A capability can change after this query; invocation/transition errors still fail closed.
+fn sleep_capability_method(command: &DesktopSessionCommand) -> io::Result<&'static str> {
+    match command {
+        DesktopSessionCommand::Suspend => Ok("CanSuspend"),
+        DesktopSessionCommand::Hibernate => Ok("CanHibernate"),
+        DesktopSessionCommand::SuspendThenHibernate => Ok("CanSuspendThenHibernate"),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sleep lifecycle only accepts suspend or hibernate",
+        )),
+    }
+}
+
+fn validate_sleep_capability(value: &str) -> io::Result<()> {
+    let kind = match value {
+        "yes" | "challenge" => return Ok(()),
+        "na" => io::ErrorKind::Unsupported,
+        "no" => io::ErrorKind::PermissionDenied,
+        "inhibited" | "inhibitor-blocked" | "challenge-inhibitor-blocked" => {
+            io::ErrorKind::WouldBlock
+        }
+        _ => io::ErrorKind::InvalidData,
+    };
+    Err(io::Error::new(
+        kind,
+        format!("logind sleep capability: {value}"),
+    ))
+}
+
+fn check_sleep_capability(
+    connection: &dbus::blocking::Connection,
+    method: &'static str,
+    deadline: Instant,
+) -> io::Result<()> {
+    let manager = connection.with_proxy(
+        LOGIN1_DESTINATION,
+        LOGIN1_MANAGER_PATH,
+        remaining(deadline)?,
+    );
+    let (capability,): (String,) = manager
+        .method_call(LOGIN1_MANAGER, method, ())
+        .map_err(dbus_error)?;
+    validate_sleep_capability(&capability)
 }
 
 fn acquire_sleep_delay_inhibitor(
@@ -2083,6 +2122,95 @@ mod tests {
     }
 
     #[test]
+    fn suspend_capability_is_typed_and_requires_positive_support() {
+        for (command, method) in [
+            (DesktopSessionCommand::Suspend, "CanSuspend"),
+            (DesktopSessionCommand::Hibernate, "CanHibernate"),
+            (
+                DesktopSessionCommand::SuspendThenHibernate,
+                "CanSuspendThenHibernate",
+            ),
+        ] {
+            assert_eq!(sleep_capability_method(&command).unwrap(), method);
+        }
+        assert_eq!(
+            sleep_capability_method(&DesktopSessionCommand::Lock)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        for value in ["yes", "challenge"] {
+            validate_sleep_capability(value).unwrap();
+        }
+        for (value, kind) in [
+            ("na", io::ErrorKind::Unsupported),
+            ("no", io::ErrorKind::PermissionDenied),
+            ("inhibited", io::ErrorKind::WouldBlock),
+            ("inhibitor-blocked", io::ErrorKind::WouldBlock),
+            ("challenge-inhibitor-blocked", io::ErrorKind::WouldBlock),
+            ("", io::ErrorKind::InvalidData),
+            ("YES", io::ErrorKind::InvalidData),
+            ("future-value", io::ErrorKind::InvalidData),
+        ] {
+            assert_eq!(validate_sleep_capability(value).unwrap_err().kind(), kind);
+        }
+    }
+
+    #[test]
+    fn suspend_preflight_failure_never_acquires_inhibitor_or_locker_hold() {
+        for kind in [
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+        ] {
+            let error = execute_suspend_lifecycle(
+                || Err(io::Error::new(kind, "capability fixture")),
+                || -> io::Result<()> { panic!("failed preflight acquired inhibitor") },
+                || -> io::Result<()> { panic!("failed preflight acquired locker hold") },
+                || panic!("failed preflight invoked sleep"),
+                SuspendTransitionWait::new(Duration::from_millis(20), |_, _| {
+                    panic!("failed preflight waited for sleep")
+                }),
+                |_| panic!("failed preflight released inhibitor"),
+                |_| panic!("failed preflight released hold"),
+                |_| panic!("failed preflight retained hold"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+    }
+
+    #[test]
+    fn suspend_invocation_ambiguity_retains_the_hold() {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::Other,
+        ] {
+            let retained = std::cell::Cell::new(false);
+            let inhibitor_released = std::cell::Cell::new(false);
+            let error = execute_suspend_lifecycle(
+                || Ok(()),
+                || Ok(()),
+                || Ok(()),
+                || Err(io::Error::new(kind, "ambiguous invocation")),
+                SuspendTransitionWait::new(Duration::from_millis(20), |_, _| {
+                    panic!("failed invocation waited for transitions")
+                }),
+                |_| inhibitor_released.set(true),
+                |_| panic!("ambiguous invocation released locker hold"),
+                |_| retained.set(true),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(retained.get());
+            assert!(inhibitor_released.get());
+        }
+    }
+
+    #[test]
     fn suspend_lifecycle_releases_delay_only_for_prepare_and_hold_only_for_resume() {
         let steps = Rc::new(RefCell::new(Vec::new()));
         let inhibitor_released_at = Rc::new(RefCell::new(None));
@@ -2092,6 +2220,10 @@ mod tests {
         };
 
         execute_suspend_lifecycle(
+            || {
+                record("capability", &steps);
+                Ok(())
+            },
             {
                 let steps = Rc::clone(&steps);
                 move || {
@@ -2154,6 +2286,7 @@ mod tests {
         assert_eq!(
             steps.borrow().as_slice(),
             [
+                "capability",
                 "inhibit",
                 "hold",
                 "suspend",
@@ -2170,6 +2303,7 @@ mod tests {
         let steps = Rc::new(RefCell::new(Vec::new()));
         let resume_timeout = Duration::from_millis(20);
         let error = execute_suspend_lifecycle(
+            || Ok(()),
             || Ok("inhibitor"),
             || Ok("hold"),
             || Ok(()),
