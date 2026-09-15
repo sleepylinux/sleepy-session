@@ -304,10 +304,24 @@ fn parse_rows(status: &[u8]) -> io::Result<Vec<Row>> {
     let text = std::str::from_utf8(status)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "wpctl output is not UTF-8"))?;
     let mut section = None;
+    let mut in_audio = false;
+    let mut audio_headings = BTreeSet::new();
+    let mut unparsed_row = false;
     let mut rows = Vec::new();
     let mut identifiers = BTreeSet::new();
     for line in text.lines() {
         let trimmed = line.trim_start_matches([' ', '│', '├', '└', '─']);
+        if matches!(trimmed, "Audio" | "Video" | "Settings") {
+            in_audio = trimmed == "Audio";
+            section = None;
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        if matches!(trimmed, "Sinks:" | "Sources:" | "Streams:") {
+            audio_headings.insert(trimmed);
+        }
         section = match trimmed {
             "Sinks:" => Some(RowKind::Output),
             "Sources:" => Some(RowKind::Input),
@@ -322,6 +336,7 @@ fn parse_rows(status: &[u8]) -> io::Result<Vec<Row>> {
         let is_default = trimmed.starts_with('*');
         let row = trimmed.trim_start_matches('*').trim();
         let Some((id, remainder)) = row.split_once('.') else {
+            unparsed_row = true;
             continue;
         };
         let id = numeric(id.trim())?;
@@ -361,6 +376,14 @@ fn parse_rows(status: &[u8]) -> io::Result<Vec<Row>> {
                 "audio identifier probe exceeds its call budget",
             ));
         }
+    }
+    // wpctl prints these sections even when the graph contains no audio
+    // nodes. Missing/truncated headings remain malformed, not "no hardware".
+    if rows.is_empty() && audio_headings.len() == 3 && !unparsed_row {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "no audio nodes are available",
+        ));
     }
     if !rows.iter().any(|row| row.kind == RowKind::Output) {
         return Err(io::Error::new(

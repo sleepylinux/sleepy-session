@@ -776,6 +776,9 @@ fn supervise_command(request: SupervisorRequest, parent: &mut impl Read) -> Supe
     for (key, value) in &request.env {
         command.env(key, value);
     }
+    // Provider tools (including busctl) must not notify systemd on behalf of
+    // sleepy-sessiond: inherited exit/readiness messages corrupt its lifecycle.
+    command.env_remove("NOTIFY_SOCKET");
     let started = Instant::now();
     let mut child = match command.spawn() {
         Ok(child) => child,

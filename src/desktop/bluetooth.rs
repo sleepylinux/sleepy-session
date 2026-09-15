@@ -31,7 +31,48 @@ pub fn mutation_spec(command: &BluetoothCommand) -> io::Result<CommandSpec> {
 }
 
 pub fn probe<R: CommandRunner>(runner: &R) -> io::Result<BluetoothSnapshot> {
-    let show = super::network::run(runner, CommandSpec::new("bluetoothctl", ["show"]))?;
+    // Query the bus itself: NameHasOwner cannot activate bluetoothd. The CLI
+    // otherwise waits for a daemon that an optional installation may not run.
+    let owner = super::network::run(
+        runner,
+        CommandSpec::new(
+            "busctl",
+            [
+                "--system",
+                "--timeout=1",
+                "call",
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                "s",
+                "org.bluez",
+            ],
+        ),
+    )?;
+    match text(&owner)?.trim() {
+        "b false" => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Bluetooth service is unavailable",
+            ))
+        }
+        "b true" => {}
+        _ => return invalid("D-Bus owner reply is malformed"),
+    }
+    let result = runner.run(&CommandSpec::new("bluetoothctl", ["show"]));
+    if let Ok(output) = &result {
+        // BlueZ cmd_show uses this exact diagnostic and EXIT_FAILURE when no
+        // controller exists. Other failures (including timeouts) stay failures.
+        if output.status == 1 && output.stdout == b"No default controller available\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no Bluetooth controller is available",
+            ));
+        }
+    }
+    let show = super::network::command_output(result)?;
+    let _ = controller_state(&show)?;
     let devices = super::network::run(runner, CommandSpec::new("bluetoothctl", ["devices"]))?;
     let mut details = BTreeMap::new();
     for (mac, _) in parse_device_rows(&devices)? {
@@ -74,14 +115,20 @@ pub fn mutate<R: CommandRunner>(
     Ok(snapshot)
 }
 
+fn controller_state(show: &[u8]) -> io::Result<(bool, bool)> {
+    let show = text(show)?;
+    Ok((
+        yes_no(required_property(show, "Powered")?)?,
+        yes_no(required_property(show, "Discovering")?)?,
+    ))
+}
+
 pub fn parse_snapshot(
     show: &[u8],
     devices: &[u8],
     details: &BTreeMap<String, Vec<u8>>,
 ) -> io::Result<BluetoothSnapshot> {
-    let show = text(show)?;
-    let powered = yes_no(required_property(show, "Powered")?)?;
-    let scanning = yes_no(required_property(show, "Discovering")?)?;
+    let (powered, scanning) = controller_state(show)?;
     let rows = parse_device_rows(devices)?;
     if rows.len() > 1_024 {
         return invalid("too many Bluetooth devices");
