@@ -273,6 +273,66 @@ async fn assert_stale_readback_is_unconfirmed(
 }
 
 #[test]
+fn empty_wayland_app_id_preserves_popup_and_normal_client_in_sdk_snapshot() {
+    // Minimal metadata observed on Hyprland 0.56.2's update popup. The existing
+    // fixture supplies anonymized addresses and coherent monitor/workspace data.
+    let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
+    clients[0]["class"] = serde_json::json!("");
+    clients[0]["title"] = serde_json::json!("Hyprland Updated");
+    let snapshot = parse_full_snapshot(
+        MONITORS.as_bytes(),
+        WORKSPACES.as_bytes(),
+        clients.to_string().as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(snapshot.windows.len(), 2);
+    assert_eq!(snapshot.windows[0].id, "0xabc");
+    assert_eq!(snapshot.windows[0].title, "Hyprland Updated");
+    assert_eq!(snapshot.windows[0].application_id, "unknown");
+    assert_eq!(snapshot.windows[1], parse_fixture().windows[1]);
+    let envelope = serde_json::json!({
+        "schemaVersion": sleepy_sdk::DESKTOP_WIRE_VERSION,
+        "generation": 1,
+        "eventId": "00000000-0000-4000-8000-000000000001",
+        "emittedAt": "1970-01-01T00:00:00Z",
+        "cause": { "kind": "lifecycle" },
+        "payload": { "type": "domainUpdate", "data": {
+            "topic": "compositor", "update": { "domain": "hyprland", "data": {
+                "status": "available", "data": snapshot
+            }}
+        }}
+    });
+    sleepy_sdk::validate_desktop_envelope(&envelope.to_string()).unwrap();
+}
+
+#[test]
+fn malformed_wayland_app_ids_remain_rejected() {
+    for value in [
+        serde_json::Value::Null,
+        serde_json::json!(42),
+        serde_json::json!("app\nname"),
+        serde_json::json!("a".repeat(513)),
+    ] {
+        let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
+        clients[0]["class"] = value;
+        assert!(parse_full_snapshot(
+            MONITORS.as_bytes(),
+            WORKSPACES.as_bytes(),
+            clients.to_string().as_bytes()
+        )
+        .is_err());
+    }
+    let mut clients: serde_json::Value = serde_json::from_str(CLIENTS).unwrap();
+    clients[0].as_object_mut().unwrap().remove("class");
+    assert!(parse_full_snapshot(
+        MONITORS.as_bytes(),
+        WORKSPACES.as_bytes(),
+        clients.to_string().as_bytes()
+    )
+    .is_err());
+}
+
+#[test]
 fn full_snapshot_maps_stable_ids_focus_special_workspace_and_window_state() {
     let snapshot = parse_fixture();
 
