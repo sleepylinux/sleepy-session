@@ -279,7 +279,7 @@ pub(crate) fn run_controlled<R: CommandRunner>(
     command_output(runner.run_controlled(&spec, control))
 }
 
-fn command_output(
+pub(crate) fn command_output(
     result: Result<crate::system::CommandOutput, crate::system::RunnerError>,
 ) -> io::Result<Vec<u8>> {
     match result {

@@ -1372,3 +1372,54 @@ fn missing_lock_program_marks_only_lock_unavailable() {
         CapabilityState::Available
     );
 }
+
+#[test]
+fn successful_upower_unknown_display_device_means_no_battery() {
+    let runner = base_runner().output(
+        "upower",
+        &[
+            "--show-info",
+            "/org/freedesktop/UPower/devices/DisplayDevice",
+        ],
+        include_str!("fixtures/system/upower-display-absent.txt"),
+    );
+    let facade = SystemFacade::new(runner);
+    let record = facade.runtime_capability(sleepy_sdk::RuntimeCapabilityId::Battery);
+    assert_eq!(
+        record.status,
+        sleepy_sdk::CapabilityAvailability::Unsupported
+    );
+    assert!(record.value.is_none());
+}
+
+#[test]
+fn broken_upower_is_not_hidden_by_an_unknown_word() {
+    for output in [
+        "unknown\n",
+        "power supply: yes\n unknown\n state: broken\n",
+        "state: broken\npercentage: 50%\n",
+        "power supply: yes\nhas history: no\nhas statistics: no\nunknown\nwarning-level: broken\n",
+    ] {
+        let facade = SystemFacade::new(base_runner().output(
+            "upower",
+            &[
+                "--show-info",
+                "/org/freedesktop/UPower/devices/DisplayDevice",
+            ],
+            output,
+        ));
+        let record = facade.runtime_capability(sleepy_sdk::RuntimeCapabilityId::Battery);
+        assert_eq!(record.status, sleepy_sdk::CapabilityAvailability::Parse);
+    }
+}
+
+#[test]
+fn provider_process_cannot_inherit_daemon_notify_socket() {
+    let runner = ProcessCommandRunner;
+    let mut spec = CommandSpec::new("sh", ["-c", "printf %s \"${NOTIFY_SOCKET-unset}\""]);
+    spec.env.push((
+        "NOTIFY_SOCKET".into(),
+        "/tmp/daemon-notify-must-not-leak".into(),
+    ));
+    assert_eq!(runner.run(&spec).unwrap().stdout, b"unset");
+}

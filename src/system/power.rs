@@ -75,6 +75,18 @@ pub(crate) fn probe_battery<R: CommandRunner>(
         }
     };
     let battery = text(&battery)?;
+    // UPower's successful DisplayDevice has kind "unknown" when no battery
+    // or UPS contributes. up_device_to_text then deliberately omits state.
+    // Require its structured header; an arbitrary "unknown" is not absence.
+    if battery.lines().any(|line| line.trim() == "unknown")
+        && field(battery, "state:").is_none()
+        && field(battery, "power supply:") == Some("yes")
+        && matches!(field(battery, "has history:"), Some("yes" | "no"))
+        && matches!(field(battery, "has statistics:"), Some("yes" | "no"))
+        && field(battery, "warning-level:") == Some("none")
+    {
+        return Err(ProbeFailure::unsupported("no battery is available"));
+    }
     let state = field(battery, "state:")
         .ok_or_else(|| ProbeFailure::parse("UPower omitted battery state"))?;
     let percentage = field(battery, "percentage:");

@@ -1,0 +1,7 @@
+  power supply:         yes
+  updated:              Mon Sep 14 12:00:00 2026 (0 seconds ago)
+  has history:          no
+  has statistics:       no
+  unknown
+    warning-level:       none
+    icon-name:          ''

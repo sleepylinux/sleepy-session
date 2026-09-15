@@ -875,11 +875,12 @@ fn per_item_probes_validate_dedupe_and_bound_identifiers_before_subprocesses() {
         })
         .collect::<String>();
     let bluetooth_runner = ScriptedRunner::new([
+        command_output(b"b true\n"),
         command_output(b"\tPowered: yes\n\tDiscovering: no\n"),
         command_output(bluetooth_rows.as_bytes()),
     ]);
     assert!(bluetooth::probe(&bluetooth_runner).is_err());
-    assert_eq!(bluetooth_runner.seen.lock().unwrap().len(), 2);
+    assert_eq!(bluetooth_runner.seen.lock().unwrap().len(), 3);
 
     let audio_runner = ScriptedRunner::new([command_output(
         b"Audio\n Sinks:\n  * 42. Speakers\n  42. Duplicate\n",
@@ -927,6 +928,7 @@ fn rich_system_mutations_execute_then_require_complete_confirmed_readback() {
 
     let bluetooth_runner = ScriptedRunner::new([
         command_output(b""),
+        command_output(b"b true\n"),
         command_output(b"\tPowered: yes\n\tDiscovering: no\n"),
         command_output(b"Device 01:23:45:67:89:AB Headphones\n"),
         command_output(b"\tName: Headphones\n\tPaired: yes\n\tConnected: yes\n"),
@@ -3348,4 +3350,102 @@ async fn secret_shutdown_cancels_and_joins_a_live_leased_handler_awaiting_respon
         io::ErrorKind::UnexpectedEof
     );
     assert!(server.await.unwrap().is_err());
+}
+
+#[test]
+fn valid_empty_audio_is_unavailable_but_malformed_and_missing_default_stay_errors() {
+    let empty = include_bytes!("fixtures/system/wpctl-empty-audio.txt");
+    let runner = ScriptedRunner::new([command_output(empty)]);
+    assert_eq!(
+        audio::probe(&runner).unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+    assert_eq!(runner.seen.lock().unwrap().len(), 1);
+    // Video nodes cannot turn an empty audio graph into a healthy speaker.
+    let video = std::str::from_utf8(empty).unwrap().replace(
+        "Video\n ├─ Devices:",
+        "Video\n ├─ Sinks:\n │  * 99. Camera [vol: 1.00]\n ├─ Devices:",
+    );
+    assert_eq!(
+        audio::parse_snapshot(video.as_bytes(), &BTreeMap::new())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotConnected
+    );
+    for bytes in [
+        b"".as_slice(),
+        b"Audio\nSinks:\n",
+        b"Audio\nSinks:\n corrupted node\nSources:\nStreams:\n",
+        b"Audio\n Sinks:\n 42. Speakers\n Sources:\n Streams:\n",
+    ] {
+        assert_eq!(
+            audio::parse_snapshot(bytes, &BTreeMap::new())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[test]
+fn bluetooth_absent_service_does_not_launch_bluetoothctl() {
+    let runner = ScriptedRunner::new([command_output(b"b false\n")]);
+    assert_eq!(
+        bluetooth::probe(&runner).unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+    let calls = runner.seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].program, "busctl");
+    assert_eq!(
+        calls[0].args,
+        [
+            "--system",
+            "--timeout=1",
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            "s",
+            "org.bluez"
+        ]
+    );
+}
+
+#[test]
+fn bluetooth_exact_absent_controller_is_unavailable_not_an_arbitrary_failure() {
+    for (status, response, expected) in [
+        (
+            1,
+            b"No default controller available\n".as_slice(),
+            io::ErrorKind::NotConnected,
+        ),
+        (1, b"permission denied\n", io::ErrorKind::Other),
+        (0, b"unexpected output\n", io::ErrorKind::InvalidData),
+    ] {
+        let runner = ScriptedRunner::new([
+            command_output(b"b true\n"),
+            Ok(CommandOutput {
+                status,
+                stdout: response.to_vec(),
+                stderr: vec![],
+            }),
+        ]);
+        assert_eq!(bluetooth::probe(&runner).unwrap_err().kind(), expected);
+        assert_eq!(runner.seen.lock().unwrap().len(), 2);
+    }
+    let runner = ScriptedRunner::new([
+        command_output(b"b true\n"),
+        Err(RunnerError::timeout("hung real bluetoothctl")),
+    ]);
+    assert_eq!(
+        bluetooth::probe(&runner).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    let runner = ScriptedRunner::new([command_output(b"not a boolean\n")]);
+    assert_eq!(
+        bluetooth::probe(&runner).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
 }
