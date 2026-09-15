@@ -255,8 +255,14 @@ pub fn parse_full_snapshot(
 
     let mut windows = Vec::with_capacity(upstream_clients.len());
     let mut focused_window_seen = false;
-    for client in upstream_clients {
+    for mut client in upstream_clients {
         validate_workspace_ref(&client.workspace, true)?;
+        // Wayland clients may provide empty app metadata (for example Hyprland's
+        // update popup). Keep the SDK's nonempty metadata contract without
+        // dropping the window or changing its address-based identity.
+        if client.application_id.is_empty() {
+            client.application_id = "unknown".into();
+        }
         validate_bounded_string(
             &client.application_id,
             MAX_APPLICATION_ID_BYTES,
