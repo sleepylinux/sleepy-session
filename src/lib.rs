@@ -2,6 +2,7 @@
 
 pub mod bindings;
 pub mod calendar;
+pub mod capture;
 pub mod cli;
 pub mod compositor;
 pub mod daily;
