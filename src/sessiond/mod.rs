@@ -1,4 +1,5 @@
 mod adapter;
+mod audio_monitor;
 mod authority;
 mod control_socket;
 mod generation;
