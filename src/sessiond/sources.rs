@@ -178,8 +178,8 @@ impl ProductionSources {
         }
 
         tasks.push(tokio::spawn(run_process_event_source(
-            "pw-mon",
-            &[],
+            "pw-dump",
+            &["--monitor", "--no-colors"],
             triggers[&RuntimeCapabilityId::Audio].clone(),
             authority.clone(),
             RuntimeCapabilityId::Audio,
@@ -483,6 +483,7 @@ async fn run_process_event_source(
             .take()
             .ok_or_else(|| io::Error::other("monitor stdout missing"))?;
         let mut lines = BufReader::with_capacity(4096, stdout);
+        let mut audio_events = super::audio_monitor::AudioMonitor::default();
         loop {
             let read = tokio::select! {
                 biased;
@@ -495,9 +496,13 @@ async fn run_process_event_source(
                 }
                 read = read_bounded_line(&mut lines) => read,
             };
+            let read =
+                read.and_then(|line| line.map(|bytes| audio_events.feed(&bytes)).transpose());
             match read {
-                Ok(Some(_)) => {
-                    let _ = trigger.try_send(Trigger::Read);
+                Ok(Some(changed)) => {
+                    if changed {
+                        let _ = trigger.try_send(Trigger::Read);
+                    }
                 }
                 Ok(None) => {
                     stop_child(&mut child).await;

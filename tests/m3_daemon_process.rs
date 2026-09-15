@@ -353,8 +353,8 @@ fn daemon_real_sources_reach_the_reconnectable_osd_socket() {
         "#!/bin/sh\n[ \"$1|$2|$3|$#\" = 'msg|--json|event-stream|3' ] || exit 64\nprintf '%s\\n' '{\"WorkspacesChanged\":{\"workspaces\":[{\"id\":9,\"output\":\"DP-9\"}]}}'\nprintf '%s\\n' '{\"WorkspaceActivated\":{\"id\":9,\"focused\":true}}'\nIFS= read -r ignored < \"$SLEEPY_NIRI_HOLD\"\n",
     );
     write_executable(
-        &bin.join("pw-mon"),
-        "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 64\ncount=0\nif [ -r \"$SLEEPY_PW_COUNT\" ]; then IFS= read -r count < \"$SLEEPY_PW_COUNT\"; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$SLEEPY_PW_COUNT\"\nif [ \"$count\" -eq 1 ]; then\n  printf '%065537d' 0\nelse\n  : > \"$SLEEPY_FIXTURE_MARKER\"\n  printf '%s\\n' changed\nfi\nIFS= read -r ignored < \"$SLEEPY_PW_HOLD\"\n",
+        &bin.join("pw-dump"),
+        "#!/bin/sh\n[ \"$1|$2|$#\" = \'--monitor|--no-colors|2\' ] || exit 64\ncount=0\nif [ -r \"$SLEEPY_PW_COUNT\" ]; then IFS= read -r count < \"$SLEEPY_PW_COUNT\"; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$SLEEPY_PW_COUNT\"\nif [ \"$count\" -eq 1 ]; then\n  printf '%065537d' 0\nelse\n  : > \"$SLEEPY_FIXTURE_MARKER\"\n  printf '%s\\n' '[{\"id\":42,\"type\":\"PipeWire:Interface:Node\",\"info\":{}}]'\nfi\nIFS= read -r ignored < \"$SLEEPY_PW_HOLD\"\n",
     );
     write_executable(
         &bin.join("wpctl"),
