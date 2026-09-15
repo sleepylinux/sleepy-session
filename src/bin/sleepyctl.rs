@@ -10,6 +10,39 @@ use sleepy_session::{cli, doctor};
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("capture") {
+        let result = (|| -> io::Result<String> {
+            let [_, verb, input] = arguments.as_slice() else {
+                return Err(io::Error::other("Usage: sleepyctl capture request JSON"));
+            };
+            if verb != "request" {
+                return Err(io::Error::other("Usage: sleepyctl capture request JSON"));
+            }
+            let runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() }));
+            if std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|p| PathBuf::from(p) != runtime) {
+                return Err(io::Error::other(
+                    "Capture requires the canonical user runtime directory",
+                ));
+            }
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(sleepy_session::capture::client_request(
+                    &runtime.join("sleepy/capture.sock"),
+                    input,
+                ))
+        })();
+        return match result {
+            Ok(reply) => {
+                println!("{reply}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("sleepyctl capture: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
     if arguments.first().map(String::as_str) == Some("doctor") {
         let json = match arguments.as_slice() {
             [_] => false,

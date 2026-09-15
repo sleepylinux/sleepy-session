@@ -25,17 +25,17 @@
     "sleepy-sdk": {
       "flake": false,
       "locked": {
-        "lastModified": 1789413761,
-        "narHash": "sha256-aizZhsyiP6xuf2B5c5uzHeG6T01tm5kH4gfl6rsHYQc=",
+        "lastModified": 1789479589,
+        "narHash": "sha256-Zlj0JPXioN6I7N3wRs9yoRjwPXMNLQqT4c24HJsHIQ8=",
         "owner": "sleepylinux",
         "repo": "sleepy-sdk",
-        "rev": "dff28bb596950d862ae5d219e478460dfa13e8f4",
+        "rev": "c7d7452163d4fdfa000634e2196212a53d8b159f",
         "type": "github"
       },
       "original": {
         "owner": "sleepylinux",
         "repo": "sleepy-sdk",
-        "rev": "dff28bb596950d862ae5d219e478460dfa13e8f4",
+        "rev": "c7d7452163d4fdfa000634e2196212a53d8b159f",
         "type": "github"
       }
     }

@@ -1,6 +1,7 @@
 use std::{env, ffi::OsStr, io, path::PathBuf, process::ExitCode, sync::Arc};
 
 use sleepy_sdk::{EventCause, EventCauseKind, ProviderEvent, SessionEvent};
+use sleepy_session::capture::{CaptureService, CaptureSocket, CONSENT_DEADLINE};
 use sleepy_session::compositor::HyprlandAdapter;
 use sleepy_session::daily::{DailySocket, ProductionDailyBackend};
 use sleepy_session::desktop::appearance::AppearanceService;
@@ -58,6 +59,8 @@ fn is_internal_command_supervisor() -> bool {
 }
 
 async fn run() -> io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     let runtime_dir = required_path("XDG_RUNTIME_DIR")?;
     let notification_bus_owner =
         notification_bus_owner(env::var_os("SLEEPY_NOTIFICATION_BUS_OWNER").as_deref())?;
@@ -201,7 +204,39 @@ async fn run() -> io::Result<()> {
     )
     .await?;
 
+    let capture_path = socket_dir.join("capture.sock");
+    let capture_socket = match env::var_os("SLEEPY_CAPTURE_ENABLE").as_deref() {
+        None => None,
+        Some(v) if v == OsStr::new("0") => None,
+        Some(v) if v == OsStr::new("1") => {
+            if runtime_dir != PathBuf::from(format!("/run/user/{expected_uid}")) {
+                return Err(io::Error::other(
+                    "capture requires the canonical user runtime directory",
+                ));
+            }
+            let helper = env::var_os("PATH")
+                .into_iter()
+                .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+                .map(|directory| directory.join("sleepy-capture-job-helper"))
+                .find(|path| {
+                    use std::os::unix::fs::PermissionsExt;
+                    path.metadata().is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                });
+            let service = CaptureService::open(
+                PathBuf::from(format!("/run/user/{expected_uid}/sleepy/captures")),
+                helper,
+                CONSENT_DEADLINE,
+            )?;
+            Some(Arc::new(CaptureSocket::bind(&capture_path, service).await?))
+        }
+        _ => return Err(io::Error::other("SLEEPY_CAPTURE_ENABLE must be 0 or 1")),
+    };
     let mut startup = StartupBarrier::new();
+    let capture_startup = capture_socket
+        .as_ref()
+        .map(|_| startup.required_task("capture"));
     let session_startup = startup.required_task("session");
     let control_startup = startup.required_task("control");
     let osd_startup = startup.required_task("osd");
@@ -234,6 +269,13 @@ async fn run() -> io::Result<()> {
     };
     let notification_socket = Arc::new(notification_socket);
     let lifecycle = DaemonLifecycle::new(Arc::new(SystemdNotifier));
+    let capture_serving = capture_socket.clone();
+    let mut capture_task = tokio::spawn(async move {
+        match (capture_serving, capture_startup) {
+            (Some(socket), Some(startup)) => socket.serve_with_startup(startup).await,
+            _ => std::future::pending().await,
+        }
+    });
     let session_serving = Arc::clone(&socket);
     let mut session_task =
         tokio::spawn(async move { session_serving.serve_with_startup(session_startup).await });
@@ -282,59 +324,63 @@ async fn run() -> io::Result<()> {
         tokio::spawn(async move { secret_serving.serve_with_startup(secret_startup).await });
 
     let desktop_paths = desktop_sockets.listener_paths();
+    let mut ready_paths = vec![
+        &socket_path,
+        &control_socket_path,
+        &osd_socket_path,
+        &daily_socket_path,
+        &theme_socket_path,
+        &notification_socket_path,
+        desktop_paths[0],
+        desktop_paths[1],
+        &secret_socket_path,
+    ];
+    if capture_socket.is_some() {
+        ready_paths.push(&capture_path);
+    }
     let producers = lifecycle
-        .complete_startup(
-            &[
-                &socket_path,
-                &control_socket_path,
-                &osd_socket_path,
-                &daily_socket_path,
-                &theme_socket_path,
-                &notification_socket_path,
-                desktop_paths[0],
-                desktop_paths[1],
-                &secret_socket_path,
-            ],
-            &mut startup,
-            || async {
-                let osd_events = hub.subscribe().await;
-                let (osd_runtime, osd_task) = spawn_osd_runtime(osd_events, 16);
-                let mut osd_publications = osd_runtime.subscribe();
-                let publication_hub = osd_hub.clone();
-                let osd_bridge = tokio::spawn(async move {
-                    loop {
-                        let publication = osd_publications.recv().await.map_err(|error| {
-                            io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                format!("OSD runtime stopped: {error}"),
-                            )
-                        })?;
-                        publication_hub.publish(publication)?;
-                    }
-                });
-                let shutdown =
-                    ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
-                // Preserve Task 3's post-READY legacy source handoff before
-                // scheduling the independent v3 reconciliation actors. This keeps
-                // the v2 replay generation stable for clients reconnecting at READY.
-                let sources =
-                    ProductionSources::start_with_overview(authority.clone(), overview_sender);
-                let desktop_runtime =
-                    desktop_registry.start(Arc::clone(&desktop_authority), 256)?;
-                Ok((
-                    osd_runtime,
-                    sources,
-                    shutdown,
-                    osd_task,
-                    osd_bridge,
-                    desktop_runtime,
-                ))
-            },
-        )
+        .complete_startup(&ready_paths, &mut startup, || async {
+            let osd_events = hub.subscribe().await;
+            let (osd_runtime, osd_task) = spawn_osd_runtime(osd_events, 16);
+            let mut osd_publications = osd_runtime.subscribe();
+            let publication_hub = osd_hub.clone();
+            let osd_bridge = tokio::spawn(async move {
+                loop {
+                    let publication = osd_publications.recv().await.map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("OSD runtime stopped: {error}"),
+                        )
+                    })?;
+                    publication_hub.publish(publication)?;
+                }
+            });
+            let shutdown =
+                ShutdownCoordinator::new(authority.clone(), std::time::Duration::from_secs(2));
+            // Preserve Task 3's post-READY legacy source handoff before
+            // scheduling the independent v3 reconciliation actors. This keeps
+            // the v2 replay generation stable for clients reconnecting at READY.
+            let sources =
+                ProductionSources::start_with_overview(authority.clone(), overview_sender);
+            let desktop_runtime = desktop_registry.start(Arc::clone(&desktop_authority), 256)?;
+            Ok((
+                osd_runtime,
+                sources,
+                shutdown,
+                osd_task,
+                osd_bridge,
+                desktop_runtime,
+            ))
+        })
         .await;
     let (osd_runtime, sources, shutdown, osd_task, osd_bridge, desktop_runtime) = match producers {
         Ok(producers) => producers,
         Err(error) => {
+            if let Some(capture) = capture_socket.as_ref() {
+                let _ = capture.shutdown().await;
+            }
+            capture_task.abort();
+            let _ = capture_task.await;
             let _ = tokio::join!(
                 &mut session_task,
                 &mut control_task,
@@ -360,6 +406,7 @@ async fn run() -> io::Result<()> {
         };
         tokio::pin!(notification_failure);
         tokio::select! {
+            result = &mut capture_task => socket_task_result(result, "capture socket"),
             result = &mut session_task => socket_task_result(result, "session socket"),
             result = &mut control_task => socket_task_result(result, "control socket"),
             result = &mut osd_socket_task => socket_task_result(result, "OSD socket"),
@@ -402,6 +449,7 @@ async fn run() -> io::Result<()> {
                 Err(error)
             }
             signal = tokio::signal::ctrl_c() => signal,
+            _ = terminate.recv() => Ok(()),
         }
     };
     // The lifecycle seam emits STOPPING before entering this closure, so no
@@ -410,6 +458,13 @@ async fn run() -> io::Result<()> {
     let cleanup = lifecycle
         .stop_and_drain(|| async move {
             let mut cleanup_error = None;
+            if let Some(capture) = capture_socket.as_ref() {
+                if let Err(error) = capture.shutdown().await {
+                    cleanup_error = Some(error);
+                }
+            }
+            capture_task.abort();
+            let _ = capture_task.await;
             drop(notification_bus);
             desktop_cancellation.cancel();
             if let Err(error) = desktop_runtime

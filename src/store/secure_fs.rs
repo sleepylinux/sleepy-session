@@ -59,6 +59,12 @@ pub(crate) struct SecureFileSnapshot {
     changed_nanoseconds: i64,
 }
 
+impl SecureFileSnapshot {
+    pub(crate) fn identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SecureNodeMetadata {
     pub mode: libc::mode_t,
